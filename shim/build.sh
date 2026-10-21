@@ -17,7 +17,8 @@ sweet)
 	;;
 sunfish)
 	# 1080x2340 command-mode panel (disp.c); BoardConfig-common.mk layout.
-	CFLAGS="$CFLAGS -DFB_H=2340 -DCMD_MODE_PANEL"
+	# Pixel ABL rejects an Image header text_offset other than 0x80000.
+	CFLAGS="$CFLAGS -DFB_H=2340 -DCMD_MODE_PANEL -DTEXT_OFFSET=0x80000"
 	DTB=${DTB:-../dtb/sunfish/dtb}
 	MKBOOTIMG_LAYOUT="--base 0 --kernel_offset 0x8000 --ramdisk_offset 0x2000000 --tags_offset 0x1e00000 --dtb_offset 0x1f00000"
 	;;

@@ -2,12 +2,22 @@
  * sweet boot shim entry: arm64 Linux Image header so Qualcomm ABL treats
  * us like a kernel. ABL enters at EL1, MMU/D-cache off, x0 = DTB pointer.
  */
+/*
+ * text_offset: sweet's ABL accepts 0. The Pixel 4a (sunfish) ABL insists on
+ * 0x80000, Google's downstream TEXT_OFFSET, and refuses anything else
+ * ("Kernel TextOffset does not match"); build.sh passes -DTEXT_OFFSET.
+ * The shim is position independent, so the value only has to satisfy ABL.
+ */
+#ifndef TEXT_OFFSET
+#define TEXT_OFFSET 0
+#endif
+
 	.section .text.head, "ax"
 	.globl _head
 _head:
 	b	_start			/* code0 */
 	.long	0			/* code1 */
-	.quad	0			/* text_offset */
+	.quad	TEXT_OFFSET		/* text_offset (see below) */
 	.quad	_end			/* image_size (linked at 0) */
 	.quad	0xa			/* flags: LE, 4K pages, place anywhere */
 	.quad	0			/* res2 */
