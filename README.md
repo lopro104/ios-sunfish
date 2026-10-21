@@ -1,5 +1,3 @@
-#Not yet ported to the fish
-
 # ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
@@ -7,6 +5,8 @@
 This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
 
 As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+
+> **Pixel 4a (`sunfish`) port:** the same kernel also boots on the Pixel 4a (same SM7150 SoC). There is a sunfish shim build (`DEVICE=sunfish`), ADT (`mkadt.py --device sunfish`) and kernel patch `0082` (ST FTM5 touch, command-mode panel autorefresh). It has **not been booted on hardware yet**. See [`docs/SUNFISH.md`](docs/SUNFISH.md).
 
 > Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
 
@@ -188,6 +188,8 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | 0066–0067 | Fault-region crash info; console mute |
 | 0068 | IOSurface lookup semantics for already-mapped surfaces |
 | 0069 | Batched persistent-log flushes |
+| 0070–0081 | pid_hibernate, edge touches, USB device mode + CDC-ECM live log, 8 cores, display power, network trace |
+| 0082 | Pixel 4a (`sunfish`): ST FTM5 touch, PM6150 GPIO4 touch power, panel size from the boot framebuffer, `google,sunfish` platform match |
 
 ## Key hardware facts
 

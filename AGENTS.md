@@ -14,3 +14,7 @@
   recovery, modem, persist and the backups intact, and confirm each
   destructive step with the user before running it.
 - Keep device dumps, serial numbers and downloaded Apple artifacts out of git.
+- Two boards share this tree: `sweet` (Redmi Note 10 Pro, the default) and
+  `sunfish` (Pixel 4a, see `docs/SUNFISH.md`). Keep changes working for both:
+  board-specific kernel code checks the ADT root compatible (`google,sunfish`),
+  and the shim/ADT take `DEVICE=sunfish` / `--device sunfish`.

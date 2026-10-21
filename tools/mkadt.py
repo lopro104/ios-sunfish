@@ -2,7 +2,12 @@
 """Build the minimal Apple Device Tree that the SWEET xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the sweet live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the sweet live FDT. Usage:
+    mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--device sweet|sunfish]
+
+--device sunfish (Pixel 4a): same SM7150 MMIO map, 1080x2340 panel, and the
+root compatible "google,sunfish" that the kernel uses to pick the board's
+drivers (FTM5 touch instead of the GT9896) and the platform expert match.
 """
 import hashlib, os, struct, sys
 
@@ -31,6 +36,12 @@ GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
+# Per-board differences on the shared SM7150 layout. Both have 6 GiB with
+# the same upper bank and the cont_splash region at 0x9c000000.
+DEVICES = {
+    'sweet': dict(fb_h=2400, compatible='xiaomi,sweet', ecid=SWEET_ECID),
+    'sunfish': dict(fb_h=2340, compatible='google,sunfish', ecid=0x53554e4600000001),  # 'SUNF' + 1
+}
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
 TIMEBASE = 19200000
@@ -74,8 +85,9 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, device='sweet'):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
+    board = DEVICES[device]
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
     panic_base = phys_base + mem_size - PANIC_LOG_SIZE
@@ -111,7 +123,7 @@ def build(seed=None, qemu=False, highmem=False):
         # files), so e.g. DataMigration never records LastSystemVersion and
         # migrates on every boot. Synthetic ECID (not the phone's); chip-id
         # of the A11 that the iPhone X userland expects.
-        ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
+        ('unique-chip-id', struct.pack('<Q', board['ecid'])),
         ('chip-id', u32(0x8015)),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
@@ -193,7 +205,7 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('reg', u64(FB, FB_SIZE)),
         ('width', u32(FB_W)),
-        ('height', u32(FB_H)),
+        ('height', u32(board['fb_h'])),
         ('stride', u32(FB_STRIDE)),
     ])
 
@@ -228,10 +240,11 @@ def build(seed=None, qemu=False, highmem=False):
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
+    # (iPhone10,3). The board string ('xiaomi,sweet' / 'google,sunfish') stays
+    # for SweetPlatformExpert matching and the kernel's board checks.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr(board['compatible']) + cstr('qcom,sm7150') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
@@ -242,7 +255,10 @@ def build(seed=None, qemu=False, highmem=False):
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    device = sys.argv[sys.argv.index('--device') + 1] if '--device' in sys.argv else 'sweet'
+    if device not in DEVICES:
+        raise SystemExit(f'unknown --device {device} (one of: {", ".join(DEVICES)})')
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

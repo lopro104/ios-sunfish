@@ -1,5 +1,13 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> SUNFISH (Pixel 4a) PORT, 2026-10-21 (read docs/SUNFISH.md) <<<
+
+**State: code written, not booted on hardware.** Branch `claude/ios-sunfish-port-sunfish-uvpkdw`.
+- Same SM7150 as sweet: CPUs, GIC, RAM layout (upper bank), splash FB `0x9c000000`, UFS, USB, SPMI/PMICs, keys and the touch I2C bus (SE7, reset 8, IRQ 9) are shared. One kernel for both phones.
+- Differences handled: (1) the panel is 1080x2340 and **command mode**. `shim/disp.c` turns on MDP pingpong autorefresh so the framebuffer keeps refreshing (`DEVICE=sunfish shim/build.sh` builds with `-DFB_H=2340 -DCMD_MODE_PANEL` and the Pixel boot.img offsets). (2) The touch is an **ST FTM5 @0x49**. Patch 0082 adds an FTM5 path to `sweet_touch.c`, selected by ADT root compatible `google,sunfish` (`tools/mkadt.py --device sunfish`). Power comes from the PM6150 GPIO4 load switch through a new, address-restricted `sweet_spmi_write()`. (3) SweetHIDTouch takes the panel size from the boot framebuffer, and the platform expert also matches `google,sunfish`.
+- Verified here: shim cross-builds for both devices, `mkadt.py --device sunfish` output, patch 0082 applies on top of 0001-0081 (local xnu-8796.141.3 tree). Kernel compile: see the CI run noted below (if any).
+- Next on hardware: boot the payload-less shim first (does the red screen update? `DISP` lines), then the full payload. Checklist in docs/SUNFISH.md.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

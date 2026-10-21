@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "loader.h"
 #include "ufs.h"
+#include "disp.h"
 
 #define IMEM_RESTART_REASON	0x146aa65cUL	/* qcom,msm-imem restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
@@ -379,6 +380,11 @@ void shim_main(uint64_t dtb)
 	con_clear(RED);
 	con_str("SHIM", "sweet milestone 4: xnu loader");
 	con_skip();
+#ifdef CMD_MODE_PANEL
+	/* sunfish: without autorefresh nothing drawn from here on would show. */
+	disp_cmd_autorefresh();
+	con_skip();
+#endif
 	const char *why = loader_boot(dtb);
 	con_str("LOADER", why);
 	con_skip();
