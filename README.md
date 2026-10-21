@@ -1,3 +1,5 @@
+#Not yet ported to the fish
+
 # ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**
