@@ -116,6 +116,18 @@ jobs:
           ls -la out
           (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
 
+      - name: Check board support in the kernel
+        # CI applies patches with "git apply --check || skip", so a patch that
+        # stopped applying only shows up as missing strings in the binary.
+        run: |
+          k=$(ls out/kernel.development.* out/kernel.release.* 2>/dev/null | grep -v '\.dSYM' | head -1)
+          [ -n "$k" ] || { echo "no kernel in out/"; exit 1; }
+          missing=0
+          for s in 'google,sunfish' 'SWEET TOUCH: selected ST FTM5' 'SWEET TOUCH: PM6150 GPIO4' 'SWEET SPMI: write'; do
+            if strings -a "$k" | grep -qF "$s"; then echo "ok:      $s"; else echo "MISSING: $s"; missing=1; fi
+          done
+          [ "$missing" = 0 ] || { echo "::error::sunfish board support (0082) is not in $k"; exit 1; }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
