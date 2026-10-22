@@ -12,10 +12,10 @@ index 6630131..a327d4f 100644
  bsd/dev/munge.c 			optional config_requires_u32_munging
 diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
 new file mode 100644
-index 0000000..52742a2
+index 0000000..97439b8
 --- /dev/null
 +++ b/bsd/dev/sweet_adreno.c
-@@ -0,0 +1,1106 @@
+@@ -0,0 +1,1107 @@
 +/*
 + * The Adreno 618 of the SM7150 (sweet and sunfish), probed step by step: the first ten steps of
 + * a GPU bring-up, up to "the GMU takes what is written into its memory". Nothing here is touched
@@ -72,6 +72,7 @@ index 0000000..52742a2
 +#include <sys/systm.h>
 +#include <kern/clock.h>
 +#include <kern/thread.h>
++#include <kern/sched_prim.h>
 +#include <libkern/libkern.h>
 +#include <mach/mach_types.h>
 +#include <mach/mach_time.h>
