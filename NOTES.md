@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> GPU PROBES, 2026-10-22 (read docs/GPU.md) <<<
+
+Patch **0083** (`bsd/dev/sweet_adreno.c`): Adreno 618 bring-up steps 1-10 (`adreno=N` boot-arg, runs in a thread 40 s after root mount, `SWEET GPU:` log lines), ported from HackiOS `redwood_adreno.c` (OOSEX GANG, APSL 2.0) with SM7150 addresses (sm7150.dtsi, sdmmagpie-gpu/gdsc.dtsi, gpucc-sdmmagpie.c, debugcc-sdmmagpie.c, a6xx_gmu.c). Not run on hardware. Next on a phone: `adreno=1`, raise one step per boot, keep the logs; steps 11+ (TrustZone, zap, GMU firmware) only after 1-10 pass.
+
 ## >>> SUNFISH (Pixel 4a) PORT, 2026-10-21 (read docs/SUNFISH.md) <<<
 
 **State: code written, not booted on hardware.** Branch `claude/ios-sunfish-port-sunfish-uvpkdw`.

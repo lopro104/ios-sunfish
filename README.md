@@ -167,6 +167,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0058–0071 | HID services, iPhone X identity, keys and touch, display size, battery, SMP, home gesture |
 | 0072–0081 | USB device mode, CDC-ECM networking and live log, 8 cores, display power, network trace |
 | 0082 | Pixel 4a (`sunfish`): ST FTM5 touch, PM6150 GPIO4 touch power, panel size from the boot framebuffer, `google,sunfish` platform match |
+| 0083 | Adreno 618 bring-up probes, steps 1-10 (`adreno=N`), ported from HackiOS; see [`docs/GPU.md`](docs/GPU.md) |
 
 ## Key hardware facts (sunfish)
 
