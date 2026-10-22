@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 0084, 2026-10-22: RTC + sunfish display fallback (docs/SUNFISH.md) <<<
+
+SweetPlatformExpert publishes IORTC (IOKitInitializeTime() used to wait 30 s for it on every boot, then start the calendar at 1970) and answers getGMTTimeOfDay() from the PM6150 RTC (SPMI 0x6046/0x6048) + boot-arg `sweetrtc_offset`. AppleCLCD on google,sunfish: re-arms MDP pingpong autorefresh and, if it does not stick, writes CTL_START of the active CTL after each frame/fade step (`sweetfb_kick=0` disables). Charger state already exists behind `sweetbattery=1` (same PM6150). Not run on hardware.
+
 ## >>> GPU PROBES, 2026-10-22 (read docs/GPU.md) <<<
 
 Patch **0083** (`bsd/dev/sweet_adreno.c`): Adreno 618 bring-up steps 1-10 (`adreno=N` boot-arg, runs in a thread 40 s after root mount, `SWEET GPU:` log lines), ported from HackiOS `redwood_adreno.c` (OOSEX GANG, APSL 2.0) with SM7150 addresses (sm7150.dtsi, sdmmagpie-gpu/gdsc.dtsi, gpucc-sdmmagpie.c, debugcc-sdmmagpie.c, a6xx_gmu.c). Not run on hardware. Next on a phone: `adreno=1`, raise one step per boot, keep the logs; steps 11+ (TrustZone, zap, GMU firmware) only after 1-10 pass.

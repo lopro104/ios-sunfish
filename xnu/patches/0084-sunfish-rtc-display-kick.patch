@@ -1,0 +1,276 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index fdd8a07..bf4e518 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,12 +88,13 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks (and the sunfish touch switch,
+-	 * PM6150 GPIO4); keys retain their own lanes. */
++	/* Restrict access to the battery blocks, the sunfish touch switch
++	 * (PM6150 GPIO4) and the RTC (0x60); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xc3)) {
++	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xc3 &&
++	    peripheral != 0x60)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a62416c..33e5c0a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,9 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++
++/* osfmk/arm64/machine_routines.c; its header keeps it to Mach/pexpert code */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -116,6 +119,11 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	vm_offset_t   fMDP;           /* command-mode panel: the display controller (MDP) */
++	int           fKickCTL;       /* CTL to kick with CTL_START after each frame; -1: none */
++
++	void cmdModeSetup(void);
++	void kick(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -176,6 +184,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fMDP = 0;
++	fKickCTL = -1;
++	cmdModeSetup();
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -238,6 +249,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			fb->kick();
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -255,10 +267,109 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		fb->kick();
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
++/*
++ * sunfish: the panel is a DSI command-mode panel, which the MDP only sends a
++ * frame to when told (sweet's video-mode panel is scanned continuously).
++ * shim/disp.c turns on the pingpong's autorefresh before XNU starts, which
++ * makes every TE pulse send the framebuffer. This is the fallback in case it
++ * did not take: autorefresh is set again here, and if a pingpong still has
++ * it off, the active CTL gets CTL_START after every frame the vsync timer
++ * copies in (the kickoff Linux's DPU driver issues per commit).
++ * SM7150 DPU catalog (dpu_5_2_sm7150.h): MDP at 0xae01000, CTL n at +0x1000 +
++ * 0x200 n, pingpong n at +0x70000 + 0x800 n.
++ */
++#define SWEET_MDP_BASE          0x0ae01000ULL
++#define SWEET_MDP_SIZE          0x72000
++#define SWEET_MDP_CTL(n)        (0x1000u + 0x200u * (n))
++#define SWEET_MDP_CTL_START     0x01c
++#define SWEET_MDP_CTL_INTF_ACTIVE 0x0f4
++#define SWEET_MDP_PP(n)         (0x70000u + 0x800u * (n))
++#define SWEET_MDP_PP_TEAR_CHECK_EN 0x000
++#define SWEET_MDP_PP_AUTOREFRESH 0x030
++#define SWEET_MDP_AUTOREFRESH_ON 0x80000001u      /* BIT(31) | every frame */
++
++static bool
++sweet_board_is(const char *want)
++{
++	IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
++	OSData *compat = root ? OSDynamicCast(OSData, root->getProperty("compatible")) : NULL;
++	if (compat == NULL) {
++		return false;
++	}
++	const char *p = (const char *)compat->getBytesNoCopy();
++	unsigned int len = compat->getLength(), wl = (unsigned int)strlen(want);
++	for (unsigned int i = 0; i < len;) {
++		unsigned int n = 0;
++		while (i + n < len && p[i + n] != 0) {
++			n++;
++		}
++		if (n == wl && memcmp(p + i, want, n) == 0) {
++			return true;
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
++void
++AppleCLCD::cmdModeSetup(void)
++{
++	int fallback = 1;
++
++	PE_parse_boot_argn("sweetfb_kick", &fallback, sizeof(fallback));
++	if (!fallback || !sweet_board_is("google,sunfish")) {
++		return;
++	}
++	fMDP = ml_io_map(SWEET_MDP_BASE, SWEET_MDP_SIZE);
++	if (fMDP == 0) {
++		IOLog("SWEET FB: cannot map the MDP; no command-mode fallback\n");
++		return;
++	}
++	volatile uint32_t *r = (volatile uint32_t *)fMDP;
++	bool needKick = false;
++	for (unsigned pp = 0; pp < 4; pp++) {
++		uint32_t base = SWEET_MDP_PP(pp) / 4;
++		if (!(r[base + SWEET_MDP_PP_TEAR_CHECK_EN / 4] & 1u)) {
++			continue;       /* not driving a command-mode panel */
++		}
++		uint32_t was = r[base + SWEET_MDP_PP_AUTOREFRESH / 4];
++		if (!(was & 0x80000000u)) {
++			r[base + SWEET_MDP_PP_AUTOREFRESH / 4] = SWEET_MDP_AUTOREFRESH_ON;
++			__asm__ volatile ("dsb sy" ::: "memory");
++		}
++		uint32_t now = r[base + SWEET_MDP_PP_AUTOREFRESH / 4];
++		IOLog("SWEET FB: command-mode pingpong %u: autorefresh %#x -> %#x\n", pp, was, now);
++		if (!(now & 0x80000000u)) {
++			needKick = true;
++		}
++	}
++	if (!needKick) {
++		return;
++	}
++	for (unsigned ctl = 0; ctl < 6; ctl++) {
++		if (r[(SWEET_MDP_CTL(ctl) + SWEET_MDP_CTL_INTF_ACTIVE) / 4] != 0) {
++			fKickCTL = (int)ctl;
++			break;
++		}
++	}
++	IOLog("SWEET FB: autorefresh did not take; kicking CTL %d with CTL_START after each frame\n", fKickCTL);
++}
++
++void
++AppleCLCD::kick(void)
++{
++	if (fMDP == 0 || fKickCTL < 0) {
++		return;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the frame's pixels before the kickoff */
++	((volatile uint32_t *)fMDP)[(SWEET_MDP_CTL((unsigned)fKickCTL) + SWEET_MDP_CTL_START) / 4] = 1;
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..6e234f5 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -9,6 +9,11 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++/* bsd/dev/sweet_spmi.c */
++extern "C" int sweet_spmi_init(void);
++extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -18,6 +23,12 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++
++private:
++	bool rtcRead(uint32_t *secs);
++	bool fRTC;              /* the PMIC RTC answers and counts */
++	int64_t fRTCOffset;     /* boot-arg sweetrtc_offset: seconds added to the raw count */
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -31,9 +42,71 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++
++	/*
++	 * The calendar. IOKitInitializeTime() waits up to 30 s for an "IORTC"
++	 * resource before it asks this platform expert for the time; nothing
++	 * published one, so every boot lost 30 s and started at 1970. The time
++	 * now comes from the PM6150's RTC (getGMTTimeOfDay below), and IORTC is
++	 * published either way: without the RTC the wait buys nothing.
++	 */
++	uint32_t raw = 0;
++	fRTC = sweet_spmi_init() == 0 && rtcRead(&raw);
++	PE_parse_boot_argn("sweetrtc_offset", &fRTCOffset, sizeof(fRTCOffset));
++	if (fRTC) {
++		IOLog("SWEET RTC: PM6150 counts %u s, offset %lld s (boot-arg sweetrtc_offset)\n", raw, fRTCOffset);
++	} else {
++		IOLog("SWEET RTC: PM6150 RTC not readable or not running; calendar starts at 1970\n");
++	}
++	publishResource("IORTC", this);
++	return true;
++}
++
++/*
++ * PM6150 RTC (SID 0, rtc_rw at 0x6000; Linux rtc-pm8xxx.c pm8941_regs): ctrl
++ * 0x6046 bit 7 = counting, a little-endian 32-bit seconds count at
++ * 0x6048..0x604b. The low byte is read again afterwards and the count read
++ * a second time if it wrapped under us. Android cannot write this RTC on
++ * sunfish (qcom,qpnp-rtc-write = <0>): it keeps the wall clock as an offset
++ * in userspace, hence sweetrtc_offset (docs/SUNFISH.md says how to get it).
++ */
++bool
++SweetPlatformExpert::rtcRead(uint32_t *secs)
++{
++	uint8_t ctrl = 0, b[4], again = 0;
++
++	if (sweet_spmi_read(0, 0x6046, &ctrl) != 0 || !(ctrl & 0x80)) {
++		return false;
++	}
++	for (int attempt = 0; attempt < 2; attempt++) {
++		for (unsigned i = 0; i < 4; i++) {
++			if (sweet_spmi_read(0, 0x6048 + i, &b[i]) != 0) {
++				return false;
++			}
++		}
++		if (sweet_spmi_read(0, 0x6048, &again) != 0) {
++			return false;
++		}
++		if (again >= b[0]) {
++			break;
++		}
++	}
++	*secs = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+ 	return true;
+ }
+ 
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	uint32_t raw;
++
++	if (!fRTC || !rtcRead(&raw)) {
++		return 0;
++	}
++	int64_t t = (int64_t)raw + fRTCOffset;
++	return t > 0 ? (long)t : 0;
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {

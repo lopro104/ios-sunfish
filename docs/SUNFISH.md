@@ -90,3 +90,26 @@ Try these steps in order. Each one can be tested without the steps after it.
    but no READY event came. Sensing is still turned on.
 4. **Keys and USB**: these should behave as on sweet (same PMIC and the same
    DWC3 wrapper).
+
+## Clock, battery and display fallback (patch 0084)
+
+- **Clock.** The kernel reads the PM6150 RTC for the calendar. Before 0084, every boot waited 30 s
+  for a clock driver that never came and then started at 1970. Android's kernel can't write this
+  RTC on sunfish (`qcom,qpnp-rtc-write = <0>`), so the raw count is not the real time: Android
+  keeps the difference itself. Get it from Android once, while it still boots, and pass it as a
+  boot-arg:
+
+  ```sh
+  adb shell 'echo $(( $(date +%s) - $(cat /sys/class/rtc/rtc0/since_epoch) ))'
+  # -> e.g. 1761000000 ; add  sweetrtc_offset=1761000000  to the --cmdline
+  ```
+
+  The difference only changes if the RTC loses power (battery fully drained). Without the
+  boot-arg, the date is wrong but the boot is still 30 s faster.
+- **Battery and charger.** Add `sweetbattery=1` to read the real voltage-based charge, the
+  charging state and USB presence from the PM6150 (the same chip as on sweet). Without it, the
+  battery shows a static 100 %.
+- **Display fallback.** If the shim's autorefresh did not take, the kernel tries again when the
+  display service starts; if it still does not take, it sends `CTL_START` after every frame it
+  copies to the panel. Look for `SWEET FB: command-mode pingpong` in the log. `sweetfb_kick=0`
+  turns the fallback off.
