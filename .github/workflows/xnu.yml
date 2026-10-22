@@ -72,7 +72,17 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      - name: Compile errors
+        # make -k keeps going, so the first error is often thousands of lines
+        # before the end of the Build step; repeat every one of them here.
+        if: failure()
+        run: |
+          grep -n -B2 -A12 -E '(error|fatal error): ' build.log | grep -v -- '-ferror-limit' | head -400 || true
+          echo "---- $(grep -c -E '(error|fatal error): ' build.log) error lines in build.log"
 
       - name: Package build tree for local compiles
         if: always()
