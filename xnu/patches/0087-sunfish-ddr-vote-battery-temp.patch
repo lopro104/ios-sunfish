@@ -253,7 +253,7 @@ index 4da50d8..d203991 100644
 +}
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
-index bf4e518..3204de8 100644
+index bf4e518..65cff75 100644
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
 @@ -89,12 +89,12 @@ int
@@ -290,7 +290,7 @@ index bf4e518..3204de8 100644
  		return -1;
  	}
  	IOLockLock(sp_lock);
-@@ -175,4 +176,110 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+@@ -175,4 +176,111 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
  	IOLockUnlock(sp_lock);
  	return -1;
  }
@@ -317,8 +317,9 @@ index bf4e518..3204de8 100644
 +#define ADC5_FULL_SCALE         0x70e4
 +#define ADC5_MAX_CODE           0x7fff
 +
-+static const struct {
-+	int mv = 0, mdeg;
++static const struct adc5_ntc_point {
++	int millivolt;
++	int millideg;
 +} adc5_ntc_100k[] = {
 +	{ 1831, -40000 }, { 1814, -35000 }, { 1791, -30000 }, { 1761, -25000 }, { 1723, -20000 },
 +	{ 1675, -15000 }, { 1616, -10000 }, { 1545, -5000 }, { 1463, 0 }, { 1370, 5000 },
@@ -378,7 +379,7 @@ index bf4e518..3204de8 100644
 +		code = 0;
 +	}
 +	mv = (int)((uint64_t)code * 1875 / ADC5_FULL_SCALE);
-+	while (i < n && adc5_ntc_100k[i].mv > mv) {
++	while (i < n && adc5_ntc_100k[i].millivolt > mv) {
 +		i++;
 +	}
 +	if (i == 0 || i == n) {
@@ -387,8 +388,8 @@ index bf4e518..3204de8 100644
 +		goto fail;
 +	} else {
 +		/* linear between the two points (fixp_linear_interpolate) */
-+		int x0 = adc5_ntc_100k[i - 1].mv, y0 = adc5_ntc_100k[i - 1].mdeg;
-+		int x1 = adc5_ntc_100k[i].mv, y1 = adc5_ntc_100k[i].mdeg;
++		int x0 = adc5_ntc_100k[i - 1].millivolt, y0 = adc5_ntc_100k[i - 1].millideg;
++		int x1 = adc5_ntc_100k[i].millivolt, y1 = adc5_ntc_100k[i].millideg;
 +		mdeg = y0 + (y1 - y0) * (mv - x0) / (x1 - x0);
 +	}
 +	*tenths = mdeg / 100;
