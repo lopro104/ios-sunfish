@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 0085, 2026-10-23: thermal service, watch-only (docs/SUNFISH.md) <<<
+
+`bsd/dev/sweet_thermal.c` + `sweet_thermal.h`, ported from HackiOS `metal` (hk_thermal.c/.h, APSL 2.0): 25 TSENS v2 sensors (tsens0 TM 0xc263000 x15, tsens1 TM 0xc265000 x10; names from msm-4.14 sdmmagpie-thermal.dtsi), their governor unchanged with no caps (no cpufreq for OSM yet), sysctls kern.hackios.thermal* (their thermald's names). Default on for google,sunfish, `thermal=0` off, `thermal=2` any board. No emergency panic without caps (log only). Not run on hardware.
+
 ## >>> 0084, 2026-10-22: RTC + sunfish display fallback (docs/SUNFISH.md) <<<
 
 SweetPlatformExpert publishes IORTC (IOKitInitializeTime() used to wait 30 s for it on every boot, then start the calendar at 1970) and answers getGMTTimeOfDay() from the PM6150 RTC (SPMI 0x6046/0x6048) + boot-arg `sweetrtc_offset`. AppleCLCD on google,sunfish: re-arms MDP pingpong autorefresh and, if it does not stick, writes CTL_START of the active CTL after each frame/fade step (`sweetfb_kick=0` disables). Charger state already exists behind `sweetbattery=1` (same PM6150). Not run on hardware.

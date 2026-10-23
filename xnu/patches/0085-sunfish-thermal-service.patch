@@ -1,0 +1,549 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a327d4f..a28be3e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_adreno.c			standard
++bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100644
+index 0000000..19ba610
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,253 @@
++/*
++ * The thermal service for the SM7150 (sunfish): every quarter of a second the SoC's 25 temperature
++ * sensors are read, the governor of sweet_thermal.h decides how hot iOS should be told the phone is,
++ * and the readings go to the log and to sysctls.
++ *
++ * Ported from HackiOS (OOSEX GANG, hackios-xnu-kernel branch "metal", xnu/files/bsd/dev/hk_thermal.c,
++ * APSL 2.0). Their service also slows the cores through their CPU frequency driver; this kernel has
++ * none for the SM7150 yet (the cores run at whatever ABL left them), so this is their "thermal=2"
++ * mode only: watch and report, no caps. The sysctl names are theirs, so HackiOS's userland
++ * thermald (which posts the level as com.apple.system.thermalpressurelevel) works unchanged:
++ *
++ *   kern.hackios.thermal              a table: every sensor's reading and limit
++ *   kern.hackios.thermal_pressure     iOS's pressure level 0..4 (nominal .. sleeping)
++ *   kern.hackios.thermal_hottest      the hottest reading, in tenths of a degree
++ *   kern.hackios.thermal_throttles    how many times a group was slowed (0 here: no caps)
++ *   kern.hackios.thermal_running      1 while the service runs
++ *
++ * Boot-arg thermal: 0 off, 1 on (the default on google,sunfish; elsewhere off), 2 on on any board.
++ * Only reads the sensors: TSENS is never written, its own thresholds stay as the firmware set them.
++ *
++ * The sensors' register layout: Linux drivers/thermal/qcom/tsens-v2.c, as in HackiOS: a status word
++ * per sensor at 0xa0 + 4 n, the last reading in its low 12 bits, signed, in tenths of a degree, bit 21
++ * set when the reading is valid. TM regions from linux sm7150.dtsi (tsens0/tsens1 "TM").
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "sweet_thermal.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++void sweet_thermal_init(void);
++
++#define TSENS0_TM               0x0c263000UL    /* dt: thermal-sensor@c263000, "TM" */
++#define TSENS1_TM               0x0c265000UL    /* dt: thermal-sensor@c265000 */
++#define TSENS_TM_SIZE           0x1000UL
++#define TSENS_STATUS(sensor)    (0xa0 + 4 * (sensor))
++#define TSENS_VALID             (1u << 21)
++#define TSENS_TRIES             4               /* a sensor caught between two conversions is asked again */
++
++static vm_offset_t tsens[2];
++static struct thermal_gov gov;
++static int16_t readings[THERMAL_ZONES];
++
++/* what the sysctls show, kept by the service's thread and read by anyone */
++static LCK_GRP_DECLARE(thermal_lck_grp, "sweet-thermal");
++static LCK_MTX_DECLARE(thermal_mtx, &thermal_lck_grp);
++static char thermal_text[2048];
++static int thermal_pressure, thermal_hottest = THERMAL_INVALID, thermal_throttles, thermal_running;
++
++SYSCTL_NODE(_kern, OID_AUTO, hackios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "HackiOS-compatible hardware services");
++SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_pressure, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_pressure, 0,
++    "iOS thermal pressure level: 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping");
++SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_hottest, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_hottest, 0,
++    "the hottest sensor's reading, tenths of a degree Celsius");
++SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_throttles, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_throttles, 0,
++    "how many times a group of cores was slowed down");
++SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_running, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_running, 0,
++    "1 while the thermal service runs");
++
++static int
++thermal_sysctl_text(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	static char copy[sizeof(thermal_text)];
++
++	lck_mtx_lock(&thermal_mtx);
++	strlcpy(copy, thermal_running ? thermal_text : "thermal: not running (thermal=0)\n", sizeof(copy));
++	lck_mtx_unlock(&thermal_mtx);
++	return SYSCTL_OUT(req, copy, strlen(copy) + 1);
++}
++SYSCTL_PROC(_kern_hackios, OID_AUTO, thermal, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    thermal_sysctl_text, "A", "every temperature sensor, as a table");
++
++/* "95.3" from 953; "-" for no reading */
++static const char *
++tenths_text(int t, char *buf, size_t size)
++{
++	if (t == THERMAL_INVALID) {
++		strlcpy(buf, "-", size);
++	} else {
++		snprintf(buf, size, "%s%d.%d", t < 0 ? "-" : "", (t < 0 ? -t : t) / 10, (t < 0 ? -t : t) % 10);
++	}
++	return buf;
++}
++
++/* one sensor's reading, THERMAL_INVALID if it has none after a few tries */
++static int16_t
++read_sensor(unsigned block, unsigned sensor)
++{
++	for (int i = 0; i < TSENS_TRIES; i++) {
++		uint32_t status = *(volatile uint32_t *)(tsens[block] + TSENS_STATUS(sensor));
++
++		if (status & TSENS_VALID) {
++			return (int16_t)((int32_t)(status << 20) >> 20);
++		}
++	}
++	return THERMAL_INVALID;
++}
++
++/* the table of kern.hackios.thermal, from this tick's readings and decisions */
++static void
++write_text(void)
++{
++	static char text[sizeof(thermal_text)];
++	size_t n = 0;
++	char a[16], b[16], c[16];
++
++	n += (size_t)snprintf(text + n, sizeof(text) - n, "pressure %s (%d), hottest %s %s C; cores not governed (no cpufreq)\n",
++	    thermal_level_name(gov.level), gov.level, gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-",
++	    tenths_text(gov.hottest_temp, a, sizeof(a)));
++	for (int z = 0; z < THERMAL_ZONES && n < sizeof(text); z++) {
++		const struct thermal_zone *zone = &hk_thermal_zones[z];
++
++		n += (size_t)snprintf(text + n, sizeof(text) - n, "%-9s tsens%u/%-2u %6s C   limit %s, stop %s\n", zone->name,
++		    zone->block, zone->sensor, tenths_text(readings[z], a, sizeof(a)), tenths_text(zone->passive, b, sizeof(b)),
++		    tenths_text(zone->critical, c, sizeof(c)));
++	}
++	lck_mtx_lock(&thermal_mtx);
++	memcpy(thermal_text, text, sizeof(thermal_text));
++	thermal_text[sizeof(thermal_text) - 1] = 0;
++	thermal_pressure = gov.level;
++	thermal_hottest = gov.hottest_temp;
++	thermal_throttles = (int)gov.throttles;
++	lck_mtx_unlock(&thermal_mtx);
++}
++
++/* every sensor in one log line: what the first run on a phone needs to show */
++static void
++log_all(const char *why)
++{
++	char line[512], a[16];
++	size_t n = 0;
++
++	for (int z = 0; z < THERMAL_ZONES && n < sizeof(line); z++) {
++		n += (size_t)snprintf(line + n, sizeof(line) - n, " %s=%s", hk_thermal_zones[z].name,
++		    tenths_text(readings[z], a, sizeof(a)));
++	}
++	printf("SWEET THERMAL: %s:%s\n", why, line);
++}
++
++static void
++thermal_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint64_t ticks = 0;
++	bool was_blind = false, emergency_said = false;
++
++	for (;;) {
++		unsigned flags;
++		char a[16];
++
++		for (int z = 0; z < THERMAL_ZONES; z++) {
++			readings[z] = read_sensor(hk_thermal_zones[z].block, hk_thermal_zones[z].sensor);
++		}
++		/* no battery temperature in this kernel yet: "not known" */
++		flags = thermal_gov_step(&gov, readings, -2730);
++
++		if (flags & THERMAL_LEVEL_CHANGED) {
++			printf("SWEET THERMAL: %s, hottest %s at %s C\n", thermal_level_name(gov.level),
++			    gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-", tenths_text(gov.hottest_temp, a, sizeof(a)));
++		}
++		if ((flags & THERMAL_BLIND) && !was_blind) {
++			printf("SWEET THERMAL: no CPU sensor has answered for %d ms\n", THERMAL_BLIND_TICKS * THERMAL_TICK_MS);
++		}
++		was_blind = (flags & THERMAL_BLIND) != 0;
++		/*
++		 * HackiOS ends the run here (a panic) once the cores have been at their lowest speed for two
++		 * seconds past the stop. Without caps there is no lowest speed to hold them at, so this only
++		 * says it, loudly; the SoC's own protection (TSENS / LMh, set by the firmware) is what acts.
++		 */
++		if ((flags & THERMAL_EMERGENCY) && !emergency_said) {
++			log_all("PAST THE STOP for 2 s, and this kernel cannot slow the cores");
++		}
++		emergency_said = (flags & THERMAL_EMERGENCY) != 0;
++		write_text();
++		if (++ticks % (60000 / THERMAL_TICK_MS) == 0) {
++			log_all("a minute");
++		}
++		delay_for_interval(THERMAL_TICK_MS, NSEC_PER_MSEC);
++	}
++}
++
++/* True when the ADT root is the Pixel 4a (tools/mkadt.py --device sunfish). */
++static bool
++thermal_board_sunfish(void)
++{
++	static const char want[] = "google,sunfish";
++	DTEntry root;
++	char const *compat;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess) {
++		return false;
++	}
++	for (unsigned int i = 0; i < size;) {
++		size_t len = strnlen(compat + i, size - i);
++		if (len == sizeof(want) - 1 && memcmp(compat + i, want, len) == 0) {
++			return true;
++		}
++		i += (unsigned int)len + 1u;
++	}
++	return false;
++}
++
++void
++sweet_thermal_init(void)
++{
++	static bool started;
++	uint32_t mode = 1;
++	int top[THERMAL_DOMAINS];
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("thermal", &mode, sizeof(mode));
++	if (mode == 0 || (mode == 1 && !thermal_board_sunfish())) {
++		return;
++	}
++	tsens[0] = ml_io_map(TSENS0_TM, TSENS_TM_SIZE);
++	tsens[1] = ml_io_map(TSENS1_TM, TSENS_TM_SIZE);
++	if (tsens[0] == 0 || tsens[1] == 0) {
++		printf("SWEET THERMAL: cannot map TSENS\n");
++		return;
++	}
++	for (int d = 0; d < THERMAL_DOMAINS; d++) {
++		top[d] = -1;                    /* no cpufreq: no group of cores is ours to slow */
++	}
++	thermal_gov_init(&gov, top);
++	for (int z = 0; z < THERMAL_ZONES; z++) {
++		readings[z] = read_sensor(hk_thermal_zones[z].block, hk_thermal_zones[z].sensor);
++	}
++	/* whether TSENS answers at all is the first thing to know */
++	log_all("first reading");
++	if (kernel_thread_start(thermal_thread, NULL, &thread) != KERN_SUCCESS) {
++		printf("SWEET THERMAL: no thread: the sensors are NOT watched\n");
++		return;
++	}
++	thread_deallocate(thread);
++	thermal_running = 1;
++	printf("SWEET THERMAL: %d sensors every %d ms, watching only (no CPU frequency control)\n", THERMAL_ZONES,
++	    THERMAL_TICK_MS);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_thermal.h b/bsd/dev/sweet_thermal.h
+new file mode 100644
+index 0000000..6a87011
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.h
+@@ -0,0 +1,252 @@
++/*
++ * The thermal governor for the SM7150 (sunfish): which temperature sensors there are, where each
++ * sits, how warm it may get, and the decision made every tick -- how hot iOS should be told the
++ * phone is, and (once there is a CPU frequency driver) how fast each group of cores may run.
++ *
++ * Ported from HackiOS (OOSEX GANG, hackios-xnu-kernel branch "metal", xnu/files/bsd/sys/hk_thermal.h,
++ * APSL 2.0). The decision logic is theirs, unchanged; the sensor table and the groups of cores are
++ * the SM7150's.
++ *
++ * The sensors: two TSENS v2 blocks (linux sm7150.dtsi: tsens0 TM at 0xc263000, 15 sensors; tsens1 TM
++ * at 0xc265000, 10 sensors). Names as Google's kernel calls them (msm-4.14 sdmmagpie-thermal.dtsi,
++ * the "-usr" zones; mainline sm7150.dtsi maps the same sensors):
++ *
++ *   tsens0  0 aoss-0      1..6 cpu-0-0..5 (the six Cortex-A55)   7, 8 cpuss-0, cpuss-1 (shared)
++ *           9..12 cpu-1-0..3 (the two Cortex-A76, two sensors each)   13, 14 gpuss-0, gpuss-1
++ *   tsens1  0 aoss-1  1 cwlan  2 audio  3 ddr  4 q6-hvx  5 camera  6 mdm-core  7 mdm-dsp  8 npu  9 video
++ *
++ * Limits: mainline sm7150.dtsi slows the cores at 90 and 95 C and calls 110 C critical; here the
++ * cores and the GPU have 95 C, everything else 100 C, and 110 C is the stop.
++ *
++ * Temperatures are kept in tenths of a degree Celsius, as TSENS reports them.
++ */
++#ifndef _SWEET_THERMAL_H_
++#define _SWEET_THERMAL_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#define THERMAL_DOMAINS         2               /* the cores' frequency groups: the A55s, the A76s */
++#define THERMAL_ALL_CPUS        (-2)            /* a zone shared by every group of cores */
++#define THERMAL_NO_CPU          (-1)            /* a zone of something else: the GPU, the DSPs, the memory */
++#define THERMAL_INVALID         (-32768)        /* no reading from that sensor this tick */
++
++/* iOS's own levels (OSThermalPressureLevel, <libkern/OSThermalNotification.h>): what thermald posts */
++#define THERMAL_NOMINAL         0               /* nothing to worry about */
++#define THERMAL_MODERATE        1               /* within 10 C of slowing down */
++#define THERMAL_HEAVY           2               /* the cores are being slowed */
++#define THERMAL_TRAPPING        3               /* within 5 C of the emergency stop */
++#define THERMAL_SLEEPING        4               /* past it: everything at the lowest speed */
++
++#define THERMAL_TICK_MS         250             /* how often the sensors are read */
++#define THERMAL_HOT_STEP        50              /* 5 C past the limit: slow down three rows a tick, not one */
++#define THERMAL_COOL_MARGIN     50              /* 5 C under the limit before speeding up again */
++#define THERMAL_COOL_TICKS      4               /* ... and for this many ticks in a row (one second) */
++#define THERMAL_EMERGENCY_TICKS 8               /* two seconds past the stop: the run ends (a panic) */
++#define THERMAL_BLIND_TICKS     20              /* five seconds with no CPU reading: slow to half and say so */
++
++#define THERMAL_BATTERY_WARM    450             /* the battery's temperature: 45 C, at least MODERATE */
++#define THERMAL_BATTERY_HOT     500             /* 50 C: the cores held at most at half speed, HEAVY */
++#define THERMAL_BATTERY_DANGER  580             /* 58 C: TRAPPING, the cores at the lowest speed */
++
++struct thermal_zone {
++	const char *name;                       /* as the device tree calls it */
++	uint8_t block, sensor;                  /* TSENS block 0 or 1, sensor number in it */
++	int8_t domain;                          /* 0..2, THERMAL_ALL_CPUS or THERMAL_NO_CPU */
++	int16_t passive;                        /* start slowing at this, tenths of C */
++	int16_t critical;                       /* the emergency stop */
++};
++
++static const struct thermal_zone hk_thermal_zones[] = {
++	{ "aoss-0", 0, 0, THERMAL_NO_CPU, 1000, 1100 },
++	{ "cpu-0-0", 0, 1, 0, 950, 1100 },
++	{ "cpu-0-1", 0, 2, 0, 950, 1100 },
++	{ "cpu-0-2", 0, 3, 0, 950, 1100 },
++	{ "cpu-0-3", 0, 4, 0, 950, 1100 },
++	{ "cpu-0-4", 0, 5, 0, 950, 1100 },
++	{ "cpu-0-5", 0, 6, 0, 950, 1100 },
++	{ "cpuss-0", 0, 7, THERMAL_ALL_CPUS, 950, 1100 },
++	{ "cpuss-1", 0, 8, THERMAL_ALL_CPUS, 950, 1100 },
++	{ "cpu-1-0", 0, 9, 1, 950, 1100 },
++	{ "cpu-1-1", 0, 10, 1, 950, 1100 },
++	{ "cpu-1-2", 0, 11, 1, 950, 1100 },
++	{ "cpu-1-3", 0, 12, 1, 950, 1100 },
++	{ "gpuss-0", 0, 13, THERMAL_NO_CPU, 950, 1100 },
++	{ "gpuss-1", 0, 14, THERMAL_NO_CPU, 950, 1100 },
++	{ "aoss-1", 1, 0, THERMAL_NO_CPU, 1000, 1100 },
++	{ "cwlan", 1, 1, THERMAL_NO_CPU, 1000, 1100 },
++	{ "audio", 1, 2, THERMAL_NO_CPU, 1000, 1100 },
++	{ "ddr", 1, 3, THERMAL_NO_CPU, 1000, 1100 },
++	{ "q6-hvx", 1, 4, THERMAL_NO_CPU, 1000, 1100 },
++	{ "camera", 1, 5, THERMAL_NO_CPU, 1000, 1100 },
++	{ "mdm-core", 1, 6, THERMAL_NO_CPU, 1000, 1100 },
++	{ "mdm-dsp", 1, 7, THERMAL_NO_CPU, 1000, 1100 },
++	{ "npu", 1, 8, THERMAL_NO_CPU, 1000, 1100 },
++	{ "video", 1, 9, THERMAL_NO_CPU, 1000, 1100 },
++};
++#define THERMAL_ZONES   ((int)(sizeof(hk_thermal_zones) / sizeof(hk_thermal_zones[0])))
++
++/* What the governor keeps from one tick to the next. */
++struct thermal_gov {
++	int top[THERMAL_DOMAINS];               /* the highest row of each group's frequency table; -1: not ours */
++	int cap[THERMAL_DOMAINS];               /* the row each group may run at now */
++	int cool[THERMAL_DOMAINS];              /* ticks in a row it has been cool enough to speed up */
++	int level;                              /* THERMAL_NOMINAL..THERMAL_SLEEPING */
++	int hottest;                            /* the zone furthest past (or nearest to) its limit; -1 none */
++	int16_t hottest_temp;
++	int hot_ticks;                          /* ticks in a row past a critical limit */
++	int blind_ticks;                        /* ticks in a row with no reading of any CPU zone */
++	uint32_t throttles;                     /* times a group was slowed, over the run */
++};
++
++/* What one tick decided, besides the caps. */
++#define THERMAL_CAPS_CHANGED    (1u << 0)       /* write the caps to the hardware */
++#define THERMAL_LEVEL_CHANGED   (1u << 1)       /* tell iOS */
++#define THERMAL_EMERGENCY       (1u << 2)       /* past the stop for too long: end the run now */
++#define THERMAL_BLIND           (1u << 3)       /* no CPU sensor reads: held at half speed */
++
++static inline void
++thermal_gov_init(struct thermal_gov *g, const int top[THERMAL_DOMAINS])
++{
++	*g = (struct thermal_gov){ .level = THERMAL_NOMINAL, .hottest = -1 };
++	for (int d = 0; d < THERMAL_DOMAINS; d++) {
++		g->top[d] = top[d];
++		g->cap[d] = top[d];
++	}
++}
++
++static inline int
++thermal_clamp(int v, int lo, int hi)
++{
++	return v < lo ? lo : v > hi ? hi : v;
++}
++
++/*
++ * One tick: `tenths` holds a reading per zone of hk_thermal_zones (THERMAL_INVALID where there was
++ * none), `battery` the battery's temperature in tenths (below -2000: not known). Changes the caps and
++ * the level in `g`; returns THERMAL_* flags.
++ */
++static inline unsigned
++thermal_gov_step(struct thermal_gov *g, const int16_t *tenths, int battery)
++{
++	int excess[THERMAL_DOMAINS], package = -10000, worst = -10000, worst_zone = -1, any_cpu = 0, critical = 0;
++	int old_cap[THERMAL_DOMAINS], old_level = g->level, level;
++	unsigned flags = 0;
++
++	for (int d = 0; d < THERMAL_DOMAINS; d++) {
++		excess[d] = -10000;
++		old_cap[d] = g->cap[d];
++	}
++	/* how far past its limit each zone is (negative: under it), and the worst of them */
++	for (int z = 0; z < THERMAL_ZONES; z++) {
++		const struct thermal_zone *zone = &hk_thermal_zones[z];
++		int t = tenths[z], over;
++
++		if (t == THERMAL_INVALID) {
++			continue;
++		}
++		over = t - zone->passive;
++		if (zone->domain >= 0) {
++			excess[zone->domain] = over > excess[zone->domain] ? over : excess[zone->domain];
++			any_cpu = 1;
++		} else {
++			/* the shared CPU zones and everything else heat the whole package: they count for every group */
++			package = over > package ? over : package;
++			any_cpu |= zone->domain == THERMAL_ALL_CPUS;
++		}
++		if (t >= zone->critical) {
++			critical = 1;
++		}
++		if (over > worst) {
++			worst = over;
++			worst_zone = z;
++		}
++	}
++	g->hottest = worst_zone;
++	g->hottest_temp = worst_zone >= 0 ? tenths[worst_zone] : THERMAL_INVALID;
++
++	/* no reading of any CPU zone for a while: a sensor block that has stopped is no reason to run hot */
++	g->blind_ticks = any_cpu ? 0 : g->blind_ticks + 1;
++
++	for (int d = 0; d < THERMAL_DOMAINS; d++) {
++		int e = excess[d] > package ? excess[d] : package;
++
++		if (g->top[d] < 0) {
++			continue;                       /* a group with none of our cores in it */
++		}
++		if (e >= THERMAL_HOT_STEP) {
++			g->cap[d] -= 3;
++			g->cool[d] = 0;
++		} else if (e >= 0) {
++			g->cap[d] -= 1;
++			g->cool[d] = 0;
++		} else if (e < -THERMAL_COOL_MARGIN) {
++			if (++g->cool[d] >= THERMAL_COOL_TICKS && g->cap[d] < g->top[d]) {
++				g->cap[d] += 1;         /* one row a second back up: no see-saw */
++				g->cool[d] = 0;
++			}
++		} else {
++			g->cool[d] = 0;                 /* between the two: hold where it is */
++		}
++		if (battery >= THERMAL_BATTERY_DANGER) {
++			g->cap[d] = 0;
++		} else if (battery >= THERMAL_BATTERY_HOT && g->cap[d] > g->top[d] / 2) {
++			g->cap[d] = g->top[d] / 2;
++		}
++		if (g->blind_ticks >= THERMAL_BLIND_TICKS && g->cap[d] > g->top[d] / 2) {
++			g->cap[d] = g->top[d] / 2;
++		}
++		if (critical) {
++			g->cap[d] = 0;
++		}
++		g->cap[d] = thermal_clamp(g->cap[d], 0, g->top[d]);
++		if (g->cap[d] < old_cap[d]) {
++			g->throttles++;
++		}
++		if (g->cap[d] != old_cap[d]) {
++			flags |= THERMAL_CAPS_CHANGED;
++		}
++	}
++
++	/* the level iOS is told */
++	if (critical) {
++		level = THERMAL_SLEEPING;
++	} else if (worst_zone >= 0 && g->hottest_temp >= hk_thermal_zones[worst_zone].critical - 50) {
++		level = THERMAL_TRAPPING;
++	} else {
++		int slowed = 0;
++		for (int d = 0; d < THERMAL_DOMAINS; d++) {
++			slowed |= g->top[d] >= 0 && g->cap[d] < g->top[d];
++		}
++		level = slowed ? THERMAL_HEAVY : worst >= -100 ? THERMAL_MODERATE : THERMAL_NOMINAL;
++	}
++	if (battery >= THERMAL_BATTERY_DANGER && level < THERMAL_TRAPPING) {
++		level = THERMAL_TRAPPING;
++	} else if (battery >= THERMAL_BATTERY_HOT && level < THERMAL_HEAVY) {
++		level = THERMAL_HEAVY;
++	} else if (battery >= THERMAL_BATTERY_WARM && level < THERMAL_MODERATE) {
++		level = THERMAL_MODERATE;
++	}
++	g->level = level;
++	if (level != old_level) {
++		flags |= THERMAL_LEVEL_CHANGED;
++	}
++
++	g->hot_ticks = critical ? g->hot_ticks + 1 : 0;
++	if (g->hot_ticks >= THERMAL_EMERGENCY_TICKS) {
++		flags |= THERMAL_EMERGENCY;
++	}
++	if (g->blind_ticks >= THERMAL_BLIND_TICKS) {
++		flags |= THERMAL_BLIND;
++	}
++	return flags;
++}
++
++static inline const char *
++thermal_level_name(int level)
++{
++	static const char *const names[] = { "nominal", "moderate", "heavy", "trapping", "sleeping" };
++	return level >= 0 && level <= THERMAL_SLEEPING ? names[level] : "?";
++}
++
++#endif /* _SWEET_THERMAL_H_ */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index ec33aca..5562dec 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_adreno_init(void);
++extern void sweet_thermal_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -661,6 +662,7 @@ sweet_ufs_init(void)
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_adreno_init();    /* only with boot-arg adreno=N (sweet_adreno.c) */
++	sweet_thermal_init();   /* on google,sunfish; boot-arg thermal (sweet_thermal.c) */
+ 	sweet_usb_probe();
+ 	return 0;
+ }

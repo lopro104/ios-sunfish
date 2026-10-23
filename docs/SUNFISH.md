@@ -113,3 +113,17 @@ Try these steps in order. Each one can be tested without the steps after it.
   display service starts; if it still does not take, it sends `CTL_START` after every frame it
   copies to the panel. Look for `SWEET FB: command-mode pingpong` in the log. `sweetfb_kick=0`
   turns the fallback off.
+
+## Temperatures (patch 0085)
+
+The kernel reads all 25 of the SoC's temperature sensors (CPU cores, GPU, memory, modem area, camera,
+video, ...) every 250 ms. It is ported from HackiOS's thermal service (`metal` branch,
+`hk_thermal.c`). It is on by default on sunfish (`thermal=0` turns it off) and only reads: the
+sensors' own thresholds and the SoC's hardware protection stay as the firmware set them.
+
+- In the log: `SWEET THERMAL: first reading: aoss-0=34.5 cpu-0-0=...` at boot, a line whenever the
+  heat level changes, and every sensor once a minute.
+- For iOS: `kern.hackios.thermal_pressure` (0 nominal ... 4 sleeping), the same names HackiOS uses,
+  so their `thermald` can pass it to apps. `sysctl kern.hackios.thermal` prints the whole table.
+- What it does **not** do yet: slow the cores when hot. That needs a CPU frequency driver for the
+  SM7150 (its OSM block), which this kernel doesn't have. The cores run at the speed ABL left them.
