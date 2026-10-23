@@ -159,7 +159,9 @@ The log also shows how fast a simple loop runs before and after: the speed-up, i
 
   The vote stays until the phone restarts. Log lines: `SWEET RPMH: DDR bandwidth ...`.
 - **Battery temperature.** Read once a second from the PM6150's ADC (the battery thermistor, as
-  Android's driver reads it) and given to the thermal service. As in HackiOS: from 45 C the heat
-  level is at least "moderate", from 50 C the cores are held at half speed, from 58 C at the lowest.
+  Android's driver reads it) and given to the thermal service. One limit, Google's own for sunfish
+  (`thermal_info_config_sunfish.json`, where Android shuts down at 60 C): from 60 C the cores go to
+  their lowest speed and the heat level is "trapping"; below it the battery changes nothing (0088;
+  HackiOS's 45/50/58 C, used in 0087, were stricter than Google's).
   A thermistor that reads off the table (open or shorted) counts as no reading, so a broken sensor
   can't slow the phone. `sysctl kern.hackios.battery_temperature_tenths`.

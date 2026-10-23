@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 0088, 2026-10-23: battery limit 60 C (Google's thermal_info_config_sunfish.json; the CPU limit, 95 C, already matched)
+
 ## >>> 0087, 2026-10-23: DDR bandwidth vote + battery temperature (docs/SUNFISH.md) <<<
 
 sweet_rpmh.c refactored: rh_lookup(res, type) for VRM and BCM, rh_send(addresses, values, n, what) generic (L11C goes through it unchanged in values; conflict check now per 4-byte address). New sweet_rpmh_ddr_vote(): HackiOS ddr_raise() on SM7150: BCM MC0/SH0 vote(x=y=16383), ACV vote(0, 8). Called from sweet_cpufreq_init (`ddr` boot-arg, default 2 with cpufreq=1). sweet_spmi_battery_temp(): PM6150 ADC5 (0x3100) BAT_THERM_100K_PU 0x4a one conversion (0x42..0x46 then CONV_REQ 0x47, STATUS1 EOC, DATA0/1, 1.875 V / 0x70e4, 100k NTC table); sweet_spmi_write allow-list extended to 0x3142..0x3147. Thermal service reads it once a second (off-table readings ignored). Not run on hardware; the sweet L11C path changed by the refactor is not re-tested either.

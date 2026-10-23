@@ -1,0 +1,53 @@
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 4810974..bc13a67 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -17,7 +17,7 @@
+  *   kern.hackios.thermal_running      1 while the service runs
+  *
+  * The battery's temperature (PM6150 ADC5, once a second, sweet_spmi_battery_temp()) goes into the
+- * governor as in HackiOS: 45 C at least moderate, 50 C the cores at half speed, 58 C at the lowest.
++ * governor at Google's one battery limit: 60 C, the cores at the lowest speed (sweet_thermal.h).
+  *
+  * Boot-arg thermal: 0 off, 1 on (the default on google,sunfish; elsewhere off), 2 on on any board.
+  * Only reads the sensors: TSENS is never written, its own thresholds stay as the firmware set them.
+diff --git a/bsd/dev/sweet_thermal.h b/bsd/dev/sweet_thermal.h
+index 6a87011..1b1ebbb 100644
+--- a/bsd/dev/sweet_thermal.h
++++ b/bsd/dev/sweet_thermal.h
+@@ -45,9 +45,12 @@
+ #define THERMAL_EMERGENCY_TICKS 8               /* two seconds past the stop: the run ends (a panic) */
+ #define THERMAL_BLIND_TICKS     20              /* five seconds with no CPU reading: slow to half and say so */
+ 
+-#define THERMAL_BATTERY_WARM    450             /* the battery's temperature: 45 C, at least MODERATE */
+-#define THERMAL_BATTERY_HOT     500             /* 50 C: the cores held at most at half speed, HEAVY */
+-#define THERMAL_BATTERY_DANGER  580             /* 58 C: TRAPPING, the cores at the lowest speed */
++/*
++ * The battery's temperature: Google's sunfish config (thermal_info_config_sunfish.json, "battery")
++ * has one limit, 60 C, where Android shuts the phone down. Here that is TRAPPING and the cores at
++ * the lowest speed; below it the battery changes nothing. (HackiOS's 45/50/58 C were stricter.)
++ */
++#define THERMAL_BATTERY_DANGER  600
+ 
+ struct thermal_zone {
+ 	const char *name;                       /* as the device tree calls it */
+@@ -190,8 +193,6 @@ thermal_gov_step(struct thermal_gov *g, const int16_t *tenths, int battery)
+ 		}
+ 		if (battery >= THERMAL_BATTERY_DANGER) {
+ 			g->cap[d] = 0;
+-		} else if (battery >= THERMAL_BATTERY_HOT && g->cap[d] > g->top[d] / 2) {
+-			g->cap[d] = g->top[d] / 2;
+ 		}
+ 		if (g->blind_ticks >= THERMAL_BLIND_TICKS && g->cap[d] > g->top[d] / 2) {
+ 			g->cap[d] = g->top[d] / 2;
+@@ -222,10 +223,6 @@ thermal_gov_step(struct thermal_gov *g, const int16_t *tenths, int battery)
+ 	}
+ 	if (battery >= THERMAL_BATTERY_DANGER && level < THERMAL_TRAPPING) {
+ 		level = THERMAL_TRAPPING;
+-	} else if (battery >= THERMAL_BATTERY_HOT && level < THERMAL_HEAVY) {
+-		level = THERMAL_HEAVY;
+-	} else if (battery >= THERMAL_BATTERY_WARM && level < THERMAL_MODERATE) {
+-		level = THERMAL_MODERATE;
+ 	}
+ 	g->level = level;
+ 	if (level != old_level) {
