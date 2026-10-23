@@ -1,0 +1,517 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 6452479..6106632 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -15,6 +15,14 @@
+  *   cpufreq=1   that, and every group with one of our cores in it (cpus=N) to its top row; the
+  *               thermal service (sweet_thermal.c) then slows it down when it gets hot
+  *
++ * And the memory's speed, as HackiOS raises it next to the cores' (their measurement: all cores
++ * together 12.4 GB/s writing before, 15.4 after): a bandwidth vote through RPMh on the memory's bus
++ * clock managers (sweet_rpmh.c, sweet_rpmh_ddr_vote()).
++ *
++ *   ddr=0       no vote             ddr=1   only look the BCMs up in cmd-db
++ *   ddr=2       vote ddr_vote=N (1..16383, default 16383: the most there is)
++ *   default: 2 with cpufreq=1, else 0. The vote stays until the phone restarts.
++ *
+  * Registers (linux drivers/cpufreq/qcom-cpufreq-hw.c, qcom_soc_data; sm7150.dtsi cpufreq@18323000):
+  *   group 0 (the six Cortex-A55, cpu0-5) at 0x18323000, group 1 (the two Cortex-A76) at 0x18325800
+  *   0x000 enable           bit 0: the firmware runs this group
+@@ -35,6 +43,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
+ void sweet_cpufreq_init(void);
+ int sweet_cpufreq_top(uint32_t domain);
+ uint32_t sweet_cpufreq_khz(uint32_t domain, int row);
+@@ -157,10 +166,22 @@ sweet_cpufreq_init(void)
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t mode = 0, cores[OSM_DOMAINS] = { 0 }, before;
+ 
+-	if (started || !PE_parse_boot_argn("cpufreq", &mode, sizeof(mode)) || mode == 0) {
++	uint32_t ddr = 0, vote = 0x3fff;
++
++	if (started) {
+ 		return;
+ 	}
+ 	started = true;
++	PE_parse_boot_argn("cpufreq", &mode, sizeof(mode));
++	ddr = mode == 1 ? 2 : 0;
++	PE_parse_boot_argn("ddr", &ddr, sizeof(ddr));
++	PE_parse_boot_argn("ddr_vote", &vote, sizeof(vote));
++	if (ddr == 1 || ddr == 2) {
++		(void)sweet_rpmh_ddr_vote(vote, ddr == 2);
++	}
++	if (mode == 0) {
++		return;
++	}
+ 	/* our cores (cpus=N): MPIDR Aff1 is the core number, 0-5 the A55s, 6-7 the A76s */
+ 	for (unsigned int i = 0; i < topology->num_cpus; i++) {
+ 		cores[((topology->cpus[i].phys_id >> 8) & 0xff) < 6 ? 0 : 1]++;
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d8..d203991 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -2,6 +2,13 @@
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ *
++ * Also the memory's bandwidth vote (sweet_rpmh_ddr_vote, sunfish, boot-arg ddr): as HackiOS
++ * (OOSEX GANG, hk_cpufreq.c ddr_raise(), "metal" branch, APSL 2.0), the most bandwidth there is on
++ * the bus clock managers of the memory controller (MC0) and of the shared hub in front of it (SH0),
++ * and the memory kept on for the application processor (ACV bit 3), as Linux's interconnect driver
++ * votes for a busy GPU (icc-bcm-voter.c: commit, valid, 14-bit average and peak). The BCM takes the
++ * highest of its levels the vote reaches. The same ACTIVE TCS sender as the L11C vote.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -12,6 +19,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -44,6 +52,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -159,7 +168,7 @@ rh_map(void)
+ }
+ 
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup(const char *res, unsigned type, uint32_t *address)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -186,9 +195,9 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != type || (addr >> 16) != type || (addr & (type == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid %s entry for %s\n", type == RH_VRM ? "VRM" : "BCM", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
+@@ -218,10 +227,15 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* Up to rh_ncpt writes with response through one free ACTIVE TCS; waits for RPMh to complete them. */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(const uint32_t *addresses, const uint32_t *values, unsigned n, const char *what)
+ {
+ 	int chosen = -1;
++
++	if (n == 0 || n > rh_ncpt || n > 3) {
++		return EINVAL;
++	}
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+ 		uint32_t enabled = rh_read(rh_tcs, b + RH_ENABLE);
+@@ -232,10 +246,12 @@ rh_send(uint32_t address, unsigned mv)
+ 			return EIO;
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+-			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
+-				return EBUSY;
++			for (unsigned k = 0; k < n; ++k) {
++				if ((enabled & (1u << c)) &&
++				    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~3u) == (addresses[k] & ~3u)) {
++					printf("SWEET RPMH: conflicting inherited %s request in TCS%u\n", what, t);
++					return EBUSY;
++				}
+ 			}
+ 		}
+ 		if (chosen < 0 && rh_free(t)) {
+@@ -266,19 +282,18 @@ rh_send(uint32_t address, unsigned mv)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	uint32_t mask = (1u << n) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE %s: %u commands, irq-enable=%#x\n", t, what, n, irq_en);
++	for (unsigned c = 0; c < n; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		printf("SWEET RPMH:   addr=%#x data=%#x\n", addresses[c], values[c]);
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
++		    !rh_sync(cmd + RH_ADDR, addresses[c]) ||
+ 		    !rh_sync(cmd + RH_DATA, values[c])) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, mask) || !rh_sync(b + RH_ENABLE, mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +304,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < n; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,7 +335,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: %s ACTIVE vote complete\n", what);
+ 	return 0;
+ }
+ 
+@@ -343,10 +358,13 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 	}
+ 	error = rh_map();
+ 	if (!error) {
+-		error = rh_lookup(res, &address);
++		error = rh_lookup(res, RH_VRM, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++		const uint32_t addresses[3] = {address, address + 8, address + 4};
++		const uint32_t values[3] = {mv, 7, 1};
++		error = rh_send(addresses, values, 3, "L11C");
+ 	}
+ out:
+ 	if (error) {
+@@ -355,4 +373,53 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++#define BCM_COMMIT      (1u << 30)
++#define BCM_VALID       (1u << 29)
++#define BCM_VOTE(x, y)  (BCM_COMMIT | BCM_VALID | ((uint32_t)(x) & 0x3fffu) << 14 | ((uint32_t)(y) & 0x3fffu))
++#define BCM_ACV_APPS    8u
++
++/*
++ * The memory bandwidth vote: `vote` (1..16383, in the BCMs' own units; 16383 the most) as average and
++ * peak on MC0 and SH0, and ACV's bit for the application processor. send=false only looks the BCMs up
++ * in cmd-db and says where they are.
++ */
++int
++sweet_rpmh_ddr_vote(uint32_t vote, bool send)
++{
++	uint32_t mc0 = 0, sh0 = 0, acv = 0;
++	int error;
++
++	if (vote == 0 || vote > 0x3fffu) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup("MC0", RH_BCM, &mc0);
++	}
++	if (!error) {
++		error = rh_lookup("SH0", RH_BCM, &sh0);
++	}
++	if (!error) {
++		error = rh_lookup("ACV", RH_BCM, &acv);
++	}
++	if (!error && send) {
++		const uint32_t addresses[3] = {mc0, sh0, acv};
++		const uint32_t values[3] = {BCM_VOTE(vote, vote), BCM_VOTE(vote, vote), BCM_VOTE(0, BCM_ACV_APPS)};
++		error = rh_send(addresses, values, 3, "DDR bandwidth");
++	}
++out:
++	printf("SWEET RPMH: DDR bandwidth %s %u on MC0 %#x, SH0 %#x, ACV %#x: %s (errno %d)\n",
++	    send ? "vote" : "look-up for a vote of", vote, mc0, sh0, acv, error ? "FAILED" : "ok", error);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index bf4e518..3204de8 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -89,12 +89,12 @@ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks, the sunfish touch switch
+-	 * (PM6150 GPIO4) and the RTC (0x60); keys retain their own lanes. */
++	 * (PM6150 GPIO4), the RTC (0x60) and the ADC5 (0x31); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+ 	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xc3 &&
+-	    peripheral != 0x60)) {
++	    peripheral != 0x60 && peripheral != 0x31)) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -130,14 +130,15 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 
+ /*
+  * SUNFISH: the in-cell FTM5 touch IC sits behind a load switch on PM6150
+- * GPIO4 (downstream pinctrl touch_power_default: output high). That pin is
+- * the only PMIC state any SWEET driver changes; the address check below
++ * GPIO4 (downstream pinctrl touch_power_default: output high), and the
++ * battery's temperature is a conversion of the PM6150's ADC5 (below). Those
++ * are the only PMIC registers any SWEET driver writes; the address check
+  * keeps every other peripheral read-only.
+  */
+ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+-	if (!sp_ready || sid != 0 || addr < 0xc340u || addr > 0xc346u) {
++	if (!sp_ready || sid != 0 || !((addr >= 0xc340u && addr <= 0xc346u) || (addr >= 0x3142u && addr <= 0x3147u))) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -175,4 +176,110 @@ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++
++/*
++ * The battery's temperature: one conversion of the PM6150's ADC5 (SID 0, 0x3100; linux pm6150.dtsi
++ * adc@3100, channel bat_therm@4a = ADC5_BAT_THERM_100K_PU, ratiometric, hw-settle 200 us), as
++ * drivers/iio/adc/qcom-spmi-adc5.c does it: registers 0x42..0x46 (digital parameters, averaging,
++ * channel, settle time, enable), then the conversion request 0x47, wait for end of conversion in
++ * STATUS1, read DATA0/1; the code to a voltage over the 1.875 V reference (full scale 0x70e4) and the
++ * voltage to a temperature through the 100k NTC table (qcom-vadc-common.c
++ * adcmap_100k_104ef_104fb_1875_vref). The same values Android's driver writes; nothing else in the
++ * ADC is touched.
++ */
++#define ADC5_BASE               0x3100u
++#define ADC5_STATUS1            0x08u
++#define ADC5_STATUS1_FAULT      0x80u
++#define ADC5_STATUS1_EOC        0x01u
++#define ADC5_STATUS1_REQ_EOC    0x03u
++#define ADC5_DIG_PARAM          0x42u
++#define ADC5_CONV_REQ           0x47u
++#define ADC5_DATA0              0x50u
++#define ADC5_CH_BAT_THERM       0x4au
++#define ADC5_FULL_SCALE         0x70e4
++#define ADC5_MAX_CODE           0x7fff
++
++static const struct {
++	int mv = 0, mdeg;
++} adc5_ntc_100k[] = {
++	{ 1831, -40000 }, { 1814, -35000 }, { 1791, -30000 }, { 1761, -25000 }, { 1723, -20000 },
++	{ 1675, -15000 }, { 1616, -10000 }, { 1545, -5000 }, { 1463, 0 }, { 1370, 5000 },
++	{ 1268, 10000 }, { 1160, 15000 }, { 1049, 20000 }, { 937, 25000 }, { 828, 30000 },
++	{ 726, 35000 }, { 630, 40000 }, { 544, 45000 }, { 467, 50000 }, { 399, 55000 },
++	{ 340, 60000 }, { 290, 65000 }, { 247, 70000 }, { 209, 75000 }, { 179, 80000 },
++	{ 153, 85000 }, { 130, 90000 }, { 112, 95000 }, { 96, 100000 }, { 82, 105000 },
++	{ 71, 110000 }, { 62, 115000 }, { 53, 120000 }, { 46, 125000 },
++};
++
++int
++sweet_spmi_battery_temp(int *tenths)
++{
++	static uint32_t failures;
++	uint8_t reg[5], status = 0, lo = 0, hi = 0;
++	int mv = 0, mdeg;
++	unsigned n = sizeof(adc5_ntc_100k) / sizeof(adc5_ntc_100k[0]), i = 0;
++
++	if (!tenths || failures > 3) {
++		return -1;
++	}
++	/* 0x42..0x46 as they are, then the bits qcom-spmi-adc5.c adc5_configure() sets */
++	for (unsigned r = 0; r < 5; r++) {
++		if (sweet_spmi_read(0, ADC5_BASE + ADC5_DIG_PARAM + r, &reg[r]) != 0) {
++			goto fail;
++		}
++	}
++	reg[0] = (uint8_t)((reg[0] & ~0x7cu) | (1u << 4) | (2u << 2)); /* timer cal, ratiometric, decimation 840 */
++	reg[1] = (uint8_t)(reg[1] & ~0x07u);                           /* one sample */
++	reg[2] = ADC5_CH_BAT_THERM;
++	reg[3] = (uint8_t)((reg[3] & ~0x0fu) | 2u);                    /* hw settle 200 us */
++	reg[4] = (uint8_t)(reg[4] | 0x80u);                            /* ADC enabled */
++	for (unsigned r = 0; r < 5; r++) {
++		if (sweet_spmi_write(0, ADC5_BASE + ADC5_DIG_PARAM + r, reg[r]) != 0) {
++			goto fail;
++		}
++	}
++	if (sweet_spmi_write(0, ADC5_BASE + ADC5_CONV_REQ, 0x80u) != 0) {
++		goto fail;
++	}
++	for (unsigned t = 0; t < 100; t++) {
++		delay(100);
++		if (sweet_spmi_read(0, ADC5_BASE + ADC5_STATUS1, &status) != 0) {
++			goto fail;
++		}
++		if ((status & ADC5_STATUS1_REQ_EOC) == ADC5_STATUS1_EOC) {
++			break;
++		}
++	}
++	if ((status & ADC5_STATUS1_REQ_EOC) != ADC5_STATUS1_EOC || (status & ADC5_STATUS1_FAULT) ||
++	    sweet_spmi_read(0, ADC5_BASE + ADC5_DATA0, &lo) != 0 ||
++	    sweet_spmi_read(0, ADC5_BASE + ADC5_DATA0 + 1, &hi) != 0) {
++		goto fail;
++	}
++	unsigned code = (unsigned)lo | (unsigned)hi << 8;
++	if (code > ADC5_MAX_CODE) {
++		code = 0;
++	}
++	mv = (int)((uint64_t)code * 1875 / ADC5_FULL_SCALE);
++	while (i < n && adc5_ntc_100k[i].mv > mv) {
++		i++;
++	}
++	if (i == 0 || i == n) {
++		/* off the table: an open (below -40 C) or shorted (above 125 C) thermistor, not a battery */
++		printf("SWEET BATTERY: ADC5 bat_therm %d mV is off the thermistor table; ignored\n", mv);
++		goto fail;
++	} else {
++		/* linear between the two points (fixp_linear_interpolate) */
++		int x0 = adc5_ntc_100k[i - 1].mv, y0 = adc5_ntc_100k[i - 1].mdeg;
++		int x1 = adc5_ntc_100k[i].mv, y1 = adc5_ntc_100k[i].mdeg;
++		mdeg = y0 + (y1 - y0) * (mv - x0) / (x1 - x0);
++	}
++	*tenths = mdeg / 100;
++	failures = 0;
++	return 0;
++fail:
++	if (++failures > 3) {
++		printf("SWEET BATTERY: ADC5 battery temperature fails (status %#x); not asked again\n", status);
++	}
++	return -1;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index ecb429f..6e82e2b 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -13,6 +13,11 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+  * load switch (PM6150 GPIO4 config registers 0xc340..0xc346) is writable.
+  */
+ int sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val);
++/*
++ * The battery's temperature from the PM6150's ADC5 (BAT_THERM, 100k pull-up), in tenths of a
++ * degree Celsius. Thread context; 0 success, -1 failure.
++ */
++int sweet_spmi_battery_temp(int *tenths);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index 0624956..4810974 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -16,6 +16,9 @@
+  *   kern.hackios.thermal_throttles    how many times a group was slowed (0 here: no caps)
+  *   kern.hackios.thermal_running      1 while the service runs
+  *
++ * The battery's temperature (PM6150 ADC5, once a second, sweet_spmi_battery_temp()) goes into the
++ * governor as in HackiOS: 45 C at least moderate, 50 C the cores at half speed, 58 C at the lowest.
++ *
+  * Boot-arg thermal: 0 off, 1 on (the default on google,sunfish; elsewhere off), 2 on on any board.
+  * Only reads the sensors: TSENS is never written, its own thresholds stay as the firmware set them.
+  *
+@@ -42,6 +45,8 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern int sweet_cpufreq_top(uint32_t domain);
+ extern uint32_t sweet_cpufreq_khz(uint32_t domain, int row);
+ extern void sweet_cpufreq_cap(uint32_t domain, int row);
++extern int sweet_spmi_init(void);
++extern int sweet_spmi_battery_temp(int *tenths);
+ void sweet_thermal_init(void);
+ 
+ #define TSENS0_TM               0x0c263000UL    /* dt: thermal-sensor@c263000, "TM" */
+@@ -55,6 +60,7 @@ static vm_offset_t tsens[2];
+ static struct thermal_gov gov;
+ static int16_t readings[THERMAL_ZONES];
+ static bool thermal_caps_on;                    /* cpufreq=1 raised a group: there are caps to set */
++static int battery_tenths = -2730;              /* the battery's temperature (PM6150 ADC5); -2730: not known */
+ 
+ /* what the sysctls show, kept by the service's thread and read by anyone */
+ static LCK_GRP_DECLARE(thermal_lck_grp, "sweet-thermal");
+@@ -71,6 +77,8 @@ SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_throttles, CTLFLAG_RD | CTLFLAG_LOCK
+     "how many times a group of cores was slowed down");
+ SYSCTL_INT(_kern_hackios, OID_AUTO, thermal_running, CTLFLAG_RD | CTLFLAG_LOCKED, &thermal_running, 0,
+     "1 while the thermal service runs");
++SYSCTL_INT(_kern_hackios, OID_AUTO, battery_temperature_tenths, CTLFLAG_RD | CTLFLAG_LOCKED, &battery_tenths, 0,
++    "the battery's temperature from the PM6150 ADC, tenths of a degree Celsius; -2730 while not known");
+ 
+ static int
+ thermal_sysctl_text(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+@@ -119,9 +127,10 @@ write_text(void)
+ 	size_t n = 0;
+ 	char a[16], b[16], c[16];
+ 
+-	n += (size_t)snprintf(text + n, sizeof(text) - n, "pressure %s (%d), hottest %s %s C, slowed %d times\n",
++	n += (size_t)snprintf(text + n, sizeof(text) - n, "pressure %s (%d), hottest %s %s C, battery %s C, slowed %d times\n",
+ 	    thermal_level_name(gov.level), gov.level, gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-",
+-	    tenths_text(gov.hottest_temp, a, sizeof(a)), (int)gov.throttles);
++	    tenths_text(gov.hottest_temp, a, sizeof(a)),
++	    tenths_text(battery_tenths < -2000 ? THERMAL_INVALID : battery_tenths, b, sizeof(b)), (int)gov.throttles);
+ 	for (int d = 0; d < THERMAL_DOMAINS && n < sizeof(text); d++) {
+ 		static const char *const names[THERMAL_DOMAINS] = { "A55 cores", "A76 cores" };
+ 
+@@ -176,8 +185,14 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ 		for (int z = 0; z < THERMAL_ZONES; z++) {
+ 			readings[z] = read_sensor(hk_thermal_zones[z].block, hk_thermal_zones[z].sensor);
+ 		}
+-		/* no battery temperature in this kernel yet: "not known" */
+-		flags = thermal_gov_step(&gov, readings, -2730);
++		/* the battery once a second: an ADC conversion over SPMI, slower than TSENS and changing slowly */
++		if (ticks % (1000 / THERMAL_TICK_MS) == 0) {
++			int t;
++			if (sweet_spmi_battery_temp(&t) == 0) {
++				battery_tenths = t;
++			}
++		}
++		flags = thermal_gov_step(&gov, readings, battery_tenths);
+ 
+ 		if ((flags & THERMAL_CAPS_CHANGED) && thermal_caps_on) {
+ 			for (int d = 0; d < THERMAL_DOMAINS; d++) {
+@@ -185,8 +200,11 @@ thermal_thread(__unused void *arg, __unused wait_result_t wr)
+ 			}
+ 		}
+ 		if (flags & (THERMAL_CAPS_CHANGED | THERMAL_LEVEL_CHANGED)) {
+-			printf("SWEET THERMAL: %s, hottest %s at %s C; cores at rows %d/%d %d/%d\n", thermal_level_name(gov.level),
+-			    gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-", tenths_text(gov.hottest_temp, a, sizeof(a)),
++			char bt[16];
++			printf("SWEET THERMAL: %s, hottest %s at %s C, battery %s C; cores at rows %d/%d %d/%d\n",
++			    thermal_level_name(gov.level), gov.hottest >= 0 ? hk_thermal_zones[gov.hottest].name : "-",
++			    tenths_text(gov.hottest_temp, a, sizeof(a)),
++			    tenths_text(battery_tenths < -2000 ? THERMAL_INVALID : battery_tenths, bt, sizeof(bt)),
+ 			    gov.cap[0], gov.top[0], gov.cap[1], gov.top[1]);
+ 		}
+ 		if ((flags & THERMAL_BLIND) && !was_blind) {
+@@ -272,6 +290,13 @@ sweet_thermal_init(void)
+ 	}
+ 	/* whether TSENS answers at all is the first thing to know */
+ 	log_all("first reading");
++	if (sweet_spmi_init() == 0 && sweet_spmi_battery_temp(&battery_tenths) == 0) {
++		char bt[16];
++		printf("SWEET THERMAL: battery %s C (PM6150 ADC5 bat_therm)\n", tenths_text(battery_tenths, bt, sizeof(bt)));
++	} else {
++		battery_tenths = -2730;
++		printf("SWEET THERMAL: no battery temperature (ADC5 not readable); the battery limits are off\n");
++	}
+ 	if (kernel_thread_start(thermal_thread, NULL, &thread) != KERN_SUCCESS) {
+ 		printf("SWEET THERMAL: no thread: the sensors are NOT watched\n");
+ 		return;

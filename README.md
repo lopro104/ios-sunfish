@@ -171,6 +171,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0084 | PM6150 RTC as the calendar (`sweetrtc_offset=`), no more 30 s IORTC wait at boot; sunfish display fallback: autorefresh re-armed by the kernel, else `CTL_START` after every frame |
 | 0085 | Thermal service (watch and report): all 25 TSENS sensors every 250 ms, iOS pressure level in `kern.hackios.thermal_pressure`; ported from HackiOS (`metal` branch) |
 | 0086 | CPU speed (SM7150 OSM): `cpufreq=2` reads the speed tables, `cpufreq=1` raises the cores to their top speed; the thermal service then slows them when hot. Ported from HackiOS |
+| 0087 | Memory bandwidth vote through RPMh (`ddr=`, on with `cpufreq=1`), battery temperature from the PM6150 ADC into the thermal service; ported from HackiOS |
 
 ## Key hardware facts (sunfish)
 

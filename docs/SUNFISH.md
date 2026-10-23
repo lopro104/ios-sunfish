@@ -142,3 +142,24 @@ newer block, so the registers here are the SM7150's (Linux `qcom-cpufreq-hw`).
 | `cpufreq=1` | Each group with one of our cores (see `cpus=N`) goes to its top speed (A55s and, with `cpus=8`, the A76s). The thermal service then slows them a row at a time when a sensor passes 95 C, and ends the run with a panic after 2 s past 110 C with everything at the lowest speed (as HackiOS does). |
 
 The log also shows how fast a simple loop runs before and after: the speed-up, in one number.
+
+## Memory speed and battery temperature (patch 0087)
+
+- **Memory speed.** Drawing everything on the CPU is memory-heavy. As HackiOS does, the kernel asks
+  RPMh for the most memory bandwidth there is: a vote on the memory controller's and the shared
+  hub's bus clock managers (MC0, SH0) and on ACV for the application processor. HackiOS measured
+  12.4 GB/s writing before and 15.4 GB/s after on their phone.
+
+  | Boot-arg | Effect |
+  | --- | --- |
+  | *(default)* | The vote happens with `cpufreq=1`, otherwise not |
+  | `ddr=1` | Only look the bus clock managers up and log where they are |
+  | `ddr=2` | Vote (also without `cpufreq=1`); `ddr_vote=N` (1..16383) instead of the most |
+  | `ddr=0` | Never |
+
+  The vote stays until the phone restarts. Log lines: `SWEET RPMH: DDR bandwidth ...`.
+- **Battery temperature.** Read once a second from the PM6150's ADC (the battery thermistor, as
+  Android's driver reads it) and given to the thermal service. As in HackiOS: from 45 C the heat
+  level is at least "moderate", from 50 C the cores are held at half speed, from 58 C at the lowest.
+  A thermistor that reads off the table (open or shorted) counts as no reading, so a broken sensor
+  can't slow the phone. `sysctl kern.hackios.battery_temperature_tenths`.

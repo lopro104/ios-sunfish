@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 0087, 2026-10-23: DDR bandwidth vote + battery temperature (docs/SUNFISH.md) <<<
+
+sweet_rpmh.c refactored: rh_lookup(res, type) for VRM and BCM, rh_send(addresses, values, n, what) generic (L11C goes through it unchanged in values; conflict check now per 4-byte address). New sweet_rpmh_ddr_vote(): HackiOS ddr_raise() on SM7150: BCM MC0/SH0 vote(x=y=16383), ACV vote(0, 8). Called from sweet_cpufreq_init (`ddr` boot-arg, default 2 with cpufreq=1). sweet_spmi_battery_temp(): PM6150 ADC5 (0x3100) BAT_THERM_100K_PU 0x4a one conversion (0x42..0x46 then CONV_REQ 0x47, STATUS1 EOC, DATA0/1, 1.875 V / 0x70e4, 100k NTC table); sweet_spmi_write allow-list extended to 0x3142..0x3147. Thermal service reads it once a second (off-table readings ignored). Not run on hardware; the sweet L11C path changed by the refactor is not re-tested either.
+
 ## >>> 0086, 2026-10-23: CPU speed (OSM) + thermal caps (docs/SUNFISH.md) <<<
 
 `bsd/dev/sweet_cpufreq.c`, ported from HackiOS hk_cpufreq.c (their EPSS -> SM7150 OSM, qcom-cpufreq-hw sdm845 regs): domains 0x18323000 (cpu0-5) / 0x18325800 (cpu6-7); enable 0x0 bit0, LUT 0x110+32n (src[31:30], cores[18:16], lval[7:0]), volt 0x114+32n, current 0x704, perf state 0x920. `cpufreq=2` read-only log, `cpufreq=1` top non-boost row for groups with our cores. sweet_thermal.c now caps raised groups and panics after 2 s past 110 C at lowest speed (HackiOS behaviour); without cpufreq=1 it stays watch-only. Battery temperature not wired (needs a PM6150 ADC5 driver). Haptics deferred: HackiOS feeds the motor from their CoreAudio "Actuator" plug-in (userland), not possible without an iOS toolchain here. Not run on hardware.
