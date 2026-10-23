@@ -1,5 +1,9 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## >>> 0086, 2026-10-23: CPU speed (OSM) + thermal caps (docs/SUNFISH.md) <<<
+
+`bsd/dev/sweet_cpufreq.c`, ported from HackiOS hk_cpufreq.c (their EPSS -> SM7150 OSM, qcom-cpufreq-hw sdm845 regs): domains 0x18323000 (cpu0-5) / 0x18325800 (cpu6-7); enable 0x0 bit0, LUT 0x110+32n (src[31:30], cores[18:16], lval[7:0]), volt 0x114+32n, current 0x704, perf state 0x920. `cpufreq=2` read-only log, `cpufreq=1` top non-boost row for groups with our cores. sweet_thermal.c now caps raised groups and panics after 2 s past 110 C at lowest speed (HackiOS behaviour); without cpufreq=1 it stays watch-only. Battery temperature not wired (needs a PM6150 ADC5 driver). Haptics deferred: HackiOS feeds the motor from their CoreAudio "Actuator" plug-in (userland), not possible without an iOS toolchain here. Not run on hardware.
+
 ## >>> 0085, 2026-10-23: thermal service, watch-only (docs/SUNFISH.md) <<<
 
 `bsd/dev/sweet_thermal.c` + `sweet_thermal.h`, ported from HackiOS `metal` (hk_thermal.c/.h, APSL 2.0): 25 TSENS v2 sensors (tsens0 TM 0xc263000 x15, tsens1 TM 0xc265000 x10; names from msm-4.14 sdmmagpie-thermal.dtsi), their governor unchanged with no caps (no cpufreq for OSM yet), sysctls kern.hackios.thermal* (their thermald's names). Default on for google,sunfish, `thermal=0` off, `thermal=2` any board. No emergency panic without caps (log only). Not run on hardware.

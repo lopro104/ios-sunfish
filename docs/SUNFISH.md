@@ -127,3 +127,18 @@ sensors' own thresholds and the SoC's hardware protection stay as the firmware s
   so their `thermald` can pass it to apps. `sysctl kern.hackios.thermal` prints the whole table.
 - What it does **not** do yet: slow the cores when hot. That needs a CPU frequency driver for the
   SM7150 (its OSM block), which this kernel doesn't have. The cores run at the speed ABL left them.
+
+## CPU speed (patch 0086)
+
+The bootloader leaves the cores at a modest speed. The SM7150's speed block (OSM) has a table of
+speeds per group of cores, built by the firmware, and switches clock and voltage by itself when
+told which row to use. Ported from HackiOS (`hk_cpufreq.c`, `metal` branch); their chip has a
+newer block, so the registers here are the SM7150's (Linux `qcom-cpufreq-hw`).
+
+| Boot-arg | Effect |
+| --- | --- |
+| *(none)* | Nothing touched; the cores stay at the bootloader's speed |
+| `cpufreq=2` | Read only: each group's speed table and current speed go to the log (`SWEET CPUFREQ:`). **Try this first.** |
+| `cpufreq=1` | Each group with one of our cores (see `cpus=N`) goes to its top speed (A55s and, with `cpus=8`, the A76s). The thermal service then slows them a row at a time when a sensor passes 95 C, and ends the run with a panic after 2 s past 110 C with everything at the lowest speed (as HackiOS does). |
+
+The log also shows how fast a simple loop runs before and after: the speed-up, in one number.
