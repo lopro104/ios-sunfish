@@ -1,4 +1,4 @@
-#Not yet ported to the fish
+#Not yet tested on the fish
 
 # ios-sweet
 
