@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 0094-0095, 2026-10-24: Bergamota 0116, 0119 (= topaz 0135-0137), 0122 (= topaz 0138), 0136; topaz 0131, 0128, all applied as they are (Bergamota builds xnu for macOS 15.3, but these only use functions xnu-8796 has). Not taken: Bergamota 0141 FJCVTZS (iOS 18 arm64e only; the iPhone X userland never uses it); topaz 0127/0132-0134/0139 and Bergamota 0097/0120/0121/0123 (conflict with our SweetFramebuffer/SweetSurface; need porting by hand).
+
 ## 0093, 2026-10-24: from NWylynko/ios-flame: 0084 (early fb Device-GRE; sunfish's 32 MB block covers dfps_data and undescribed memory), 0104 (planar IOSurface bpr), 0121 (vsync period), 0114 (AMFI dyld policy, policy renamed "AMFI"). 0104 and 0114 applied as they are.
 
 ## 0092, 2026-10-24: Adreno steps corrected from arbuxiktech/ios-surya's hardware-verified A618 bring-up (GPUCC 0x5000 SMMU vote, GCC clock order, zap optional, HFI non-fatal, scratch-reg test). See docs/GPU.md.

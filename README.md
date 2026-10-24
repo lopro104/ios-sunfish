@@ -6,7 +6,7 @@
 
 This is a port of [ios-sweet](https://github.com/dipa-studio/ios-sweet). That project runs Apple's open-source XNU kernel (xnu-8796, iOS 16 generation) with the **unmodified iOS 16.7.16 userland of the iPhone X** on the Redmi Note 10 Pro. The Pixel 4a (`sunfish`) uses the same Qualcomm SM7150 chip. Most of that work therefore carries over, and this repository adds what differs on the Pixel.
 
-> **Status (2026-10-24): ported, not yet tested on a Pixel 4a.** Everything in the sweet column of the table below has run on real hardware. The sunfish-specific parts (patches 0082-0093: board support, display refresh, touch, RTC, thermal, CPU and memory speed, battery, the GPU bring-up and the `SweetGPU` service, and the boot image) are written and build in CI, but nobody has tried them on a phone yet. The first-boot checklist is in [`docs/SUNFISH.md`](docs/SUNFISH.md). Reports are welcome.
+> **Status (2026-10-24): ported, not yet tested on a Pixel 4a.** Everything in the sweet column of the table below has run on real hardware. The sunfish-specific parts (patches 0082-0095: board support, display refresh, touch, RTC, thermal, CPU and memory speed, battery, the GPU bring-up and the `SweetGPU` service, and the boot image) are written and build in CI, but nobody has tried them on a phone yet. The first-boot checklist is in [`docs/SUNFISH.md`](docs/SUNFISH.md). Reports are welcome.
 
 > Experimental bring-up, not a usable phone OS. Apple's security model is mostly switched off. It installs into the `userdata` partition, so **it erases Android's user data**.
 
@@ -191,6 +191,8 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0091 | Battery: the Pixel 4a's 3140 mAh and Google's voltage curve, battery temperature from the thermistor, PMIC reading on by default on sunfish |
 | 0092 | GPU bring-up corrected with hardware findings from ios-surya (same SoC and GPU): SMMU clock vote, safe clock order, no zap shader needed, register test (docs/GPU.md) |
 | 0093 | From [ios-flame](https://github.com/NWylynko/ios-flame) (Pixel 4): early framebuffer as Device memory (no speculative reads past it), planar IOSurface bytes-per-row (blank Safari pages), vsync refresh period for Core Animation, AMFI answers dyld's policy query (third-party apps with frameworks load) |
+| 0094 | From [Bergamota](https://github.com/ry-diffusion/Bergamota) and [ios-topaz](https://github.com/MakrSas/ios-topaz): sandbox extensions (TCC grants such as Photos work), the container query answered, IOSurface views released at the right trap (a backboardd crash), an empty `IOAcceleratorES` (no 30 s wait in Core Animation at every backboardd start) |
+| 0095 | From ios-topaz: IOSurface calls that would hand out a zeroed client refused (a Core Animation crash), and IOKit allowed to quiesce (configd, Wi-Fi setup and SpringBoard waited for it) |
 
 ## Key hardware facts (sunfish)
 
