@@ -1,8 +1,16 @@
 diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
-index ff2c725..5d09612 100644
+index ff2c725..f5c6d61 100644
 --- a/bsd/kern/sweet_amfi.c
 +++ b/bsd/kern/sweet_amfi.c
-@@ -280,25 +280,124 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+@@ -26,6 +26,7 @@
+ #include <kern/debug.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
++#include <os/atomic_private.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
+ #include <sys/mount.h>
+@@ -280,25 +281,124 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
   * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
   * "profile not found"). SWEET runs without a sandbox: operations succeed
   * (checks allow, profile init is accepted); the few that must return
