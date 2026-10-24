@@ -45,7 +45,7 @@ Both phones are SM7150. The CPUs, GIC, RAM layout, the splash framebuffer at `0x
 
 | | sweet | sunfish | Where |
 | --- | --- | --- | --- |
-| Boot image | Xiaomi layout, text offset 0 | ramdisk `0x2000000`, tags `0x1e00000`; ABL requires Image text offset **`0x80000`** | `DEVICE=sunfish shim/build.sh` |
+| Boot image | Xiaomi layout, text offset 0 | ramdisk `0x2000000`, tags `0x1e00000`; ABL requires Image text offset **`0x80000`**, an **LZ4** kernel and an **AVB hash footer** (64 MiB) | `DEVICE=sunfish shim/build.sh` |
 | Panel | 1080x2400, video mode | 1080x2340 Samsung sofef01, **command mode**: the display controller only sends a frame when kicked | `shim/disp.c` enables pingpong autorefresh |
 | Touch | Goodix GT9896 @ `0x5d` | in-cell **ST FTM5 @ `0x49`** | kernel patch `0082`, `sweet_touch.c` |
 | Touch power | L11C via RPMh | panel rails (on from ABL) + load switch on PM6150 GPIO4 | `0082`, `sweet_spmi_write()` (limited to that pin) |
@@ -100,7 +100,10 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 
 ### 3. Build the boot image
 
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
+Needs `aarch64-linux-gnu-gcc`, `mkbootimg`, `lz4` and AOSP's `avbtool` (Fedora: `sudo dnf install lz4`; `avbtool.py` is
+in any Android tree, `external/avb/avbtool.py`, and the script looks in `~/evox17` by itself, or set `AVBTOOL=`).
+Google's bootloader refuses `fastboot boot` of a kernel that is not LZ4-compressed or an image without an AVB
+footer (found on the Pixel 4 by [ios-flame](https://github.com/NWylynko/ios-flame)); `DEVICE=sunfish` does both.
 
 ```sh
 python3 tools/mkadt.py shim/out/sunfish.adt --highmem --device sunfish
