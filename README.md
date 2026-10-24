@@ -1,10 +1,12 @@
+#Not yet tested on the fish
+
 # ios-sunfish
 
 **Apple's iOS 16 on the Google Pixel 4a.**
 
 This is a port of [ios-sweet](https://github.com/dipa-studio/ios-sweet). That project runs Apple's open-source XNU kernel (xnu-8796, iOS 16 generation) with the **unmodified iOS 16.7.16 userland of the iPhone X** on the Redmi Note 10 Pro. The Pixel 4a (`sunfish`) uses the same Qualcomm SM7150 chip. Most of that work therefore carries over, and this repository adds what differs on the Pixel.
 
-> **Status (2026-10-21): ported, not yet booted on a Pixel 4a.** Everything in the sweet column of the table below has run on real hardware. The sunfish-specific parts (the display refresh, the touch driver and the boot image) are written and build, but nobody has tried them on a phone yet. The first-boot checklist is in [`docs/SUNFISH.md`](docs/SUNFISH.md). Reports are welcome.
+> **Status (2026-10-24): ported, not yet tested on a Pixel 4a.** Everything in the sweet column of the table below has run on real hardware. The sunfish-specific parts (patches 0082-0091: board support, display refresh, touch, RTC, thermal, CPU and memory speed, battery, the GPU bring-up and the `SweetGPU` service, and the boot image) are written and build in CI, but nobody has tried them on a phone yet. The first-boot checklist is in [`docs/SUNFISH.md`](docs/SUNFISH.md). Reports are welcome.
 
 > Experimental bring-up, not a usable phone OS. Apple's security model is mostly switched off. It installs into the `userdata` partition, so **it erases Android's user data**.
 
