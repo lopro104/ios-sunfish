@@ -20,7 +20,11 @@ if [ -z "${MKBOOTIMG:-}" ]; then
 	elif [ -f "$ANDROID_TREE/system/tools/mkbootimg/mkbootimg.py" ]; then
 		MKBOOTIMG="python3 $ANDROID_TREE/system/tools/mkbootimg/mkbootimg.py"
 	else
-		echo "error: mkbootimg not found: install it, or set MKBOOTIMG= or ANDROID_TREE= (an Android tree)" >&2
+		echo "error: mkbootimg not found: install it, set MKBOOTIMG=, or ANDROID_TREE= to an Android tree." >&2
+		echo "  Without a ROM tree, LineageOS's two repositories are enough:" >&2
+		echo "  git clone --depth 1 -b lineage-23.0 https://github.com/LineageOS/android_system_tools_mkbootimg tools-android/system/tools/mkbootimg" >&2
+		echo "  git clone --depth 1 -b lineage-23.0 https://github.com/LineageOS/android_external_avb tools-android/external/avb" >&2
+		echo "  ANDROID_TREE=\$PWD/tools-android DEVICE=$DEVICE shim/build.sh" >&2
 		exit 1
 	fi
 fi
@@ -88,7 +92,7 @@ $MKBOOTIMG --header_version 2 --kernel "$KERNEL" --ramdisk out/ramdisk.bin \
 if [ -n "$AVB_PARTITION_SIZE" ]; then
 	AVBTOOL=${AVBTOOL:-$(command -v avbtool || true)}
 	[ -n "$AVBTOOL" ] || [ ! -f "$ANDROID_TREE/external/avb/avbtool.py" ] || AVBTOOL="$ANDROID_TREE/external/avb/avbtool.py"
-	[ -n "$AVBTOOL" ] || { echo "error: avbtool not found: set AVBTOOL=/path/to/avbtool.py (AOSP external/avb)" >&2; exit 1; }
+	[ -n "$AVBTOOL" ] || { echo "error: avbtool not found: set AVBTOOL=, or ANDROID_TREE= (git clone https://github.com/LineageOS/android_external_avb)" >&2; exit 1; }
 	# Unsigned (algorithm NONE); ABL only wants the footer to be there on an unlocked phone.
 	python3 "$AVBTOOL" add_hash_footer --image out/shim-boot.img \
 		--partition_size "$AVB_PARTITION_SIZE" --partition_name boot

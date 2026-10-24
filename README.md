@@ -102,7 +102,14 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 
 Needs `aarch64-linux-gnu-gcc`, `lz4` (Fedora: `sudo dnf install lz4`), and AOSP's `mkbootimg` and `avbtool`. Any Android
 ROM tree has both (`system/tools/mkbootimg/mkbootimg.py`, `external/avb/avbtool.py`); the script uses them from
-`~/evox17` when they are not installed (`ANDROID_TREE=` for another tree, or `MKBOOTIMG=` / `AVBTOOL=` for single files).
+`~/evox17` when they are not installed (`ANDROID_TREE=` for another tree, or `MKBOOTIMG=` / `AVBTOOL=` for single files). Without a ROM tree,
+LineageOS's two repositories do:
+
+```sh
+git clone --depth 1 -b lineage-23.0 https://github.com/LineageOS/android_system_tools_mkbootimg tools-android/system/tools/mkbootimg
+git clone --depth 1 -b lineage-23.0 https://github.com/LineageOS/android_external_avb tools-android/external/avb
+ANDROID_TREE=$PWD/tools-android DEVICE=sunfish shim/build.sh
+```
 Google's bootloader refuses `fastboot boot` of a kernel that is not LZ4-compressed or an image without an AVB
 footer (found on the Pixel 4 by [ios-flame](https://github.com/NWylynko/ios-flame)); `DEVICE=sunfish` does both.
 
