@@ -8,9 +8,22 @@
 # ABL boot image rules"; sunfish's BoardConfig has Image.lz4 and a 64 MiB boot
 # partition). Needs lz4 and AOSP's avbtool: AVBTOOL=path, else avbtool on PATH,
 # else ~/evox17/external/avb/avbtool.py (an Android tree).
+# mkbootimg likewise: MKBOOTIMG=path, else mkbootimg on PATH, else the Android
+# tree's system/tools/mkbootimg/mkbootimg.py. ANDROID_TREE=path changes ~/evox17.
 set -euo pipefail
 cd "$(dirname "$0")"
 DEVICE=${DEVICE:-sweet}
+ANDROID_TREE=${ANDROID_TREE:-$HOME/evox17}
+if [ -z "${MKBOOTIMG:-}" ]; then
+	if command -v mkbootimg >/dev/null; then
+		MKBOOTIMG=mkbootimg
+	elif [ -f "$ANDROID_TREE/system/tools/mkbootimg/mkbootimg.py" ]; then
+		MKBOOTIMG="python3 $ANDROID_TREE/system/tools/mkbootimg/mkbootimg.py"
+	else
+		echo "error: mkbootimg not found: install it, or set MKBOOTIMG= or ANDROID_TREE= (an Android tree)" >&2
+		exit 1
+	fi
+fi
 LZ4_KERNEL=0
 AVB_PARTITION_SIZE=
 CC=aarch64-linux-gnu-gcc
@@ -67,14 +80,14 @@ else
 	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
 [ -f "$DTB" ] || { echo "error: stock DTB $DTB missing (see README: unpack the stock boot.img)" >&2; exit 1; }
-# shellcheck disable=SC2086 # MKBOOTIMG_LAYOUT is a list of arguments
-mkbootimg --header_version 2 --kernel "$KERNEL" --ramdisk out/ramdisk.bin \
+# shellcheck disable=SC2086 # MKBOOTIMG may be "python3 path"; MKBOOTIMG_LAYOUT is a list of arguments
+$MKBOOTIMG --header_version 2 --kernel "$KERNEL" --ramdisk out/ramdisk.bin \
 	--dtb "$DTB" $MKBOOTIMG_LAYOUT --pagesize 4096 \
 	--os_version 17.0.0 --os_patch_level 2035-06 \
 	--cmdline "console=null" -o out/shim-boot.img
 if [ -n "$AVB_PARTITION_SIZE" ]; then
 	AVBTOOL=${AVBTOOL:-$(command -v avbtool || true)}
-	[ -n "$AVBTOOL" ] || [ ! -f "$HOME/evox17/external/avb/avbtool.py" ] || AVBTOOL="$HOME/evox17/external/avb/avbtool.py"
+	[ -n "$AVBTOOL" ] || [ ! -f "$ANDROID_TREE/external/avb/avbtool.py" ] || AVBTOOL="$ANDROID_TREE/external/avb/avbtool.py"
 	[ -n "$AVBTOOL" ] || { echo "error: avbtool not found: set AVBTOOL=/path/to/avbtool.py (AOSP external/avb)" >&2; exit 1; }
 	# Unsigned (algorithm NONE); ABL only wants the footer to be there on an unlocked phone.
 	python3 "$AVBTOOL" add_hash_footer --image out/shim-boot.img \

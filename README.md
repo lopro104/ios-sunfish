@@ -100,8 +100,9 @@ ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im
 
 ### 3. Build the boot image
 
-Needs `aarch64-linux-gnu-gcc`, `mkbootimg`, `lz4` and AOSP's `avbtool` (Fedora: `sudo dnf install lz4`; `avbtool.py` is
-in any Android tree, `external/avb/avbtool.py`, and the script looks in `~/evox17` by itself, or set `AVBTOOL=`).
+Needs `aarch64-linux-gnu-gcc`, `lz4` (Fedora: `sudo dnf install lz4`), and AOSP's `mkbootimg` and `avbtool`. Any Android
+ROM tree has both (`system/tools/mkbootimg/mkbootimg.py`, `external/avb/avbtool.py`); the script uses them from
+`~/evox17` when they are not installed (`ANDROID_TREE=` for another tree, or `MKBOOTIMG=` / `AVBTOOL=` for single files).
 Google's bootloader refuses `fastboot boot` of a kernel that is not LZ4-compressed or an image without an AVB
 footer (found on the Pixel 4 by [ios-flame](https://github.com/NWylynko/ios-flame)); `DEVICE=sunfish` does both.
 
