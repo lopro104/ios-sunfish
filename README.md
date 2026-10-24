@@ -173,6 +173,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0086 | CPU speed (SM7150 OSM): `cpufreq=2` reads the speed tables, `cpufreq=1` raises the cores to their top speed; the thermal service then slows them when hot. Ported from HackiOS |
 | 0087 | Memory bandwidth vote through RPMh (`ddr=`, on with `cpufreq=1`), battery temperature from the PM6150 ADC into the thermal service; ported from HackiOS |
 | 0088 | Battery limit set to Google's sunfish value (60 C) instead of HackiOS's 45/50/58 C |
+| 0089 | Adreno 618 bring-up steps 11-21: TrustZone and the zap shader, the (legacy) GMU started and talked to, the 3D core powered, its command processor started and writing to memory; firmware from `/fw/adreno/` (docs/GPU.md) |
 
 ## Key hardware facts (sunfish)
 

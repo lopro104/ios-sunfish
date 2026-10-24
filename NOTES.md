@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 0089, 2026-10-24: Adreno steps 11-21 (docs/GPU.md). Legacy GMU (HFI v1, HFI_USE_REG) per msm-4.14 kgsl; firmware read via vnode_open from /fw/adreno/. Untested on hardware.
+
 ## 0088, 2026-10-23: battery limit 60 C (Google's thermal_info_config_sunfish.json; the CPU limit, 95 C, already matched)
 
 ## >>> 0087, 2026-10-23: DDR bandwidth vote + battery temperature (docs/SUNFISH.md) <<<

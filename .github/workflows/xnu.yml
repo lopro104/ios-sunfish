@@ -134,11 +134,12 @@ jobs:
           [ -n "$k" ] || { echo "no kernel in out/"; exit 1; }
           strings -a "$k" > kernel-strings.txt
           missing=0
-          # 0082 (sunfish board support), 0083 (Adreno bring-up probes), 0084 (RTC, display kick), 0085 (thermal), 0086 (cpufreq), 0087 (ddr vote, battery temperature)
+          # 0082 (sunfish board support), 0083 (Adreno bring-up probes), 0084 (RTC, display kick), 0085 (thermal), 0086 (cpufreq), 0087 (ddr vote, battery temperature), 0089 (Adreno steps 11-21)
           for s in 'google,sunfish' 'SWEET TOUCH: selected ST FTM5' 'SWEET TOUCH: PM6150 GPIO4' 'SWEET SPMI: write' \
               'SWEET GPU: step %u: done' 'SWEET RTC: PM6150 counts' 'kicking CTL %d with CTL_START' \
               'SWEET THERMAL: %s:%s' 'SWEET CPUFREQ: %s raised' 'SWEET RPMH: DDR bandwidth %s %u on MC0' \
-              'SWEET THERMAL: battery %s C (PM6150 ADC5'; do
+              'SWEET THERMAL: battery %s C (PM6150 ADC5' 'TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER' \
+              'THE 3D CORE WRITES OUR MEMORY ON COMMAND'; do
             if grep -qF "$s" kernel-strings.txt; then echo "ok:      $s"; else echo "MISSING: $s"; missing=1; fi
           done
           [ "$missing" = 0 ] || { echo "::error::board patches are missing from $k"; exit 1; }

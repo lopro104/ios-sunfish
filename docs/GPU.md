@@ -1,6 +1,6 @@
 # GPU bring-up (Adreno 618)
 
-Status (2026-10-22): **probe steps written and built, not run on a phone yet.** The goal is
+Status (2026-10-24): **steps 1-21 written and built, not run on a phone yet.** The goal is
 CoreAnimation drawing on the GPU instead of the CPU. This first part only finds out, step by step,
 how much of the GPU block this kernel may touch under Qualcomm's hypervisor.
 
@@ -37,11 +37,61 @@ did it.
 | 9 | reads | SMMU context 0 | values |
 | 10 | **writes** | two words into GMU data memory, read back, restored | `TAKES WHAT IS WRITTEN: its firmware can be loaded` |
 
-## What comes after (from HackiOS, steps 11-22)
+## Steps 11-21 (patch 0089)
 
-TrustZone calls and loading the zap shader (`a615_zap.mdt` on sunfish), GMU page tables and
-firmware (`a630_gmu.bin`), HFI message queues, powering the 3D core, the SQE microcode
-(`a630_sqe.fw`), the first command ring, and a first frame. Then a `RedwoodGPU`-style service that
-speaks Linux's msm DRM interface, so Mesa's freedreno (a6xx; the A618 is supported upstream) can
-draw for CoreAnimation. Each of these needs the results of steps 1-10 from a real phone before it
-can be written with any confidence.
+Status (2026-10-24): **written and compiled, not run on a phone.** They take the GPU from "the GMU
+takes what is written" to "the 3D core writes a word into our memory on command". The A618 has the
+older ("legacy") GMU, so these steps follow Google's own driver for this exact GPU and firmware
+(msm-4.14 `drivers/gpu/msm`, which runs with `qcom,gpu-quirk-hfi-use-reg` on this SoC), checked
+against Linux's legacy path in `a6xx_gmu.c` / `a6xx_hfi.c`. HackiOS's step layout, SMMU page
+tables, TrustZone calls and command ring are reused; their GMU code is for a newer GMU and is not.
+
+### Firmware
+
+Steps 12 on read the Pixel's own GPU firmware from `/fw/adreno/` on the iOS root. Copy it once, with
+Android running:
+
+```bash
+mkdir -p fw-adreno
+for f in a618_gmu.bin a630_sqe.fw a615_zap.mdt a615_zap.b00 a615_zap.b01 a615_zap.b02; do
+  adb pull /vendor/firmware/$f fw-adreno/
+done
+sudo mount -o loop,force ios16-root.img /mnt
+sudo mkdir -p /mnt/fw/adreno && sudo cp fw-adreno/* /mnt/fw/adreno/
+sudo umount /mnt
+```
+
+If `adb pull` says a file does not exist, run `adb shell ls /vendor/firmware | grep -E 'a6|a618'`
+and send the list: the zap shader may have a different number of `.bNN` segments (step 19 reads the
+segment list from the `.mdt` and asks for exactly the files it names).
+
+### What each step does
+
+| Step | Kind | What | Success looks like |
+| --- | --- | --- | --- |
+| 11 | asks TrustZone | Is "is this call available" available; are the image-loading calls there; which images it "supports" | `"supported" ... GPU x/y` (any answer is information) |
+| 12 | asks TrustZone | Check the signature of `a615_zap.mdt` (image 13) | `TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE` |
+| 13 | **writes** | Page tables for the GMU's memory (caches at 0x4000/0x44000, HFI, dump, log at 0x6000_0000+); SMMU context 1, stream 5 | no `SMMU did not take what was written` |
+| 14 | **writes** | `a618_gmu.bin` into the GMU's code memory, read back | `THE GMU'S FIRMWARE IS LOADED` |
+| 15 | **writes** | RSCC and PDC (0xb290000, 0xb490000) programs; GMU registers; GMU out of reset | `THE GMU'S FIRMWARE RUNS` (0xbabeface) |
+| 16 | talks to GMU | "boot" request with the GX rail level, SPTP power on, HFI queues, init / version / speed table / bus table / test | `THE GMU'S MESSAGE QUEUES ARE UP`, `firmware is version 1.8.x` |
+| 17 | asks GMU | Power the 3D core (OOB GPU), set the speed (180/267/355 MHz, `adreno_speed=1..3`) | `THE 3D CORE HAS POWER AND ANSWERS` |
+| 18 | **writes** | Ring, `a630_sqe.fw`, scratch page; SMMU context 0, stream 0 | no SMMU refusal |
+| 19 | asks TrustZone | Load the zap shader into its reserved memory (0x98f95000) and start it | `TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER` |
+| 20 | **writes** | The 3D core's registers (Linux's A618 values), start the command processor, "initialize" | `THE 3D CORE TAKES COMMANDS` |
+| 21 | commands | Leave secure mode; write 0x600dc0de into our page | `THE 3D CORE WRITES OUR MEMORY ON COMMAND` |
+
+At the end everything is undone in reverse: the 3D core given back, the GMU sent to slumber and
+held in reset, the zap shader handed back to TrustZone, the RPMh channel put to sleep, the SMMU
+streams cleared, then the clocks and CX as before. `adreno_keep=1` leaves it all on.
+
+As with steps 1-10: one new step per boot (`adreno=11`, then `adreno=12`, ...). The steps that ask
+TrustZone or the hypervisor something are the ones most likely to end a run without a word; the log
+line before the reset names the call.
+
+## What comes after
+
+A first frame drawn by the GPU (HackiOS's step 22), then a service that speaks Linux's msm DRM
+interface (HackiOS's `HKGPU.cpp`) so that Mesa's freedreno (A618 supported upstream) can draw for
+CoreAnimation, and Mesa built for iOS. The kernel service can be written next; Mesa needs an iOS
+build toolchain in CI and a way to load it into backboardd, which this port does not have yet.
