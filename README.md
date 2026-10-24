@@ -174,6 +174,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0087 | Memory bandwidth vote through RPMh (`ddr=`, on with `cpufreq=1`), battery temperature from the PM6150 ADC into the thermal service; ported from HackiOS |
 | 0088 | Battery limit set to Google's sunfish value (60 C) instead of HackiOS's 45/50/58 C |
 | 0089 | Adreno 618 bring-up steps 11-21: TrustZone and the zap shader, the (legacy) GMU started and talked to, the 3D core powered, its command processor started and writing to memory; firmware from `/fw/adreno/` (docs/GPU.md) |
+| 0090 | `SweetGPU`: with `adreno=21 adreno_keep=1` the GPU stays on and programs get it through Linux's msm DRM interface (what Mesa's freedreno speaks); ported from HackiOS's `HKGPU` |
 
 ## Key hardware facts (sunfish)
 

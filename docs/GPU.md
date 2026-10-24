@@ -89,9 +89,26 @@ As with steps 1-10: one new step per boot (`adreno=11`, then `adreno=12`, ...). 
 TrustZone or the hypervisor something are the ones most likely to end a run without a word; the log
 line before the reset names the call.
 
+## The GPU kept on: the SweetGPU service (patch 0090)
+
+Status (2026-10-24): **written and compiled, not run on a phone.** With `adreno=21 adreno_keep=1`,
+and all 21 steps done, nothing is undone: the 3D core stays powered and the kernel starts the
+IOKit service `SweetGPU`. It speaks the interface of Linux's msm DRM driver, which Mesa's freedreno
+uses (HackiOS's `HKGPU.cpp`, same request numbers and structures): parameters (chip ID 0x06010800,
+512K GMEM at 1 MB, UBWC 2.0 with highest bank bit 14), buffers (made zeroed and write-combined,
+given a GPU address, mapped into the program, given back), command submission and waiting for a
+fence, and one request of its own (0x7e) that makes an IOSurface's memory a GPU buffer, for
+drawing into what the display shows.
+
+Left out for now (all in HackiOS's version): their cache of given-back buffers (a few ms a frame),
+per-submission timing, resetting a hung core (here a hang is reported once and the GPU is given
+nothing more), and the display waiting for a surface the GPU is still drawing.
+
+Nothing uses it yet: that needs Mesa built for iOS with HackiOS's `hackios-drm` shim (service name
+changed to `SweetGPU`) and loaded into backboardd.
+
 ## What comes after
 
-A first frame drawn by the GPU (HackiOS's step 22), then a service that speaks Linux's msm DRM
-interface (HackiOS's `HKGPU.cpp`) so that Mesa's freedreno (A618 supported upstream) can draw for
-CoreAnimation, and Mesa built for iOS. The kernel service can be written next; Mesa needs an iOS
-build toolchain in CI and a way to load it into backboardd, which this port does not have yet.
+Mesa (freedreno, A618 supported upstream) built for iOS with HackiOS's `hackios-drm` shim and
+`eagl.c`, so CoreAnimation draws with OpenGL ES on the GPU. That needs an iOS build toolchain in CI
+and a way to load the library into backboardd, which this port does not have yet.

@@ -1,0 +1,1094 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index df18f44..d7e35a6 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -54,7 +54,8 @@
+  *                      (default 1500)
+  *   adreno_fine=1      the newest step waits like that before every single access
+  *   adreno_delay=S     start S seconds after the root is mounted (default 40), after the GUI
+- *   adreno_keep=1      do not switch off again what the steps switched on
++ *   adreno_keep=1      do not switch off again what the steps switched on; after all 21, the GPU
++ *                      stays on for the system (the service SweetGPU: "the GPU kept on" below)
+  *   adreno_speed=N     step 16/17: the 3D core's speed, 1 180 MHz, 2 267 MHz, 3 355 MHz (default)
+  *
+  * Sources (all in the repositories of this port):
+@@ -96,6 +97,7 @@ extern kern_return_t thread_terminate(thread_t);
+ void sweet_adreno_init(void);
+ 
+ static uint32_t last_step, skip_steps, pause_ms = 1500, fine, start_delay_s = 40, keep;
++static uint32_t speed_bin;              /* which of the GPUs of this kind the fuses say this is (step 2) */
+ static uint32_t step;                   /* the one being performed */
+ static uint32_t newest_step;            /* the highest one asked for: the one not yet seen to work */
+ static char last_write[96] = "nothing written";
+@@ -412,6 +414,7 @@ step_fuses(void)
+ 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
+ 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
+ 	bin = bin >> 5 & 0xff;
++	speed_bin = bin;
+ 	printf("SWEET GPU: %u: speed bin %u\n", step, bin);
+ 	return true;
+ }
+@@ -1155,7 +1158,7 @@ to_memory(vm_offset_t start, vm_size_t size)
+ 	settle();
+ }
+ 
+-#define SPACE_TABLES            256
++#define SPACE_TABLES            1024           /* 2 GB of addresses, were they all in use */
+ 
+ struct gpu_space {
+ 	const char *name;
+@@ -1226,7 +1229,7 @@ space_map(struct gpu_space *space, uint64_t address, uint64_t phys, uint64_t att
+ 	if (level3 == NULL) {
+ 		return false;
+ 	}
+-	level3[address >> 12 & 0x1ff] = phys | attributes | PTE_PAGE;
++	level3[address >> 12 & 0x1ff] = phys == 0 && attributes == 0 ? 0 : phys | attributes | PTE_PAGE;
+ 	return true;
+ }
+ 
+@@ -2668,6 +2671,287 @@ gpu_core_stop(void)
+ 	}
+ }
+ 
++/* ---- the GPU kept on, for the system to draw with --------------------------------------------------- */
++
++/*
++ * With boot-arg adreno_keep=1 and all 21 steps done, nothing is undone: the 3D core stays powered
++ * and taking commands, and the service SweetGPU (iokit/Kernel/arm/SweetGPU.cpp) hands it to
++ * programs through the interface of Linux's msm driver, which Mesa's freedreno speaks. That file
++ * keeps the buffers and the clients; what is the GPU's is here: addresses in the 3D core's SMMU
++ * context, the ring, and the word in which the core writes the number of each submission it is
++ * through with (a "fence"). The caller holds one lock around all of these. Ported from HackiOS
++ * (redwood_adreno.c, "the GPU kept on"), less its timing and recovery.
++ *
++ * One address space for everything the core reads and writes: below GPU_ADDRESSES_START the
++ * steps' own blocks at their constants (ring, microcode, scratch page), from there up addresses
++ * handed out a buffer at a time, first fit, coalesced when given back (as Linux's msm hands them
++ * out: userspace only asks, MSM_INFO_GET_IOVA). Below 4 GB: the A618 has ADRENO_QUIRK_4GB_VA.
++ */
++#define GPU_CHIP_ID             0x06010800ull   /* dt: qcom,chipid */
++#define GPU_ADDRESSES_START     0x20000000ull
++#define GPU_ADDRESSES_SIZE      0xe0000000ull
++#define GPU_ADDRESS_GRANULE     0x10000ull
++#define GPU_FENCE_AT            0x40            /* in the scratch page */
++#define CP_SCRATCH_REG2         0x0885
++#define CP_INDIRECT_BUFFER      0x3f
++#define CP_EVENT_WRITE          0x46
++#define CP_WAIT_FOR_IDLE        0x26
++#define EVENT_CACHE_FLUSH_TS    0x04
++#define EVENT_INVALIDATE_DEPTH  0x18
++#define EVENT_INVALIDATE_COLOR  0x19
++#define CP_IB1_BASE             GPU_WORD(0x0928)
++#define CP_IB1_REM_SIZE         GPU_WORD(0x092a)
++
++extern void SweetGPUStart(void);
++bool sweet_gpu_ready(void);
++bool sweet_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t sweet_gpu_address(uint64_t size);
++void sweet_gpu_address_free(uint64_t address, uint64_t size);
++bool sweet_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void sweet_gpu_mapped(void);
++void sweet_gpu_unmap(uint64_t address, uint64_t size);
++void sweet_gpu_to_memory(void *start, uint64_t size);
++bool sweet_gpu_done(uint32_t fence);
++uint32_t sweet_gpu_last(void);
++uint32_t sweet_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++void sweet_gpu_report(const char *why);
++
++static bool gpu_kept;
++static uint32_t gpu_fence;              /* the number of the last submission */
++static struct {
++	uint64_t start, size;
++} gpu_free[1024];                       /* the addresses not in use, in order */
++static unsigned gpu_free_count;
++
++bool
++sweet_gpu_ready(void)
++{
++	return gpu_kept;
++}
++
++/* The answers to msm's GET_PARAM (linux adreno_get_param for this GPU; the numbers are msm_drm.h's). */
++bool
++sweet_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01:                              /* GPU_ID: none, the chip ID says it */
++	case 0x08:                              /* PP_PGTABLE */
++	case 0x09:                              /* FAULTS */
++	case 0x0a:                              /* SUSPENDS */
++	case 0x11:                              /* RAYTRACING */
++	case 0x13:                              /* MACROTILE_MODE: 4 channels below UBWC 3.1 */
++		*value = 0;
++		return true;
++	case 0x02:                              /* GMEM_SIZE */
++		*value = 512 * 1024;
++		return true;
++	case 0x03:                              /* CHIP_ID, with the speed bin above it */
++		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
++		return true;
++	case 0x04:                              /* MAX_FREQ */
++		*value = gpu_speeds[gpu_speed].khz * 1000ull;
++		return true;
++	case 0x05:                              /* TIMESTAMP: the 19.2 MHz counter, which is this kernel's clock too */
++		*value = mach_absolute_time();
++		return true;
++	case 0x06:                              /* GMEM_BASE: 1 MB below the A650 family (UCHE_GMEM_RANGE_MIN, step 20) */
++		*value = 0x100000;
++		return true;
++	case 0x07:                              /* PRIORITIES */
++		*value = 1;
++		return true;
++	case 0x10:                              /* HIGHEST_BANK_BIT (ubwc_config.c, sm7150) */
++		*value = 14;
++		return true;
++	case 0x12:                              /* UBWC_SWIZZLE: levels 2 and 3 */
++		*value = 6;
++		return true;
++	default:                                /* VA_START, VA_SIZE among them: refused to clients of a shared space, as msm does */
++		return false;
++	}
++}
++
++/* Addresses for a buffer of so many bytes; 0: none left. The buffer's until sweet_gpu_address_free(). */
++uint64_t
++sweet_gpu_address(uint64_t size)
++{
++	size = (size + GPU_ADDRESS_GRANULE - 1) & ~(GPU_ADDRESS_GRANULE - 1);
++	for (unsigned i = 0; i < gpu_free_count; i++) {
++		if (gpu_free[i].size >= size) {
++			uint64_t address = gpu_free[i].start;
++
++			gpu_free[i].start += size;
++			gpu_free[i].size -= size;
++			if (gpu_free[i].size == 0) {
++				memmove(&gpu_free[i], &gpu_free[i + 1], (--gpu_free_count - i) * sizeof(gpu_free[0]));
++			}
++			return address;
++		}
++	}
++	return 0;
++}
++
++void
++sweet_gpu_address_free(uint64_t address, uint64_t size)
++{
++	unsigned at;
++
++	size = (size + GPU_ADDRESS_GRANULE - 1) & ~(GPU_ADDRESS_GRANULE - 1);
++	for (at = 0; at < gpu_free_count && gpu_free[at].start < address; at++) {
++	}
++	if (at > 0 && gpu_free[at - 1].start + gpu_free[at - 1].size == address) {
++		gpu_free[at - 1].size += size;
++		if (at < gpu_free_count && address + size == gpu_free[at].start) {
++			gpu_free[at - 1].size += gpu_free[at].size;
++			memmove(&gpu_free[at], &gpu_free[at + 1], (--gpu_free_count - at) * sizeof(gpu_free[0]));
++		}
++	} else if (at < gpu_free_count && address + size == gpu_free[at].start) {
++		gpu_free[at].start = address;
++		gpu_free[at].size += size;
++	} else if (gpu_free_count < sizeof(gpu_free) / sizeof(gpu_free[0])) {
++		memmove(&gpu_free[at + 1], &gpu_free[at], (gpu_free_count++ - at) * sizeof(gpu_free[0]));
++		gpu_free[at].start = address;
++		gpu_free[at].size = size;
++	}
++	/* (else these addresses are lost: there is no room to remember the hole, and to hand them out unremembered is worse) */
++}
++
++/* One 4K page of ours at an address of the 3D core's; after the last of a buffer's, sweet_gpu_mapped(). */
++bool
++sweet_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	return space_map(&core_space, address, phys, PTE_CORE | (read_only ? PTE_READ_ONLY : 0));
++}
++
++void
++sweet_gpu_mapped(void)
++{
++	space_commit(&core_space);
++}
++
++void
++sweet_gpu_unmap(uint64_t address, uint64_t size)
++{
++	uint32_t context = smmu_context(&core_space);
++
++	for (uint64_t offset = 0; offset < size; offset += 4096) {
++		space_map(&core_space, address + offset, 0, 0);
++	}
++	space_commit(&core_space);
++	wr(smmu.base + context + SMMU_CB_TLBIASID, core_space.context);
++	wr(smmu.base + context + SMMU_CB_TLBSYNC, 1);
++	for (int i = 0; i < 1000 && (rd(smmu.base + context + SMMU_CB_TLBSTATUS) & 1); i++) {
++	}
++}
++
++/* Memory that the 3D core and a program both see: out of this processor's cache. */
++void
++sweet_gpu_to_memory(void *start, uint64_t size)
++{
++	to_memory((vm_offset_t)start, (vm_size_t)size);
++}
++
++/* How far the 3D core has got. */
++bool
++sweet_gpu_done(uint32_t fence)
++{
++	volatile uint32_t *word = (volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT);
++
++	to_memory((vm_offset_t)word, 4);
++	return (int32_t)(*word - fence) >= 0;
++}
++
++uint32_t
++sweet_gpu_last(void)
++{
++	return gpu_fence;
++}
++
++/* A register of the 3D core (by its word number) written by command, in the order of the other commands. */
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
++/*
++ * Command buffers for the 3D core to run, in order: each an address and a count of words, put
++ * in the ring as linux a6xx_submit puts them. Returns the submission's number; 0: the ring is
++ * full and the core is not reading it.
++ */
++uint32_t
++sweet_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	uint32_t wanted = 16 + 4 * count, room = 0;
++
++	for (int i = 0; i < 20000; i++) {
++		room = (rd(gpu.base + CP_RB_RPTR) + RING_WORDS - ring_at - 1) % RING_WORDS;
++		if (room >= wanted) {
++			break;
++		}
++		sleep_us(100);
++	}
++	if (room < wanted) {
++		return 0;
++	}
++	if (++gpu_fence == 0) {
++		gpu_fence = 1;
++	}
++	ring_command(CP_EVENT_WRITE, 1);
++	ring(EVENT_INVALIDATE_DEPTH);
++	ring_command(CP_EVENT_WRITE, 1);
++	ring(EVENT_INVALIDATE_COLOR);
++	for (uint32_t i = 0; i < count; i++) {
++		ring_command(CP_INDIRECT_BUFFER, 3);
++		ring((uint32_t)addresses[i]);
++		ring((uint32_t)(addresses[i] >> 32));
++		ring(words[i]);
++	}
++	ring_register(CP_SCRATCH_REG2, gpu_fence);
++	ring_command(CP_EVENT_WRITE, 4);
++	ring(EVENT_CACHE_FLUSH_TS);
++	ring(CORE_SCRATCH_ADDRESS + GPU_FENCE_AT);
++	ring(0);
++	ring(gpu_fence);
++	ring_send();
++	return gpu_fence;
++}
++
++/* A submission does not come back: what the 3D core and its SMMU context say. */
++void
++sweet_gpu_report(const char *why)
++{
++	printf("SWEET GPU: %s: submission %u is the last, the core has done %u; ring read up to %u, written up to %u; status "
++	    "%#x, interrupts %#x; command processor: fault %#x, interrupts %#x, protection %#x; in the command buffer at %#llx, "
++	    "%u words to go\n", why, gpu_fence, *(volatile uint32_t *)(core_scratch.memory + GPU_FENCE_AT),
++	    rd(gpu.base + CP_RB_RPTR), ring_at, rd(gpu.base + RBBM_STATUS), rd(gpu.base + RBBM_INT_0_STATUS),
++	    rd(gpu.base + CP_HW_FAULT), rd(gpu.base + CP_INTERRUPT_STATUS), rd(gpu.base + CP_PROTECT_STATUS),
++	    (uint64_t)rd(gpu.base + CP_IB1_BASE + 4) << 32 | rd(gpu.base + CP_IB1_BASE), rd(gpu.base + CP_IB1_REM_SIZE));
++	space_faulted(&core_space);
++}
++
++/* After step 21, with adreno_keep=1: the GPU is the system's from here on. */
++static bool
++gpu_keep(void)
++{
++	if (!core_runs) {
++		return false;
++	}
++	gpu_free[0].start = GPU_ADDRESSES_START;
++	gpu_free[0].size = GPU_ADDRESSES_SIZE;
++	gpu_free_count = 1;
++	bzero((void *)core_scratch.memory, 4096);
++	to_memory(core_scratch.memory, 4096);
++	step = 0;
++	newest_step = ~0u;
++	quiet = true;
++	gpu_kept = true;
++	printf("SWEET GPU: THE GPU STAYS ON for the system to draw with: the service SweetGPU\n");
++	SweetGPUStart();
++	return true;
++}
++
+ /* ---- all of it together ---------------------------------------------------------------------------- */
+ 
+ static bool(*const steps[])(void) = {
+@@ -2720,6 +3004,10 @@ adreno_thread(void *arg, wait_result_t result)
+ 		printf("SWEET GPU: step %u: done\n", step);
+ 		done = step;
+ 	}
++	if (keep && done == STEPS && gpu_keep()) {
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
+ 	/* A reset for a write may come late: keep the end of the log saying where things stand. */
+ 	for (uint32_t second = 1; second <= 20; second++) {
+ 		sleep_ms(1000);
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+new file mode 100644
+index 0000000..0e184f7
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -0,0 +1,729 @@
++/*
++ * SweetGPU: the Adreno 618 for programs to draw with.
++ *
++ * bsd/dev/sweet_adreno.c wakes the GPU and, with boot-arg adreno_keep=1 after all 21 of its
++ * steps, keeps it on and starts this service. A program that opens it speaks the interface of
++ * Linux's msm DRM driver, the one Mesa's freedreno knows: every request of that interface is a
++ * call of the user client with the request's number as the selector and the request's structure
++ * passed in and back. What Linux does with mmap() on the device is the client memory of the type
++ * that is the buffer's handle.
++ *
++ * Ported from HackiOS (OOSEX GANG, hackios-xnu-kernel branch "metal", iokit/Kernel/HKGPU.cpp,
++ * APSL 2.0), with the same request numbers and structures, so their userland half
++ * (hackios-xnu-userland tools/mesa/hackios-drm, which stands in for libdrm inside Mesa) works
++ * here with its service name changed to "SweetGPU". Left out for now: their cache of given-back
++ * buffers, their timing, reset of a hung core, and the display waiting for a surface the GPU is
++ * still drawing (the display shows what is there).
++ *
++ * What there is of the interface is what freedreno uses to draw: parameters, buffers (made, told
++ * their address in the GPU's address space, mapped, given back), submission of command buffers,
++ * and waiting for one to be done. A buffer is wired kernel memory entered into the 3D core's SMMU
++ * context, zero when made and write-combined, as Linux maps them for freedreno. One request is
++ * not Linux's: a buffer that is the memory of an IOSurface (SweetSurface.cpp), for drawing into
++ * what the display shows.
++ *
++ * Not here yet: interrupts (waiting is asking again five times a millisecond), and more than one
++ * program's worth of care: every client's buffers are in the one address space.
++ */
++#include "SweetSurface.h"
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <sys/systm.h>
++
++extern "C" {
++/* bsd/dev/sweet_adreno.c, "the GPU kept on" */
++bool sweet_gpu_ready(void);
++bool sweet_gpu_parameter(uint32_t which, uint64_t * value);
++uint64_t sweet_gpu_address(uint64_t size);
++void sweet_gpu_address_free(uint64_t address, uint64_t size);
++bool sweet_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void sweet_gpu_mapped(void);
++void sweet_gpu_unmap(uint64_t address, uint64_t size);
++void sweet_gpu_to_memory(void * start, uint64_t size);
++bool sweet_gpu_done(uint32_t fence);
++uint32_t sweet_gpu_last(void);
++uint32_t sweet_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
++void sweet_gpu_report(const char * why);
++void SweetGPUStart(void);
++}
++
++/* Linux's include/uapi/drm/msm_drm.h and drm.h: the requests' numbers and structures (HackiOS's numbering). */
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++	kSweetSurface           = 0x7e,         /* ours (HackiOS's kHKSurface): an IOSurface's memory as a buffer */
++};
++
++struct msm_timespec {
++	int64_t seconds, nanoseconds;           /* of the clock that goes on while the machine sleeps */
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++struct sweet_gpu_surface {
++	uint32_t surface;                       /* the IOSurface's ID */
++	uint32_t handle;                        /* kSweetDescribe: no buffer is wanted; else, back: the buffer, */
++	uint64_t size;                          /* how big it is, */
++	uint32_t offset, rowBytes;              /* where the pixels start in it and how long a row of them is, */
++	uint32_t width, height, pixelFormat, planes;    /* and what they are */
++};
++
++#define kSweetDescribe          0xffffffffu
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++#define MSM_INFO_SET_NAME       2
++#define MSM_INFO_GET_FLAGS      5
++#define MSM_BO_GPU_READONLY     0x00000002
++#define MSM_PREP_NOSYNC         0x04
++#define MSM_SUBMIT_CMD_BUF      1
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++
++#define GPU_BUFFERS             4096            /* a client's, at most */
++#define GPU_BUFFER_MAX          (256u << 20)
++#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_BOS          4096
++#define GPU_PATIENCE_MS         5000            /* for a buffer or a submission somebody waits for without a limit */
++#define GPU_ASK_AGAIN_US        200
++
++static IOLock * gGPULock;                       /* around everything that is the GPU's (sweet_gpu_...) */
++static bool gGPUReported;                       /* the core has stopped answering: nothing is waited for again */
++
++/* Wait for the 3D core to be done with submission `fence`; with the lock held, which is let go of while waiting. */
++static bool
++gpuWait(uint32_t fence, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	for (;;) {
++		if (sweet_gpu_done(fence)) {
++			return true;
++		}
++		if (mach_absolute_time() - began >= patience || gGPUReported) {
++			break;
++		}
++		IOLockUnlock(gGPULock);
++		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
++		IOLockLock(gGPULock);
++	}
++	/* a second or more for nothing: the core has stopped. Said once; a GPU that may yet write our memory gets nothing more */
++	if (milliseconds >= 1000 && !gGPUReported) {
++		sweet_gpu_report("no answer");
++		gGPUReported = true;
++	}
++	return false;
++}
++
++/* How long from now a time of msm's is, in milliseconds; 0: now or past. */
++static uint64_t
++millisecondsUntil(const struct msm_timespec * when)
++{
++	uint64_t now;
++	int64_t left;
++
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->seconds * (int64_t) NSEC_PER_SEC + when->nanoseconds - (int64_t) now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t) left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t) left / NSEC_PER_MSEC;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++class SweetGPU : public IOService
++{
++	OSDeclareDefaultStructors(SweetGPU);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPU, IOService);
++
++bool
++SweetGPU::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	setName("SweetGPU");
++	registerService();
++	return true;
++}
++
++void
++SweetGPUStart(void)
++{
++	IOService * provider = IOService::getPlatform();
++	SweetGPU * gpu;
++
++	gGPULock = IOLockAlloc();
++	gpu = OSTypeAlloc(SweetGPU);
++	if (gpu == NULL || provider == NULL || gGPULock == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("SWEET GPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("SWEET GPU: the service did not start\n");
++	}
++	gpu->release();
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++struct gpu_buffer {
++	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
++	uint8_t *                       kernel;         /* where it is in the kernel */
++	SweetSurface *                  surface;        /* whose memory it is, when not its own */
++	uint64_t                        address;        /* the GPU's for it */
++	uint64_t                        size;
++	uint32_t                        flags;
++	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++	bool                            seen;           /* mapped by the program, and so perhaps written through its cache */
++};
++
++class SweetGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(SweetGPUUserClient);
++
++	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextQueue;
++	uint32_t                fNextBuffer;
++	uint32_t                fSubmits;
++
++	struct gpu_buffer * buffer(uint32_t handle);
++	struct gpu_buffer * newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t flags, uint32_t * handle);
++	void freeBuffer(struct gpu_buffer * b);
++	IOReturn gemNew(struct msm_gem_new * request);
++	IOReturn surfaceBuffer(struct sweet_gpu_surface * request);
++	IOReturn gemInfo(struct msm_gem_info * request);
++	IOReturn submit(struct msm_gem_submit * request);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
++
++bool
++SweetGPUUserClient::start(IOService * provider)
++{
++	if (!sweet_gpu_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	return fBuffers != NULL;
++}
++
++/*
++ * With the lock held. The GPU is waited for if it may still be at the buffer (a second at most:
++ * HackiOS keeps such buffers aside instead, which saves a window server a few milliseconds a
++ * frame). One it never lets go of stays its own: it may yet be written, and must not be anybody
++ * else's memory by then.
++ */
++void
++SweetGPUUserClient::freeBuffer(struct gpu_buffer * b)
++{
++	bool busy = sweet_gpu_ready() && b->fence != 0 && !gpuWait(b->fence, 1000);
++
++	if (busy) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("SWEET GPU: the GPU is not done with a buffer of %llu bytes: it stays its own\n", b->size);
++		}
++		/* (the memory and the surface are kept: references not dropped) */
++	} else {
++		if (sweet_gpu_ready()) {
++			sweet_gpu_unmap(b->address, b->size);
++			sweet_gpu_address_free(b->address, b->size);
++		}
++		b->memory->release();
++		OSSafeReleaseNULL(b->surface);
++	}
++	b->memory = NULL;
++	b->surface = NULL;
++}
++
++IOReturn
++SweetGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		IOLockLock(gGPULock);
++		if (sweet_gpu_ready()) {
++			gpuWait(sweet_gpu_last(), 1000);        /* what the client had the GPU do last may still be going on */
++		}
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		IOLockUnlock(gGPULock);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++SweetGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct gpu_buffer *
++SweetGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++/*
++ * A handle and addresses of the GPU's for `size` bytes of a memory descriptor (wired memory, in
++ * whole pages). With the lock held; NULL: there is no room. The caller fills in memory and kernel.
++ */
++struct gpu_buffer *
++SweetGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t size, uint32_t flags, uint32_t * handle)
++{
++	struct gpu_buffer * b = NULL;
++	bool mapped = true;
++
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			*handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (b->address = sweet_gpu_address(size)) == 0) {
++		IOLog("SWEET GPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
++		return NULL;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && sweet_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++	}
++	sweet_gpu_mapped();
++	if (!mapped) {
++		sweet_gpu_unmap(b->address, size);
++		sweet_gpu_address_free(b->address, size);
++		IOLog("SWEET GPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		return NULL;
++	}
++	b->size = size;
++	b->flags = flags;
++	b->fence = 0;
++	b->seen = false;
++	b->surface = NULL;
++	return b;
++}
++
++IOReturn
++SweetGPUUserClient::gemNew(struct msm_gem_new * request)
++{
++	uint64_t size = round_page_64(request->size);
++	struct gpu_buffer * b;
++	IOBufferMemoryDescriptor * memory;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t) size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("SWEET GPU: no memory for a buffer of %llu bytes\n", size);
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gGPULock);
++	b = newBuffer(memory, size, request->flags, &request->handle);
++	if (b != NULL) {
++		b->memory = memory;
++		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++	}
++	IOLockUnlock(gGPULock);
++	if (b == NULL) {
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	return kIOReturnSuccess;
++}
++
++/*
++ * The memory of an IOSurface as a buffer: its pixels. The surface is held for as long as the
++ * buffer is there. A surface that is a buffer of this client's already is that buffer again, as
++ * with Linux's handles. Asked only to describe (kSweetDescribe), no buffer is made.
++ */
++IOReturn
++SweetGPUUserClient::surfaceBuffer(struct sweet_gpu_surface * request)
++{
++	SweetSurface * s = sweet_surface_copy(request->surface);
++	struct gpu_buffer * b = NULL;
++	uint64_t size;
++
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	size = round_page_64(s->allocSize);
++	if (s->memory == NULL || size == 0 || size > GPU_BUFFER_MAX || s->memory->getLength() < size) {
++		s->release();
++		return kIOReturnNoMemory;
++	}
++	request->size = size;
++	request->offset = s->offset;
++	request->rowBytes = s->bytesPerRow;
++	request->width = s->width;
++	request->height = s->height;
++	request->pixelFormat = s->pixelFormat;
++	request->planes = s->planeCount;
++	if (request->handle == kSweetDescribe) {
++		request->handle = 0;
++		s->release();
++		return kIOReturnSuccess;
++	}
++
++	IOLockLock(gGPULock);
++	for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++		if (fBuffers[i].memory != NULL && fBuffers[i].surface == s) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			break;
++		}
++	}
++	if (b != NULL) {
++		s->release();
++	} else if ((b = newBuffer(s->memory, size, 0, &request->handle)) != NULL) {
++		s->memory->retain();
++		b->memory = s->memory;
++		b->kernel = (uint8_t *) s->kernelAddress();
++		b->surface = s;
++	} else {
++		s->release();
++	}
++	IOLockUnlock(gGPULock);
++	return b != NULL ? kIOReturnSuccess : kIOReturnNoMemory;
++}
++
++IOReturn
++SweetGPUUserClient::gemInfo(struct msm_gem_info * request)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		ret = kIOReturnBadArgument;
++	} else if (request->info == MSM_INFO_GET_OFFSET) {
++		request->value = (uint64_t) request->handle << 32;      /* nobody maps by it here */
++	} else if (request->info == MSM_INFO_GET_IOVA) {
++		request->value = b->address;    /* the buffer's until it is given back: nothing moves a live buffer */
++	} else if (request->info == MSM_INFO_GET_FLAGS) {
++		request->value = b->flags;
++	} else if (request->info != MSM_INFO_SET_NAME) {        /* SET_IOVA among them: addresses are the kernel's to give */
++		ret = kIOReturnUnsupported;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::submit(struct msm_gem_submit * request)
++{
++	struct msm_gem_submit_bo * bos = NULL;
++	struct msm_gem_submit_cmd * cmds = NULL;
++	uint64_t addresses[GPU_SUBMIT_CMDS];
++	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
++	if (bos == NULL || cmds == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t) request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t) request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	IOLockLock(gGPULock);
++	/*
++	 * The GPU reads and writes memory, not this processor's cache. Surfaces are ordinary cached
++	 * memory, which others (the display, programs that draw with the processor) write: each one
++	 * named goes out of the cache before the core sees it (HackiOS does this once a frame or when
++	 * its seed changes; this is the simple, slower form). The buffers made here are write-combined
++	 * and need none of it.
++	 */
++	for (uint32_t i = 0; i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b != NULL && b->surface != NULL && b->kernel != NULL) {
++			sweet_gpu_to_memory(b->kernel, b->size);
++		}
++	}
++	sweet_gpu_to_memory(NULL, 0);           /* (and what was written last is in memory: a barrier) */
++	for (uint32_t i = 0; i < request->nr_cmds; i++) {
++		struct gpu_buffer * b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
++			continue;                       /* the other kinds are for a GPU shared between address spaces */
++		}
++		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
++		    (uint64_t) cmds[i].submit_offset + cmds[i].size > b->size) {
++			IOLog("SWEET GPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
++			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++			IOLockUnlock(gGPULock);
++			goto out;
++		}
++		addresses[count] = b->address + cmds[i].submit_offset;
++		words[count++] = cmds[i].size / 4;
++	}
++	request->fence = count == 0 || gGPUReported ? 0 : sweet_gpu_submit(addresses, words, count);
++	if (request->fence == 0 && count != 0 && !gGPUReported) {
++		sweet_gpu_report("the ring is full");
++		gGPUReported = true;
++	}
++	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		request->fence_fd = -1;
++	}
++	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
++		struct gpu_buffer * b = buffer(bos[i].handle);
++
++		if (b != NULL) {
++			b->fence = request->fence;
++		}
++	}
++	if (request->fence != 0 && fSubmits++ < 4) {
++		IOLog("SWEET GPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
++		    addresses[0], words[0]);
++	}
++	IOLockUnlock(gGPULock);
++	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
++out:
++	if (bos != NULL) {
++		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
++	}
++	if (cmds != NULL) {
++		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
++	}
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits * options, IOMemoryDescriptor ** memory)
++{
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gGPULock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		b->seen = true;
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++		struct sweet_gpu_surface surface;
++	} r;
++	size_t size = args->structureInputSize;
++	struct gpu_buffer * b;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t zero = 0, patience;
++
++	(void) dispatch;
++	(void) target;
++	(void) reference;
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!sweet_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	switch (selector) {
++	case kMsmGetParam:
++		ret = sweet_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:                      /* the program's name, for Linux's lists of who uses the GPU */
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep:                    /* is the GPU done with a buffer: with all it has been given, here */
++		IOLockLock(gGPULock);
++		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
++		if (!gpuWait(sweet_gpu_last(), patience)) {
++			ret = kIOReturnBusy;
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kMsmGemSubmit:
++		ret = submit(&r.submit);
++		break;
++	case kMsmWaitFence:
++		IOLockLock(gGPULock);
++		if (!gpuWait(r.waitFence.fence, millisecondsUntil(&r.waitFence.timeout))) {
++			ret = kIOReturnTimeout;
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kMsmGemMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:              /* how often the GPU has faulted on this client's commands */
++		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
++			(void) copyout(&zero, (user_addr_t) r.query.data, sizeof(zero));
++		}
++		break;
++	case kDrmGemClose:
++		IOLockLock(gGPULock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kSweetSurface:
++		ret = surfaceBuffer(&r.surface);
++		break;
++	default:
++		IOLog("SWEET GPU: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t) size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++#endif /* SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..5207ffc 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
