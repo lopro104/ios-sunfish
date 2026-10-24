@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 0093, 2026-10-24: from NWylynko/ios-flame: 0084 (early fb Device-GRE; sunfish's 32 MB block covers dfps_data and undescribed memory), 0104 (planar IOSurface bpr), 0121 (vsync period), 0114 (AMFI dyld policy, policy renamed "AMFI"). 0104 and 0114 applied as they are.
+
 ## 0092, 2026-10-24: Adreno steps corrected from arbuxiktech/ios-surya's hardware-verified A618 bring-up (GPUCC 0x5000 SMMU vote, GCC clock order, zap optional, HFI non-fatal, scratch-reg test). See docs/GPU.md.
 
 ## 0091, 2026-10-24: SweetBattery per-board profile (sunfish: 3140 mAh, ATL 25 C OCV curve), thermistor temperature via sweet_thermal_battery_tenths(), polling default on for sunfish.

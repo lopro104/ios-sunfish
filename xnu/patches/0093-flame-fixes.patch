@@ -1,0 +1,161 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..ff2c725 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -305,8 +305,55 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+ 	}
+ }
+ 
++/*
++ * Policy "AMFI" syscalls. dyld asks amfi_check_dyld_policy_self (call 0x5a,
++ * arg = { u64 input flags, user pointer to u64 output flags }) what the
++ * process may do; on error it gets 0 = nothing, and with nothing every
++ * @rpath/@executable_path/@loader_path load fails ("security policy does not
++ * allow @ path expansion"): any app with embedded frameworks. Grant @ paths
++ * always, and DYLD_* variables, fallback paths, interposing, failed
++ * insertions and LC_DYLD_ENVIRONMENT unless the process is restricted
++ * (__RESTRICT segment) or FairPlay encrypted, like a development device.
++ * Other calls fail with ENOPOLICY as before the policy had this name.
++ */
++#define SWEET_AMFI_DYLD_POLICY_SELF     0x5a
++#define SWEET_AMFI_DYLD_IN_RESTRICTED   (1ULL << 1)
++#define SWEET_AMFI_DYLD_IN_ENCRYPTED    (1ULL << 2)
++#define SWEET_AMFI_DYLD_AT_PATH         (1ULL << 0)
++#define SWEET_AMFI_DYLD_DEVELOPMENT     0xfaULL         /* path vars, fallback, print, insert failures, interpose, embedded vars */
++
++static uint64_t sweet_amfi_seen[2];
++
++static int
++sweet_amfi_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 128 && !(sweet_amfi_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s syscall %d\n", name, call);
++	}
++	if (call != SWEET_AMFI_DYLD_POLICY_SELF) {
++		return ENOPOLICY;
++	}
++	struct {
++		uint64_t input;
++		uint64_t output;        /* user pointer */
++	} args;
++	int error = copyin(arg, &args, sizeof(args));
++	if (error) {
++		return error;
++	}
++	uint64_t out = SWEET_AMFI_DYLD_AT_PATH;
++	if (!(args.input & (SWEET_AMFI_DYLD_IN_RESTRICTED | SWEET_AMFI_DYLD_IN_ENCRYPTED))) {
++		out |= SWEET_AMFI_DYLD_DEVELOPMENT;
++	}
++	return copyout(&out, (user_addr_t)args.output, sizeof(out));
++}
++
+ static const struct mac_policy_ops sweet_amfi_mac_ops = {
+ 	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
++	.mpo_policy_syscall = sweet_amfi_syscall,
+ };
+ 
+ /*
+@@ -360,7 +407,7 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+-	.mpc_name = "SWEET AMFI",
++	.mpc_name = "AMFI",     /* __mac_syscall("AMFI", ...) finds it by this name */
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+ 	.mpc_ops = &sweet_amfi_mac_ops,
+ };
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 33e5c0a..7211661 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -223,10 +223,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/*
++	 * CA::WindowServer::IOMFBServer::vsync_callback: the second value is the vsync's host time,
++	 * the third the refresh period (CA's videoRefreshPeriod). It was 0, and Core Animation saw
++	 * every frame's deadline as past (ios-flame 0121).
++	 */
++	uint64_t period;
++	nanoseconds_to_absolutetime(SWEET_FB_VSYNC_US * 1000ULL, &period);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+-		0, 0,
++		(uint32_t)period, (uint32_t)(period >> 32),
+ 	};
+ 
+ 	IOLockLock(fb->fLock);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..0fba502 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -334,6 +334,29 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 		}
+ 		s->planeCount = planes->getCount();
++		/*
++		 * Planar surfaces whose creator gave no top-level geometry: report the sum over
++		 * the planes (b3a8 = BGRA + A8: 5 bytes per pixel), as Core Animation checks
++		 * IOSurfaceGetBytesPerRow against the format's full pixel size ("unexpected
++		 * bytes-per-row value of 4544, expected at least 5625": Safari pages stayed blank).
++		 * The allocation comes from the planes alone.
++		 */
++		if (props->getObject("IOSurfaceBytesPerRow") == NULL && s->planeCount > 1) {
++			uint32_t bpr = 0, bpe = 0;
++			end = s->offset;
++			for (uint32_t i = 0; i < s->planeCount; i++) {
++				const struct sweet_surface_plane *p = &s->planes[i];
++				bpr += (uint32_t)((uint64_t)p->bytesPerRow * s->width / (p->width ? p->width : 1));
++				bpe += p->bytesPerElement;
++				if ((uint64_t)p->offset + p->size > end) {
++					end = (uint64_t)p->offset + p->size;
++				}
++			}
++			s->bytesPerRow = bpr;
++			if (props->getObject("IOSurfaceBytesPerElement") == NULL && bpe <= 64) {
++				s->bytesPerElement = (uint16_t)bpe;
++			}
++		}
+ 	}
+ 
+ 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 06bb568..7baf7d3 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,9 +1843,15 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
++	/*
++	 * Device-GRE like start.s: the 32MB block reaches past the splash memory into
++	 * dfps_data and memory nobody describes, and Normal memory may be read
++	 * speculatively; Device memory never is (ios-flame 0084, where the block
++	 * covers part of an XPU-protected carve-out).
++	 */
+ 	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+-	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index fe6a70c..ae40371 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -687,7 +687,8 @@ Lkernelcache_base_found:
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+ 	MOV64	x10, 0x9c000000
+-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
++	/* Device-GRE: no speculative reads into what else the 32MB block covers (ios-flame 0084) */
++	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_POSTED_COMBINED_REORDERED) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
