@@ -347,10 +347,10 @@ index df18f44..d7e35a6 100644
  		sleep_ms(1000);
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 new file mode 100644
-index 0000000..0e184f7
+index 0000000..7aade5d
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -0,0 +1,729 @@
+@@ -0,0 +1,730 @@
 +/*
 + * SweetGPU: the Adreno 618 for programs to draw with.
 + *
@@ -384,6 +384,7 @@ index 0000000..0e184f7
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOLocks.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
