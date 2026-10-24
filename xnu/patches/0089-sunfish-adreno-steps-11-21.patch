@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
-index 97439b8..eb01ce6 100644
+index 97439b8..df18f44 100644
 --- a/bsd/dev/sweet_adreno.c
 +++ b/bsd/dev/sweet_adreno.c
 @@ -1,6 +1,6 @@
@@ -76,7 +76,7 @@ index 97439b8..eb01ce6 100644
  /* Mach MIG declaration is not included by BSD's exported thread.h. */
  extern kern_return_t thread_terminate(thread_t);
  void sweet_adreno_init(void);
-@@ -1008,20 +1036,1650 @@ step_gmu_memory(void)
+@@ -1008,20 +1036,1654 @@ step_gmu_memory(void)
  	return back[0] == pattern[0] && back[1] == pattern[1];
  }
  
@@ -102,6 +102,7 @@ index 97439b8..eb01ce6 100644
 +	vfs_context_t context = vfs_context_kernel();
 +	char path[96];
 +	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
 +	off_t length = 0;
 +	vm_offset_t data = 0;
 +	int resid = 0, error;
@@ -113,7 +114,10 @@ index 97439b8..eb01ce6 100644
 +		    error, name);
 +		return NULL;
 +	}
-+	error = vnode_size(vnode, &length, context);
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	error = vnode_getattr(vnode, &attributes, context);
++	length = (off_t)attributes.va_data_size;
 +	if (error == 0 && (length <= 0 || length > FW_LARGEST)) {
 +		error = EFBIG;
 +	}
