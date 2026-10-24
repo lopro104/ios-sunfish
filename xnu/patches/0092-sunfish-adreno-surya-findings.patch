@@ -1,0 +1,352 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index d7e35a6..f142ab4 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -57,6 +57,7 @@
+  *   adreno_keep=1      do not switch off again what the steps switched on; after all 21, the GPU
+  *                      stays on for the system (the service SweetGPU: "the GPU kept on" below)
+  *   adreno_speed=N     step 16/17: the 3D core's speed, 1 180 MHz, 2 267 MHz, 3 355 MHz (default)
++ *   adreno_zap=0       step 19 loads no zap shader (step 12 can be skipped too: adreno_skip=0x1800)
+  *
+  * Sources (all in the repositories of this port):
+  *   addresses   linux sm7150.dtsi (gpu@5000000, gmu@506a000, iommu@5040000, clock-controller@5090000,
+@@ -383,9 +384,11 @@ step_outside(void)
+ 	announce("read the GPU's clocks in the global clock controller (the touch driver uses this controller too)");
+ 	get(&gcc, "pll votes", GCC_PLL_VOTE);
+ 	get(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR);
+-	get(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR);
+-	get(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR);
+-	get(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR);
++	/*
++	 * Not the GPU's bus clocks (gpu_memnoc_gfx and the others): on a Poco X3 NFC, the same SoC,
++	 * the first read of gpu_memnoc_gfx (0x17100c) made this early stopped the phone; turned on in
++	 * the device tree's order after gpu_cfg_ahb, as step 5 does, it reads (ios-surya NOTES.md).
++	 */
+ 
+ 	announce("look up the GPU's rails in the boot loader's list of RPMh resources (memory at 0x85f20000)");
+ 	show_rpmh_resource("gfx.lvl");
+@@ -587,6 +590,42 @@ clock_source(const char *name, uint32_t rcgr, uint32_t source)
+ 	return true;
+ }
+ 
++/*
++ * The GPU SMMU's clock vote: gpu_cc_hlos1_vote_gpu_smmu_clk, 0x5000 bit 0 of the GPU clock
++ * controller (msm-4.14 gpucc-sm6150.c; sunfish's gpucc-sdmmagpie.c leaves it out). Without it
++ * the SMMU's registers have no clock and the first read of one stalls the bus for good: found
++ * on a Poco X3 NFC, the same SoC (ios-surya, NOTES.md "GPUCC HLOS1 SMMU clock vote"), where
++ * setting it made the SMMU answer. Steps 8 on check it before they touch the SMMU.
++ */
++#define GPUCC_HLOS1_VOTE_GPU_SMMU 0x5000
++
++static bool
++smmu_vote(void)
++{
++	uint32_t vote = get(&gpucc, "hlos1_vote_gpu_smmu", GPUCC_HLOS1_VOTE_GPU_SMMU);
++
++	if (!(vote & CBCR_ENABLE)) {
++		remember(&gpucc, "hlos1_vote_gpu_smmu", GPUCC_HLOS1_VOTE_GPU_SMMU, CBCR_ENABLE);
++		vote = set(&gpucc, "hlos1_vote_gpu_smmu", GPUCC_HLOS1_VOTE_GPU_SMMU, CBCR_ENABLE);
++	}
++	if (!(vote & CBCR_ENABLE)) {
++		printf("SWEET GPU: %u: the SMMU's clock vote does not hold (%#x): the SMMU is not to be touched\n", step, vote);
++		return false;
++	}
++	return true;
++}
++
++/* Before a step touches the SMMU: its clock vote is in. */
++static bool
++smmu_clocked(void)
++{
++	if (!(rd(gpucc.base + GPUCC_HLOS1_VOTE_GPU_SMMU) & CBCR_ENABLE)) {
++		printf("SWEET GPU: %u: the SMMU's clock vote (gpucc 0x5000) is not set: step 5 first\n", step);
++		return false;
++	}
++	return true;
++}
++
+ /*
+  * The SoC's frequency counter (vendor-only: debugcc-sdmmagpie.c, clk-debug.c): the GPU clock
+  * controller puts one of its clocks on its debug output (mux 0x1568, divider 0x10fc /2, enable
+@@ -755,9 +794,10 @@ step_clocks(void)
+ 		remember(&gcc, "pll votes", GCC_PLL_VOTE, GCC_PLL_VOTE_GPU_DIV);
+ 	}
+ 	set(&gcc, "pll votes", GCC_PLL_VOTE, GCC_PLL_VOTE_GPU_DIV);
+-	if (!clock_on(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
+-	    !clock_on(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR, false) ||
+-	    !clock_on(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, false)) {
++	/* sdmmagpie-gpu.dtsi kgsl-iommu clocks, in their order (iface gpu_cfg_ahb, step 3; mem; mem_iface), as on ios-surya */
++	if (!clock_on(&gcc, "ddrss_gpu_axi", GCC_DDRSS_GPU_AXI_CBCR, false) ||
++	    !clock_on(&gcc, "gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX_CBCR, false) ||
++	    !clock_on(&gcc, "gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX_CBCR, false)) {
+ 		return false;
+ 	}
+ 
+@@ -766,10 +806,15 @@ step_clocks(void)
+ 		return false;
+ 	}
+ 
+-	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on");
++	announce("in the GPU's clock controller: the clocks of the GMU and of the SMMU on, and the SMMU's clock vote");
+ 	if (!clock_on(&gpucc, "cxo", GPUCC_CXO_CBCR, true) ||
+-	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false) ||
+-	    !clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true)) {
++	    !clock_on(&gpucc, "cxo_aon", GPUCC_CXO_AON_CBCR, false) ||
++	    !clock_on(&gpucc, "ahb", GPUCC_AHB_CBCR, false)) {
++		return false;
++	}
++	/* the GMU's clock with its wake and sleep counters at their most, as ios-surya brings it up */
++	put(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, (rd(gpucc.base + GPUCC_CX_GMU_CBCR) & ~0xff0u) | 0xff0u);
++	if (!clock_on(&gpucc, "cx_gmu", GPUCC_CX_GMU_CBCR, true) || !smmu_vote()) {
+ 		return false;
+ 	}
+ 	return measure_clocks();
+@@ -954,7 +999,7 @@ smmu_layout(void)
+ static bool
+ step_smmu(void)
+ {
+-	if (!cx_ready()) {
++	if (!cx_ready() || !smmu_clocked()) {
+ 		return false;
+ 	}
+ 	announce("read the ID registers of the GPU's SMMU (0x5040000): global registers, answered by the hypervisor");
+@@ -983,7 +1028,7 @@ step_smmu_context(void)
+ {
+ 	uint32_t context;
+ 
+-	if (!cx_ready()) {
++	if (!cx_ready() || !smmu_clocked()) {
+ 		return false;
+ 	}
+ 	announce("read translation context 0 of the SMMU: registers of the hardware itself, not the hypervisor's");
+@@ -1573,7 +1618,7 @@ static bool gmu_space_is_on, gmu_runs, gmu_talks, core_is_on, rsc_awake;
+ static bool
+ step_gmu_space(void)
+ {
+-	if (!cx_ready()) {
++	if (!cx_ready() || !smmu_clocked()) {
+ 		return false;
+ 	}
+ 	announce("read the GMU's firmware, " FW_DIRECTORY FW_GMU ", and make the memory its driver gives it");
+@@ -1919,6 +1964,13 @@ struct hfi_bw_table {
+ 
+ static uint32_t hfi_number;
+ 
++/* The 3D core's power switch, which the GMU's firmware operates. */
++static bool
++gx_on(void)
++{
++	return (rd(gpucc.base + GPUCC_GX_GDSCR) & GDSC_POWER_ON) != 0;
++}
++
+ /* Everything waiting in a queue of the GMU's; true if the answer to the message numbered `number` was among it. */
+ static bool
+ hfi_receive(unsigned which, uint32_t number, uint32_t *answer, uint32_t answer_words)
+@@ -2104,12 +2156,19 @@ step_gmu_queues(void)
+ 	if (!oob_set("\"boot\"", OOB_BOOT_SLUMBER)) {
+ 		return false;
+ 	}
++	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
++	/*
++	 * On ios-surya (same GPU, same firmware) this request alone, with no message queues at all,
++	 * powered the 3D core (gx_gdsc on) and its command processor later ran commands. So from here
++	 * a failure is said and the steps go on whenever the core has power: `gmu_talks` says the GMU
++	 * is up either way, and step 17 checks the power switch itself.
++	 */
++	gmu_talks = true;
+ 	/* a6xx_sptprac_enable: the shader processors' and texture units' power, ours to switch while the GMU idles none */
+ 	put(&gmu, "gx_sptprac_power_control", GMU_GX_SPTPRAC_POWER_CONTROL, 0x778000);
+ 	if (!wait_for(&gmu, GMU_SPTPRAC_PWR_CLK_STATUS, 0x38, 0x28, 10)) {
+-		printf("SWEET GPU: %u: the shader processors' power does not come on (%#x)\n", step,
++		printf("SWEET GPU: %u: the shader processors' power does not come on (%#x); going on\n", step,
+ 		    rd(gmu.base + GMU_SPTPRAC_PWR_CLK_STATUS));
+-		return false;
+ 	}
+ 	get(&gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK_STATUS);
+ 
+@@ -2118,24 +2177,28 @@ step_gmu_queues(void)
+ 	if (!wait_for(&gmu, GMU_HFI_CTRL_STATUS, 1, 1, 100)) {
+ 		get(&gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
+ 		space_faulted(&gmu_space);
+-		printf("SWEET GPU: %u: the GMU does not start its message queues\n", step);
+-		return false;
++		printf("SWEET GPU: %u: the GMU does not start its message queues; %s\n", step, gx_on() ?
++		    "THE 3D CORE HAS POWER ALL THE SAME (as on ios-surya): going on without them" : "and the 3D core has no power");
++		return gx_on();
+ 	}
+-	gmu_talks = true;
+ 
+ 	/* linux a6xx_hfi_start_v1; msm-4.14 hfi_start with HFI version 1 */
+ 	announce("send the GMU \"init\", ask its version, send the tables of speeds and of bus votes, and \"test\" (no more "
+ 	    "messages until the next start)");
+ 	if (!hfi_send("\"init\"", HFI_INIT, init, 5, answer, 0) ||
+ 	    !hfi_send("the question of its version", HFI_FW_VERSION, version, 2, answer, 1)) {
+-		return false;
++		printf("SWEET GPU: %u: no messages with the GMU; %s\n", step, gx_on() ?
++		    "THE 3D CORE HAS POWER ALL THE SAME: going on without them" : "and the 3D core has no power");
++		return gx_on();
+ 	}
+ 	printf("SWEET GPU: %u: the GMU's firmware is version %u.%u.%u (the vendor's driver expects 1.8)\n", step,
+ 	    answer[0] >> 28, answer[0] >> 16 & 0xfff, answer[0] & 0xffff);
+ 	if (!hfi_send("the table of speeds", HFI_PERF_TABLE, &perf.header, sizeof(perf) / 4, answer, 0) ||
+ 	    !hfi_send("the table of bus votes", HFI_BW_TABLE, &bw.header, sizeof(bw) / 4, answer, 0) ||
+ 	    !hfi_send("\"test\"", HFI_TEST, test, 1, answer, 0)) {
+-		return false;
++		printf("SWEET GPU: %u: the GMU does not take its tables; %s\n", step, gx_on() ?
++		    "THE 3D CORE HAS POWER ALL THE SAME: going on" : "and the 3D core has no power");
++		return gx_on();
+ 	}
+ 	printf("SWEET GPU: %u: THE GMU'S MESSAGE QUEUES ARE UP\n", step);
+ 	return !space_faulted(&gmu_space);
+@@ -2205,7 +2268,10 @@ step_core_power(void)
+ 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+ 	core_is_on = true;                      /* asked for, at least: to be given back */
+ 	if (!oob_set("to keep the 3D core powered", OOB_GPU)) {
+-		return false;
++		if (!gx_on()) {
++			return false;
++		}
++		printf("SWEET GPU: %u: the 3D core has power from \"boot\" (step 16): going on\n", step);
+ 	}
+ 	get(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR);
+ 	get(&gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
+@@ -2219,10 +2285,11 @@ step_core_power(void)
+ 	put(&gmu, "dcvs_ack_option", GMU_DCVS_ACK_OPTION, 0);
+ 	put(&gmu, "dcvs_perf_setting", GMU_DCVS_PERF_SETTING, 3u << 28 | gpu_speed);
+ 	put(&gmu, "dcvs_bw_setting", GMU_DCVS_BW_SETTING, 0xff);       /* the firmware's choice of bus vote */
+-	if (!oob_set("for the speed", OOB_DCVS)) {
+-		return false;
++	if (oob_set("for the speed", OOB_DCVS)) {
++		oob_clear(OOB_DCVS);
++	} else {
++		printf("SWEET GPU: %u: no speed set: the core runs at whatever the GMU chose; going on\n", step);
+ 	}
+-	oob_clear(OOB_DCVS);
+ 	returned = get(&gmu, "dcvs_return", GMU_DCVS_RETURN);
+ 	printf("SWEET GPU: %u: measured: the 3D core's clock runs at %u Hz (dcvs_return %d)\n", step,
+ 	    measure_quietly(GPUCC_DEBUG_GX_GFX3D), (int)returned);
+@@ -2253,6 +2320,8 @@ step_core_power(void)
+ #define CP_ME_INIT              0x48
+ #define CP_MEM_WRITE            0x3d
+ #define CP_SET_SECURE_MODE      0x66
++#define CP_SCRATCH_REG0_NUMBER  0x0883
++#define CP_SCRATCH_REG0         GPU_WORD(CP_SCRATCH_REG0_NUMBER)
+ 
+ static struct gpu_space core_space = { .name = "the 3D core", .context = 0, .control = SMMU_SCTLR_SERVE_AFTER_FAULT };
+ static struct gpu_block core_ring, core_sqe, core_scratch;
+@@ -2281,6 +2350,14 @@ ring_command(uint32_t command, uint32_t words)
+ 	ring(7u << 28 | words | odd_parity(words) << 15 | command << 16 | odd_parity(command) << 23);
+ }
+ 
++/* A register of the 3D core (by its word number) written by command, in the order of the other commands. */
++static void
++ring_register(uint32_t number, uint32_t value)
++{
++	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
++	ring(value);
++}
++
+ static void
+ ring_send(void)
+ {
+@@ -2372,6 +2449,8 @@ step_core_space(void)
+ #define ZAP_MEMORY              0x98f95000ull
+ #define ZAP_MEMORY_SIZE         0x2000u
+ #define ELF_PT_LOAD             1
++static uint32_t zap_wanted = 1;         /* boot-arg adreno_zap=0: none (ios-surya's command processor ran without one) */
++static bool zap_load(void);
+ #define MDT_TYPE_HASH           (2u << 24)      /* of a segment's flags (qcom_mdt_loader: QCOM_MDT_TYPE_MASK) */
+ 
+ static bool
+@@ -2393,8 +2472,30 @@ loadable(const struct elf32_phdr *segment)
+ 	return segment->type == ELF_PT_LOAD && (segment->flags & (7u << 24)) != MDT_TYPE_HASH && segment->memsz != 0;
+ }
+ 
++/*
++ * Whether there is a zap shader or not, the steps go on: ios-surya's A618 (same SoC, same
++ * firmware) ran its command processor's commands with none ever loaded, so this kernel may well
++ * do without TrustZone here. Step 21 then leaves secure mode only if a zap shader is there to
++ * ask, and otherwise just tries the memory write.
++ */
+ static bool
+ step_zap_load(void)
++{
++	if (!cx_ready() || !core_is_on) {
++		return false;
++	}
++	if (!zap_wanted) {
++		printf("SWEET GPU: %u: no zap shader (adreno_zap=0): the 3D core stays as it starts\n", step);
++		return true;
++	}
++	if (!zap_load()) {
++		printf("SWEET GPU: %u: NO ZAP SHADER; going on without one, as ios-surya's A618 runs commands without one\n", step);
++	}
++	return true;
++}
++
++static bool
++zap_load(void)
+ {
+ 	struct elf32_phdr segment;
+ 	volatile uint8_t *memory;
+@@ -2557,7 +2658,15 @@ step_core_start(void)
+ 	if (!ring_run("initialize its command processor")) {
+ 		return false;
+ 	}
+-	printf("SWEET GPU: %u: THE 3D CORE TAKES COMMANDS\n", step);
++	/* ios-surya's proof on this GPU: a register written by command, read back here */
++	wr(gpu.base + CP_SCRATCH_REG0, 0);
++	ring_register(CP_SCRATCH_REG0_NUMBER, 0x1337beef);
++	if (!ring_run("write a register") || rd(gpu.base + CP_SCRATCH_REG0) != 0x1337beef) {
++		printf("SWEET GPU: %u: cp_scratch_reg0 reads %#x, not the 0x1337beef it was told to write\n", step,
++		    rd(gpu.base + CP_SCRATCH_REG0));
++		return false;
++	}
++	printf("SWEET GPU: %u: THE 3D CORE TAKES COMMANDS (cp_scratch_reg0 = 0x1337beef, written by command)\n", step);
+ 	return true;
+ }
+ 
+@@ -2571,11 +2680,15 @@ step_core_commands(void)
+ 	if (!cx_ready() || !core_runs) {
+ 		return false;
+ 	}
+-	announce("command the 3D core out of secure mode (it asks the zap shader), then to write a word into a page of ours");
+-	ring_command(CP_SET_SECURE_MODE, 1);
+-	ring(0);
+-	if (!ring_run("leave secure mode")) {
+-		return false;
++	if (zap_is_loaded) {
++		announce("command the 3D core out of secure mode (it asks the zap shader), then to write a word into a page of ours");
++		ring_command(CP_SET_SECURE_MODE, 1);
++		ring(0);
++		if (!ring_run("leave secure mode")) {
++			return false;
++		}
++	} else {
++		announce("no zap shader: command the 3D core to write a word into a page of ours as it is");
+ 	}
+ 	ring_command(CP_MEM_WRITE, 3);
+ 	ring(CORE_SCRATCH_ADDRESS);
+@@ -2867,14 +2980,6 @@ sweet_gpu_last(void)
+ 	return gpu_fence;
+ }
+ 
+-/* A register of the 3D core (by its word number) written by command, in the order of the other commands. */
+-static void
+-ring_register(uint32_t number, uint32_t value)
+-{
+-	ring(4u << 28 | 1 | odd_parity(1) << 7 | number << 8 | odd_parity(number) << 27);
+-	ring(value);
+-}
+-
+ /*
+  * Command buffers for the 3D core to run, in order: each an address and a count of words, put
+  * in the ring as linux a6xx_submit puts them. Returns the submission's number; 0: the ring is
+@@ -3043,6 +3148,7 @@ sweet_adreno_init(void)
+ 	PE_parse_boot_argn("adreno_fine", &fine, sizeof(fine));
+ 	PE_parse_boot_argn("adreno_delay", &start_delay_s, sizeof(start_delay_s));
+ 	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
++	PE_parse_boot_argn("adreno_zap", &zap_wanted, sizeof(zap_wanted));
+ 	if (last_step > STEPS) {
+ 		last_step = STEPS;
+ 	}

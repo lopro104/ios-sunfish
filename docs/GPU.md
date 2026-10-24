@@ -89,6 +89,26 @@ As with steps 1-10: one new step per boot (`adreno=11`, then `adreno=12`, ...). 
 TrustZone or the hypervisor something are the ones most likely to end a run without a word; the log
 line before the reset names the call.
 
+## Corrections from ios-surya (patch 0092)
+
+[arbuxiktech/ios-surya](https://github.com/arbuxiktech/ios-surya), another ios-sweet fork, runs on the
+Poco X3 NFC: the same SM7150 and Adreno 618, the same GPU firmware. It has brought the GPU up on real
+hardware as far as the command processor running commands (its NOTES.md, with photos). Our steps were
+written without hardware, so they were checked against it; most of the GMU sequence agreed (chip ID
+0x06018000, fence range, PDC and RSC programs, ITCM upload, boot request 22/30). What did not:
+
+| Their finding | Our steps before | Now |
+| --- | --- | --- |
+| The SMMU's registers need GPUCC `0x5000` bit 0 (`gpu_cc_hlos1_vote_gpu_smmu_clk`); without it the first read stalls the bus | not set: step 8 would have hung | step 5 sets it; steps 8, 9, 13 refuse to run without it |
+| Reading `gcc_gpu_memnoc_gfx` (0x17100c) early stopped the phone; after turning on `gpu_cfg_ahb`, `ddrss_gpu_axi`, `gpu_memnoc_gfx` in that order it reads | step 1 read it first thing | step 1 no longer reads it; step 5 uses their order |
+| `cxo_aon` on; the GMU clock's wake/sleep counters at 0xff | not done | done in step 5 |
+| The boot request alone powered the 3D core; no message queues were used | a failed message stopped step 16 | step 16 goes on if the core has power |
+| The command processor ran with no zap shader | step 19 failing stopped everything | step 19 never stops the steps; `adreno_zap=0` skips it |
+| Their proof: a register written by command (`0x1337beef`) | memory write only | step 20 does the register test, step 21 the memory write |
+
+They tried, then took out again as risky, writing the SMMU's `attach-impl-defs` and ACTLR and
+`RBBM_SECVID_TRUST_CNTL`; those are not done here either.
+
 ## The GPU kept on: the SweetGPU service (patch 0090)
 
 Status (2026-10-24): **written and compiled, not run on a phone.** With `adreno=21 adreno_keep=1`,
