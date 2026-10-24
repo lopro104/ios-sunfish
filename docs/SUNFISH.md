@@ -165,3 +165,15 @@ The log also shows how fast a simple loop runs before and after: the speed-up, i
   HackiOS's 45/50/58 C, used in 0087, were stricter than Google's).
   A thermistor that reads off the table (open or shorted) counts as no reading, so a broken sensor
   can't slow the phone. `sysctl kern.hackios.battery_temperature_tenths`.
+
+## Battery (patch 0091)
+
+The battery service (`SweetBattery.cpp`) had the Redmi's 5020 mAh battery and a generic voltage curve
+built in. On `google,sunfish` it now uses the Pixel 4a's: 3140 mAh, and Google's own curve of open-circuit
+voltage against charge at 25 C (msm-4.14 `batterydata-qcom-s5-SWD-ATL.dtsi`; full is 4.45 V, not 4.35).
+Reading the PMIC is on by default on the Pixel (`sweetbattery=0` turns it off; it only reads). The
+temperature iOS sees is the battery thermistor's, from the thermal service, instead of a fixed 25 C.
+
+It is still an estimate from the voltage alone: under load the voltage sags and the percentage reads low,
+while charging it reads high. Google's driver tracks charge going in and out over time (Qualcomm's QG
+algorithm), which is not ported. Log line: `SWEET BATTERY: google,sunfish battery, 3140 mAh; PM6150 polling on`.

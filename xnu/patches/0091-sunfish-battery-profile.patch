@@ -1,0 +1,241 @@
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+index bc13a67..7cb3826 100644
+--- a/bsd/dev/sweet_thermal.c
++++ b/bsd/dev/sweet_thermal.c
+@@ -48,6 +48,7 @@ extern void sweet_cpufreq_cap(uint32_t domain, int row);
+ extern int sweet_spmi_init(void);
+ extern int sweet_spmi_battery_temp(int *tenths);
+ void sweet_thermal_init(void);
++int sweet_thermal_battery_tenths(void);
+ 
+ #define TSENS0_TM               0x0c263000UL    /* dt: thermal-sensor@c263000, "TM" */
+ #define TSENS1_TM               0x0c265000UL    /* dt: thermal-sensor@c265000 */
+@@ -62,6 +63,13 @@ static int16_t readings[THERMAL_ZONES];
+ static bool thermal_caps_on;                    /* cpufreq=1 raised a group: there are caps to set */
+ static int battery_tenths = -2730;              /* the battery's temperature (PM6150 ADC5); -2730: not known */
+ 
++/* For the battery service (SweetBattery.cpp): the last reading, in tenths of a degree; -2730 while not known. */
++int
++sweet_thermal_battery_tenths(void)
++{
++	return battery_tenths;
++}
++
+ /* what the sysctls show, kept by the service's thread and read by anyone */
+ static LCK_GRP_DECLARE(thermal_lck_grp, "sweet-thermal");
+ static LCK_MTX_DECLARE(thermal_mtx, &thermal_lck_grp);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..6256571 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,18 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * The battery is the board's (struct sweet_battery_profile below):
++ *   sweet           5020 mAh, a generic single-cell voltage curve
++ *   google,sunfish  3140 mAh (the Pixel 4a's rated capacity), Google's own
++ *                   curve: msm-4.14 batterydata-qcom-s5-SWD-ATL.dtsi, the
++ *                   open-circuit voltage at 25 C for each state of charge
++ *                   (the ATL cell; LSN's is within 15 mV, and ATL is the
++ *                   profile Google falls back to when the ID is unknown).
++ *                   Polling is on by default there (sweetbattery=0: off):
++ *                   the same PMIC, read only.
++ * The temperature is the battery thermistor's when the thermal service has
++ * one (sweet_thermal.c), else a fixed 25 C as before.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -15,6 +27,39 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_thermal.c: the battery thermistor, tenths of a degree; -2730 not known */
++extern "C" int sweet_thermal_battery_tenths(void);
++
++struct sweet_battery_profile {
++	const char *compatible;         /* NULL: the default (sweet) */
++	unsigned capacity;              /* mAh */
++	unsigned points;
++	const unsigned short *mv;       /* rising */
++	const unsigned char *soc;       /* percent, at each */
++	int pollDefault;                /* sweetbattery when not given */
++};
++
++/* Generic single-cell curve, intentionally NOT advertised as QG SOC. */
++static const unsigned short sweet_mv[] = {3400, 3500, 3600, 3700, 3800, 3900,
++    4000, 4100, 4200, 4350};
++static const unsigned char sweet_soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++
++/* batterydata-qcom-s5-SWD-ATL.dtsi qcom,pc-temp-v1-lut, the 25 C column. */
++static const unsigned short sunfish_mv[] = {3000, 3377, 3499, 3578, 3636, 3679,
++    3699, 3703, 3705, 3706, 3709, 3719, 3736, 3752, 3766, 3778, 3789, 3797,
++    3802, 3806, 3811, 3815, 3820, 3826, 3833, 3840, 3848, 3858, 3868, 3878,
++    3888, 3902, 3926, 3953, 3973, 3990, 4007, 4025, 4044, 4064, 4085, 4107,
++    4129, 4152, 4176, 4200, 4224, 4249, 4274, 4299, 4323, 4346, 4368, 4390,
++    4412, 4437};
++static const unsigned char sunfish_soc[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
++    12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46,
++    48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 82,
++    84, 86, 88, 90, 92, 94, 96, 98, 100};
++
++static const struct sweet_battery_profile sweet_battery_profiles[] = {
++	{"google,sunfish", 3140, sizeof(sunfish_mv) / sizeof(sunfish_mv[0]), sunfish_mv, sunfish_soc, 1},
++	{NULL, 5020, sizeof(sweet_mv) / sizeof(sweet_mv[0]), sweet_mv, sweet_soc, 0},
++};
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,6 +71,7 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
++	const struct sweet_battery_profile *fProfile;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
+ 	void putNumber(const char *key, UInt32 value);
+@@ -36,7 +82,8 @@ private:
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+-	static unsigned estimatePercent(unsigned mv);
++	unsigned estimatePercent(unsigned mv);
++	static bool boardIs(const char *want);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
+@@ -51,6 +98,7 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
++	fProfile = &sweet_battery_profiles[sizeof(sweet_battery_profiles) / sizeof(sweet_battery_profiles[0]) - 1];
+ 	fTimerAdded = fRunning = fReal = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+@@ -101,11 +149,14 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units (the board's nominal). powerd computes C*100/M. */
++	const unsigned design = fProfile->capacity;
++	const unsigned capacity = (design * percent + 50u) / 100u;
++	const int tenths = sweet_thermal_battery_tenths();
++	const bool thermistor = measured && tenths > -400 && tenths < 1000;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(design);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,15 +170,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", design);
++	putNumber("DesignCapacity", design);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+-	putNumber("Temperature", 2500);
++	/* iOS battery convention: centidegrees C; the thermistor's, else fixed 25 C. */
++	putNumber("Temperature", thermistor ? (UInt32)(tenths * 10) : 2500);
+ 	putBool("SweetBatteryHardwareSampleValid", measured);
+ 	putBool("SweetBatteryCurrentValid", currentValid);
+ 	putBool("SweetBatterySOCEstimated", measured);
+-	putBool("SweetBatteryTemperatureEstimated", true);
++	putBool("SweetBatteryTemperatureEstimated", !thermistor);
+ 	putBool("SweetBatteryFallback", !measured);
+ 	putNumber("SweetBatteryPercent", percent);
+ 
+@@ -137,7 +188,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, design, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -186,18 +237,18 @@ SweetBattery::readWord(unsigned address, uint16_t *value)
+ unsigned
+ SweetBattery::estimatePercent(unsigned mv)
+ {
+-	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+-	 * Load sag, temperature, aging and charging introduce large errors. */
+-	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
+-	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
++	/* The board's curve. Open-circuit voltages: load sag, temperature,
++	 * aging and charging introduce large errors. Never 0% from a reading. */
++	const unsigned short *volts = fProfile->mv;
++	const unsigned char *soc = fProfile->soc;
+ 	if (mv <= volts[0]) {
+-		return soc[0];
++		return soc[0] > 1 ? soc[0] : 1;
+ 	}
+-	for (unsigned i = 1; i < sizeof(volts) / sizeof(volts[0]); ++i) {
++	for (unsigned i = 1; i < fProfile->points; ++i) {
+ 		if (mv < volts[i]) {
+-			return soc[i - 1] + (mv - volts[i - 1]) * (soc[i] - soc[i - 1]) /
+-			       (volts[i] - volts[i - 1]);
++			unsigned p = soc[i - 1] + (mv - volts[i - 1]) * (unsigned)(soc[i] - soc[i - 1]) /
++			    (unsigned)(volts[i] - volts[i - 1]);
++			return p > 1 ? p : 1;
+ 		}
+ 	}
+ 	return 100;
+@@ -246,6 +297,30 @@ SweetBattery::poll(void)
+ 	    charging, full, true, currentValid);
+ }
+ 
++/* Whether the ADT root's compatible list names `want` (as SweetFramebuffer.cpp asks). */
++bool
++SweetBattery::boardIs(const char *want)
++{
++	IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
++	OSData *compat = root ? OSDynamicCast(OSData, root->getProperty("compatible")) : NULL;
++	if (compat == NULL) {
++		return false;
++	}
++	const char *p = (const char *)compat->getBytesNoCopy();
++	unsigned int len = compat->getLength(), wl = (unsigned int)strlen(want);
++	for (unsigned int i = 0; i < len;) {
++		unsigned int n = 0;
++		while (i + n < len && p[i + n] != 0) {
++			n++;
++		}
++		if (n == wl && memcmp(p + i, want, n) == 0) {
++			return true;
++		}
++		i += n + 1;
++	}
++	return false;
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -262,8 +337,17 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	for (unsigned i = 0; i < sizeof(sweet_battery_profiles) / sizeof(sweet_battery_profiles[0]); ++i) {
++		if (sweet_battery_profiles[i].compatible == NULL || boardIs(sweet_battery_profiles[i].compatible)) {
++			fProfile = &sweet_battery_profiles[i];
++			break;
++		}
++	}
++	int real = fProfile->pollDefault;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	IOLog("SWEET BATTERY: %s battery, %u mAh; PM6150 polling %s\n",
++	    fProfile->compatible ? fProfile->compatible : "default (sweet)", fProfile->capacity,
++	    real == 1 ? "on" : "off (sweetbattery=1 turns it on)");
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();

@@ -175,6 +175,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0088 | Battery limit set to Google's sunfish value (60 C) instead of HackiOS's 45/50/58 C |
 | 0089 | Adreno 618 bring-up steps 11-21: TrustZone and the zap shader, the (legacy) GMU started and talked to, the 3D core powered, its command processor started and writing to memory; firmware from `/fw/adreno/` (docs/GPU.md) |
 | 0090 | `SweetGPU`: with `adreno=21 adreno_keep=1` the GPU stays on and programs get it through Linux's msm DRM interface (what Mesa's freedreno speaks); ported from HackiOS's `HKGPU` |
+| 0091 | Battery: the Pixel 4a's 3140 mAh and Google's voltage curve, battery temperature from the thermistor, PMIC reading on by default on sunfish |
 
 ## Key hardware facts (sunfish)
 

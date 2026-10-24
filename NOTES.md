@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 0091, 2026-10-24: SweetBattery per-board profile (sunfish: 3140 mAh, ATL 25 C OCV curve), thermistor temperature via sweet_thermal_battery_tenths(), polling default on for sunfish.
+
 ## 0090, 2026-10-24: SweetGPU service (iokit/Kernel/arm/SweetGPU.cpp) + "GPU kept on" API in sweet_adreno.c (sweet_gpu_*). Trimmed HKGPU port: no kept-buffer cache, no timing, no recovery. Untested.
 
 ## 0089, 2026-10-24: Adreno steps 11-21 (docs/GPU.md). Legacy GMU (HFI v1, HFI_USE_REG) per msm-4.14 kgsl; firmware read via vnode_open from /fw/adreno/. Untested on hardware.
