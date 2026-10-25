@@ -48,8 +48,16 @@ tables, TrustZone calls and command ring are reused; their GMU code is for a new
 
 ### Firmware
 
-Steps 12 on read the Pixel's own GPU firmware from `/fw/adreno/` on the iOS root. Copy it once, with
-Android running:
+Steps 12 on need the Pixel's own GPU firmware. Since patch 0101 the boot image can carry it: give
+`tools/mkadt.py` the directory with Android's firmware files (an Android tree's
+`vendor/google/sunfish/proprietary/vendor/firmware`, or `adb pull`ed as below):
+
+```bash
+python3 tools/mkadt.py shim/out/sunfish.adt --highmem --device sunfish --firmware DIR
+```
+
+The kernel looks in the device tree's `/sweet-fw` first and only then in `/fw/adreno/` on the iOS
+root. To put the files on the root instead, copy them once, with Android running:
 
 ```bash
 mkdir -p fw-adreno

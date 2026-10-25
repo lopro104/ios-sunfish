@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index f142ab4..c43e56b 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -84,6 +84,7 @@
+ #include <mach/mach_time.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <sys/errno.h>
+ #include <sys/fcntl.h>
+ #include <sys/uio.h>
+@@ -1091,7 +1092,9 @@ step_gmu_memory(void)
+  * the 3D core's microcode and the signed zap shader, in its .mdt header and its segments. They
+  * are read from the iOS root, which is mounted by the time the steps run, in FW_DIRECTORY:
+  * docs/GPU.md says how they get there. Names as the vendor's driver for this GPU asks for them
+- * (msm-4.14 adreno-gpulist.h, ADRENO_REV_A618).
++ * (msm-4.14 adreno-gpulist.h, ADRENO_REV_A618). Looked for first in the device tree's /sweet-fw
++ * node, one property per file (tools/mkadt.py --firmware DIR): then the boot image carries them
++ * and the root needs no copy.
+  */
+ #define FW_DIRECTORY            "/fw/adreno/"
+ #define FW_GMU                  "a618_gmu.bin"
+@@ -1111,6 +1114,22 @@ fw_file(const char *name, uint64_t *size)
+ 	vm_offset_t data = 0;
+ 	int resid = 0, error;
+ 
++	DTEntry node;
++	void const *blob = NULL;
++	unsigned int blob_size = 0;
++	if (SecureDTLookupEntry(NULL, "/sweet-fw", &node) == kSuccess &&
++	    SecureDTGetProperty(node, name, &blob, &blob_size) == kSuccess && blob_size > 0 && blob_size <= FW_LARGEST) {
++		if (kmem_alloc(kernel_map, &data, round_page((vm_size_t)blob_size), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET GPU: %u: no memory for %s\n", step, name);
++			return NULL;
++		}
++		memcpy((void *)data, blob, blob_size);
++		printf("SWEET GPU: %u: %s from the boot image: %u bytes\n", step, name, blob_size);
++		*size = blob_size;
++		return (const uint8_t *)data;
++	}
++
+ 	snprintf(path, sizeof(path), FW_DIRECTORY "%s", name);
+ 	error = vnode_open(path, FREAD, 0, 0, &vnode, context);
+ 	if (error != 0) {

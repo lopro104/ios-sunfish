@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0101, 2026-10-25: user: battery not important (0100 still showed a jump to 100 while charging), GPU next. GPU firmware found on this PC in Google's vendor blobs (~/evox17/vendor/google/sunfish/proprietary/vendor/firmware: a618_gmu.bin 32768, a630_sqe.fw 32136, a615_zap.mdt 6860 + b00/b01/b02). 0101: fw_file() reads /sweet-fw/<name> from the device tree first; mkadt.py --firmware DIR adds that node (ADT 93744 bytes with it). So the root need not be reflashed. Plan: boot with adreno=21 (steps 1-21, 1.5 s pause per access, the log names the last access on a reset), then adreno_keep=1 for SweetGPU.
+
 ## 0100, 2026-10-25: 0099 booted (user): real readings now, but the percentage jumps with load (charging 100, unplugged 90 -> 83 -> 85 in two minutes): voltage-only estimate. 0100 ports the mainline sunfish qcom_qg.c method into SweetBattery for boards with a resistance in the profile (sunfish 150 mOhm from the mainline dts; sweet unchanged): OCV = V - I*R, coulomb counting every 5 s with 10 min resync / 30 s sleep gap / idle pull 1/64, full (charger state 5) = full charge, UI percent smoothed 1%/20 s and never against the current. Untested.
 
 ## Known, deferred (user: ignore for now): the root is a 16 GiB HFS+ volume at the start of the 109 GiB userdata, so iOS sees 16 GiB. Options when it matters: (1) rebuild with mkiosroot.sh at partition size minus a reserve for the log ring (last 4 MiB + 4 KiB) and send only the data extents over adb; (2) grow in place with XNU hfs_extendfs from the kernel, after the UFS driver reports the partition minus the log area (today DKIOCGETBLOCKCOUNT covers the whole partition, so any grow to the device size would overwrite the log).

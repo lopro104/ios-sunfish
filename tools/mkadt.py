@@ -266,6 +266,16 @@ if __name__ == '__main__':
     if device not in DEVICES:
         raise SystemExit(f'unknown --device {device} (one of: {", ".join(DEVICES)})')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, device=device)
+    if '--firmware' in sys.argv:
+        # bsd/dev/sweet_adreno.c fw_file(): the GPU firmware in the boot image, one
+        # property per file of DIR (Android's /vendor/firmware names), so the root needs no copy.
+        fwdir = sys.argv[sys.argv.index('--firmware') + 1]
+        names = ['a618_gmu.bin', 'a630_sqe.fw'] + sorted(
+            f for f in os.listdir(fwdir) if f.startswith('a615_zap.') and f != 'a615_zap.elf')
+        missing = [f for f in names[:2] + ['a615_zap.mdt'] if not os.path.exists(os.path.join(fwdir, f))]
+        if missing:
+            raise SystemExit(f'--firmware {fwdir}: missing {", ".join(missing)}')
+        root.children.append(node('sweet-fw', [(f, open(os.path.join(fwdir, f), 'rb').read()) for f in names]))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
