@@ -1,0 +1,149 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index e96afa4..62f96ad 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -18,6 +18,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
++#include <kern/clock.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -38,6 +39,7 @@ struct sweet_battery_profile {
+ 	const unsigned short *mv;       /* rising */
+ 	const unsigned char *soc;       /* percent, at each */
+ 	int pollDefault;                /* sweetbattery when not given */
++	unsigned resistance;            /* mOhm, cell + path; 0: no load correction, no charge counting */
+ };
+ 
+ /* Generic single-cell curve, intentionally NOT advertised as QG SOC. */
+@@ -58,8 +60,9 @@ static const unsigned char sunfish_soc[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+     84, 86, 88, 90, 92, 94, 96, 98, 100};
+ 
+ static const struct sweet_battery_profile sweet_battery_profiles[] = {
+-	{"google,sunfish", 3140, sizeof(sunfish_mv) / sizeof(sunfish_mv[0]), sunfish_mv, sunfish_soc, 1},
+-	{NULL, 5020, sizeof(sweet_mv) / sizeof(sweet_mv[0]), sweet_mv, sweet_soc, 0},
++	/* 150 mOhm: the mainline sunfish dts, factory-internal-resistance-micro-ohms */
++	{"google,sunfish", 3140, sizeof(sunfish_mv) / sizeof(sunfish_mv[0]), sunfish_mv, sunfish_soc, 1, 150},
++	{NULL, 5020, sizeof(sweet_mv) / sizeof(sweet_mv[0]), sweet_mv, sweet_soc, 0, 0},
+ };
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -75,6 +78,12 @@ private:
+ 	const struct sweet_battery_profile *fProfile;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	/* Charge counting and the shown percentage (as linux qcom_qg.c, mainline sunfish port) */
++	bool fCcValid;
++	int64_t fChargeUah;
++	uint64_t fCcTime, fSocTime;     /* ms */
++	int fSoc;                       /* shown percent, -1: none yet */
++	unsigned smoothPercent(unsigned raw, int ma, uint64_t now);
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -121,6 +130,10 @@ SweetBattery::init(OSDictionary *dictionary)
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fCcValid = false;
++	fChargeUah = 0;
++	fCcTime = fSocTime = 0;
++	fSoc = -1;
+ 	return true;
+ }
+ 
+@@ -294,10 +307,73 @@ SweetBattery::poll(void)
+ 		/* Linux: negative=charging; IOPMPowerSource: positive=charging, mA. */
+ 		ma = (int)(-((int64_t)signedRaw * (subtype == 3 ? 152588 : 305176)) / 1000000);
+ 	}
+-	publish(full ? 100 : estimatePercent(mv), mv, ma, external, capable,
++	unsigned percent = estimatePercent(mv);
++	if (fProfile->resistance && currentValid) {
++		/*
++		 * The curve is for a resting cell; under load or while charging the
++		 * terminal voltage is off by I * R (the percentage jumped 10-25%).
++		 * Then count the charge from the current, starting from that
++		 * estimate and pulled slowly back to it while nearly idle, and let
++		 * the shown value move 1% per 20 s at most (qcom_qg.c).
++		 */
++		int ocv = (int)mv - ma * (int)fProfile->resistance / 1000;
++		unsigned raw = estimatePercent(ocv > 0 ? (unsigned)ocv : 0);
++		uint64_t now;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now);
++		now /= 1000000ULL;
++		const int64_t fullUah = (int64_t)fProfile->capacity * 1000;
++		const int64_t ocvUah = fullUah * raw / 100;
++		const int64_t dt = (int64_t)(now - fCcTime);
++		if (!fCcValid || dt > 10 * 60 * 1000) {
++			fChargeUah = ocvUah;
++			fCcValid = true;
++		} else if (dt > 30 * 1000) {
++			fChargeUah -= 10000LL * dt / 3600000;           /* asleep: 10 mA */
++		} else {
++			fChargeUah += (int64_t)ma * 1000 * dt / 3600000;
++			if (ma > -50 && ma < 50) {
++				fChargeUah += (ocvUah - fChargeUah) / 64;
++			}
++		}
++		if (full) {
++			fChargeUah = fullUah;
++		}
++		fChargeUah = fChargeUah < 0 ? 0 : (fChargeUah > fullUah ? fullUah : fChargeUah);
++		fCcTime = now;
++		percent = smoothPercent((unsigned)((fChargeUah * 100 + fullUah / 2) / fullUah), ma, now);
++	}
++	publish(full ? 100 : percent, mv, ma, external, capable,
+ 	    charging, full, true, currentValid);
+ }
+ 
++/* What the UI shows: toward raw by at most 1% per 20 s, never up while discharging nor down while charging. */
++unsigned
++SweetBattery::smoothPercent(unsigned raw, int ma, uint64_t now)
++{
++	if (fSoc < 0) {
++		fSoc = (int)raw;
++		fSocTime = now;
++		return raw;
++	}
++	int diff = (int)raw - fSoc;
++	if (diff == 0 || (diff > 0 && ma < -10) || (diff < 0 && ma > 10)) {
++		fSocTime = now;
++		return (unsigned)fSoc;
++	}
++	int64_t steps = (int64_t)(now - fSocTime) / 20000;
++	if (steps == 0) {
++		return (unsigned)fSoc;
++	}
++	if (diff > steps) {
++		diff = (int)steps;
++	} else if (diff < -steps) {
++		diff = -(int)steps;
++	}
++	fSoc += diff;
++	fSocTime += (uint64_t)steps * 20000;
++	return (unsigned)fSoc;
++}
++
+ /*
+  * Whether the ADT root's compatible list names `want`. The device tree root
+  * (IODeviceTree:/) carries it; the registry root does not (asking that one
+@@ -331,7 +407,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(self->fProfile->resistance ? 5000 : 30000);
+ 	}
+ }
+ 
+@@ -361,7 +437,7 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fProfile->resistance ? 5000 : 30000);
+ 		} else {
+ 			fReal = false;
+ 			poll();
