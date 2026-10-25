@@ -133,6 +133,13 @@ def build(seed=None, qemu=False, highmem=False, device='sweet'):
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
+        # iBoot's MAC addresses. MobileGestalt computes UniqueDeviceID from
+        # them and otherwise waits for an IONetworkController with a
+        # local-mac-address, which never appears here: lsd's database seeding
+        # (and SpringBoard behind it) blocked on that. Locally administered,
+        # derived from the synthetic ECID.
+        ('mac-address-wifi0', b'\x02' + struct.pack('<Q', board['ecid'])[:4] + b'\x01'),
+        ('mac-address-bluetooth0', b'\x02' + struct.pack('<Q', board['ecid'])[:4] + b'\x02'),
     ], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
