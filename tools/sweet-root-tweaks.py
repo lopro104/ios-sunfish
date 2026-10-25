@@ -23,6 +23,10 @@ screen (image versions v8-v14 in NOTES.md):
                   kills), no cloud-configuration UI
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
                   mini-buddy flags off
+  staged apps     /private/var/staged_system_apps/*.app moved into /Applications: data
+                  migration would install them, but installd rejects every one (code
+                  signature 0xe8008001, no AMFI verification here); in /Applications
+                  they are system apps (as HackiOS's userland/build.sh does)
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
@@ -122,6 +126,19 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def staged_apps(root):
+    staged = os.path.join(root, 'private/var/staged_system_apps')
+    if not os.path.isdir(staged):
+        return
+    moved = 0
+    for app in sorted(os.listdir(staged)):
+        dest = os.path.join(root, 'Applications', app)
+        if app.endswith('.app') and not os.path.exists(dest):
+            shutil.move(os.path.join(staged, app), dest)
+            moved += 1
+    print(f'staged apps: {moved} moved into /Applications')
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -129,6 +146,7 @@ def main():
     launchd(root)
     containers(root)
     activation(root)
+    staged_apps(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
