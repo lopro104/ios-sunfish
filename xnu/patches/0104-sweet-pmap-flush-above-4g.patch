@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index fc2096f..1503a25 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6877,7 +6877,16 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * ppnum_t is 32 bits: shifted before the cast, a page above 4 GiB lost its top bits and the
++	 * flush went to an address outside RAM (phystokv_range panic, PA 0x10e40000 for 0x110e40000,
++	 * the first write-combined GPU buffer on the Pixel with RAM at 0x100000000). ptoa() casts first.
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
++#else
+ 	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++#endif
+ }
+ 
+ #if CONFIG_COREDUMP

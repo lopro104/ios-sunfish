@@ -201,6 +201,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0101 | GPU firmware from the boot image: `mkadt.py --firmware DIR` puts the GMU firmware, SQE microcode and zap shader into the device tree (`/sweet-fw`); the GPU steps read it there before `/fw/adreno/` on the root |
 | 0102 | GPU SMMU stream matches without the downstream mask 0x400 (first Pixel run: the hypervisor dropped SMR 0x84000005 at step 13); exact matches as in the mainline sm7150.dtsi and ios-surya |
 | 0103 | File drop: `mkadt.py --drop SPEC` puts files into the device tree (`/sweet-drop`), and the kernel writes them onto the root right after mounting it, before launchd starts (for Mesa and its test without rewriting the root image) |
+| 0104 | XNU bug fix: `pmap_sync_page_attributes_phys` shifted the 32-bit page number before widening it, so the cache flush for a page above 4 GiB went outside RAM (panic on the first write-combined GPU buffer, our RAM starts at 4 GiB) |
 
 ## Key hardware facts (sunfish)
 
