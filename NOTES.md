@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## adreno_trust=1 result (logs/live-0107t.txt, 01:45-01:52): the GPU thread stops at "about to write gpu rbbm_secvid_trust_cntl at 0x503d000: 0" and never returns; iOS keeps running (ping, log). The secure world blocks that register on sunfish (as linux a6xx_gpu.c warns). So secure mode can only be left through the zap shader: 0108 test next (adreno_zap_fresh=1 adreno_skip=4096).
+
 ## 0108: downstream msm-4.14 (subsys-pil-tz.c pil_init_image_trusted / pil_mem_setup_trusted, peripheral-loader.c pil_boot) makes the same PAS_MEM_SETUP(13, region, max-min) call; mem_setup has no bw vote there (only init_image/auth). Difference is the sequence: downstream init_image -> mem_setup -> load -> auth once; ours step 12 init_image (dangling) then step 19 shutdown + init_image + mem_setup. 0108 adreno_zap_fresh=1 skips the shutdown; test with adreno_skip=4096 (no step 12).
 
 ## 0107 result (logs/live-0107.txt, 01:13): crypto vote ok (CE0 0x500a0, SN11 0x5006c, SN0 0x50078 + DDR vote) but PAS_MEM_SETUP(13, 0x98f95000, 0x7c0) still -3145798; no zap shader; gputest still all zeros. So the bandwidth vote was not it. Next ideas: (a) boot-arg adreno_trust=1 (0106) to leave secure mode by register; (b) find what -3145798 means and how Linux/the mainline port actually loads the zap shader on this phone (ask the user for the mainline session; check whether the mainline GPU really comes up with zap); (c) compare with topaz 0901-0947.
