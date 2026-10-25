@@ -1,6 +1,9 @@
 # GPU bring-up (Adreno 618)
 
-Status (2026-10-24): **steps 1-21 written and built, not run on a phone yet.** The goal is
+Status (2026-10-25): **all 21 steps pass on the Pixel 4a** (kernel 0102, `adreno=21`, firmware from
+the boot image): the GMU firmware runs, the 3D core takes commands and writes memory. The zap
+shader's signature is accepted, but TrustZone refuses to load it (step 19); the core runs without it.
+Before: steps 1-21 written and built, not run on a phone. The goal is
 CoreAnimation drawing on the GPU instead of the CPU. This first part only finds out, step by step,
 how much of the GPU block this kernel may touch under Qualcomm's hypervisor.
 
