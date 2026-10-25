@@ -1,0 +1,38 @@
+name: mesa
+
+# Mesa (OSMesa, freedreno + softpipe) and mesa/gputest for the iOS root: mesa/build.sh.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, sunfish-ios]
+    paths:
+      - "mesa/**"
+      - ".github/workflows/mesa.yml"
+
+concurrency:
+  group: mesa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install ninja bison flex
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
+          mesa/build.sh out 2>&1 | tee build.log
+      - name: Errors
+        if: failure()
+        run: grep -n -B3 -A10 -E '(error|ERROR|FAILED)' build.log | head -300 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-ios
+          path: |
+            out/
+            build.log
