@@ -1,0 +1,91 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index 9e34e5c..e813bd7 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -85,6 +85,8 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++int sweet_rpmh_crypto_vote(uint32_t vote);
++int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
+ #include <sys/errno.h>
+ #include <sys/fcntl.h>
+ #include <sys/uio.h>
+@@ -2539,6 +2541,13 @@ zap_load(void)
+ 	if (!cx_ready() || !core_is_on) {
+ 		return false;
+ 	}
++	/*
++	 * linux qcom_scm.c votes the crypto engine's path to memory around every PAS call; without it our
++	 * PAS_MEM_SETUP failed (-3145798). Left on: the GPU keeps the memory busy anyway.
++	 */
++	announce("vote the crypto engine's path to memory (CE0, SN11, SN0; MC0, SH0, ACV), as Linux does for the PAS calls");
++	printf("SWEET GPU: %u: crypto vote %d, memory vote %d\n", step, sweet_rpmh_crypto_vote(0x3fff),
++	    sweet_rpmh_ddr_vote(0x3fff, true));
+ 	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+ 	printf("SWEET GPU: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+ 	    "TrustZone does not give it up: the next answers tell whether it keeps one");
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index d203991..3c2acc9 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -20,6 +20,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
++int sweet_rpmh_crypto_vote(uint32_t vote);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -422,4 +423,51 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/*
++ * The crypto engine's path to memory, which TrustZone uses for the PAS calls (zap shader): linux
++ * qcom_scm.c votes it around every one (qcom_scm_bw_enable: icc_set_bw(path, 0, UINT_MAX) on the
++ * sm7150.dtsi scm "interconnects", MASTER_CRYPTO_CORE_0 -> SLAVE_EBI_CH0). In sm7150.c that path's
++ * BCMs are CE0 (qxm_crypto), SN11 (the aggre2 NoC to the system NoC), SN0 (to the GEM NoC), then
++ * SH0, MC0 and ACV, which sweet_rpmh_ddr_vote() votes. Without it, our PAS_MEM_SETUP came back
++ * -3145798 while the same call works for Linux.
++ */
++int
++sweet_rpmh_crypto_vote(uint32_t vote)
++{
++	uint32_t ce0 = 0, sn11 = 0, sn0 = 0;
++	int error;
++
++	if (vote == 0 || vote > 0x3fffu) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup("CE0", RH_BCM, &ce0);
++	}
++	if (!error) {
++		error = rh_lookup("SN11", RH_BCM, &sn11);
++	}
++	if (!error) {
++		error = rh_lookup("SN0", RH_BCM, &sn0);
++	}
++	if (!error) {
++		const uint32_t addresses[3] = {ce0, sn11, sn0};
++		const uint32_t values[3] = {BCM_VOTE(vote, vote), BCM_VOTE(vote, vote), BCM_VOTE(vote, vote)};
++		error = rh_send(addresses, values, 3, "crypto bandwidth");
++	}
++out:
++	printf("SWEET RPMH: crypto bandwidth vote %u on CE0 %#x, SN11 %#x, SN0 %#x: %s (errno %d)\n", vote, ce0, sn11, sn0,
++	    error ? "FAILED" : "ok", error);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

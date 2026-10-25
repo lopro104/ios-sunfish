@@ -204,6 +204,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0104 | XNU bug fix: `pmap_sync_page_attributes_phys` shifted the 32-bit page number before widening it, so the cache flush for a page above 4 GiB went outside RAM (panic on the first write-combined GPU buffer, our RAM starts at 4 GiB) |
 | 0105 | `SweetGPU` reports the command processor and SMMU state after each of the first four submissions (Mesa drew zeros without a timeout) |
 | 0106 | Boot-arg `adreno_trust=1`: with no zap shader, leave the GPU's secure mode by writing `RBBM_SECVID_TRUST_CNTL` as Linux does (Mesa's draws came back empty; may be blocked by the secure world) |
+| 0107 | The crypto engine's bandwidth vote (RPMh BCMs CE0, SN11, SN0, plus the DDR vote) before the zap shader's PAS calls, as mainline's qcom_scm.c does: our PAS_MEM_SETUP failed without it |
 
 ## Key hardware facts (sunfish)
 
