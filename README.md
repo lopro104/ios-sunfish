@@ -203,6 +203,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0103 | File drop: `mkadt.py --drop SPEC` puts files into the device tree (`/sweet-drop`), and the kernel writes them onto the root right after mounting it, before launchd starts (for Mesa and its test without rewriting the root image) |
 | 0104 | XNU bug fix: `pmap_sync_page_attributes_phys` shifted the 32-bit page number before widening it, so the cache flush for a page above 4 GiB went outside RAM (panic on the first write-combined GPU buffer, our RAM starts at 4 GiB) |
 | 0105 | `SweetGPU` reports the command processor and SMMU state after each of the first four submissions (Mesa drew zeros without a timeout) |
+| 0106 | Boot-arg `adreno_trust=1`: with no zap shader, leave the GPU's secure mode by writing `RBBM_SECVID_TRUST_CNTL` as Linux does (Mesa's draws came back empty; may be blocked by the secure world) |
 
 ## Key hardware facts (sunfish)
 

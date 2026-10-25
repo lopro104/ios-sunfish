@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index 493bb43..9e34e5c 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -2274,6 +2274,7 @@ static struct block gpu = { "gpu", 0x05000000, 0x40000 };
+ #define RBBM_SECVID_TSB_TRUSTED_BASE GPU_WORD(0xf800)
+ #define RBBM_SECVID_TSB_TRUSTED_SIZE GPU_WORD(0xf802)
+ #define RBBM_SECVID_TSB_CNTL    GPU_WORD(0xf803)
++#define RBBM_SECVID_TRUST_CNTL  GPU_WORD(0xf400)
+ 
+ /*
+  * linux a6xx_hw_init begins by asking the GMU to keep the 3D core powered (oob GPU_SET); with
+@@ -2351,6 +2352,14 @@ step_core_power(void)
+ static struct gpu_space core_space = { .name = "the 3D core", .context = 0, .control = SMMU_SCTLR_SERVE_AFTER_FAULT };
+ static struct gpu_block core_ring, core_sqe, core_scratch;
+ static bool core_space_is_on, core_runs, zap_is_loaded;
++/*
++ * boot-arg adreno_trust=1: with no zap shader, leave secure mode by writing RBBM_SECVID_TRUST_CNTL
++ * (linux a6xx_gpu.c hw_init does that when a device has no zap shader). The 3D core comes out of
++ * reset secure; Mesa's draws came back as zeros while CP_MEM_WRITE (step 21) still landed. Off by
++ * default: where the secure world wants a zap shader the write is blocked and Linux warns of a
++ * permissions violation (the phone may reset).
++ */
++static uint32_t trust_wanted;
+ static uint32_t core_match;             /* its entry of the stream table */
+ #define RING_WORDS              (CORE_RING_SIZE / 4)
+ static uint32_t ring_at, ring_sent;
+@@ -2712,6 +2721,10 @@ step_core_commands(void)
+ 		if (!ring_run("leave secure mode")) {
+ 			return false;
+ 		}
++	} else if (trust_wanted) {
++		announce("no zap shader: out of secure mode through RBBM_SECVID_TRUST_CNTL (adreno_trust=1), then write a word");
++		put(&gpu, "rbbm_secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL, 0);
++		printf("SWEET GPU: %u: rbbm_secvid_trust_cntl reads %#x after the write\n", step, rd(gpu.base + RBBM_SECVID_TRUST_CNTL));
+ 	} else {
+ 		announce("no zap shader: command the 3D core to write a word into a page of ours as it is");
+ 	}
+@@ -3174,6 +3187,7 @@ sweet_adreno_init(void)
+ 	PE_parse_boot_argn("adreno_delay", &start_delay_s, sizeof(start_delay_s));
+ 	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
+ 	PE_parse_boot_argn("adreno_zap", &zap_wanted, sizeof(zap_wanted));
++	PE_parse_boot_argn("adreno_trust", &trust_wanted, sizeof(trust_wanted));
+ 	if (last_step > STEPS) {
+ 		last_step = STEPS;
+ 	}

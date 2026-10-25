@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0105 result (logs/live-0105.txt, 00:55): Mesa's 2 submissions run to the end: ring read = written, IB 0 words to go, CP fault 0, protection 0, fence advanced, no SMMU fault reported; pixels still 0. Step 20 already sets all 12 ADDR_MODE_CNTL to 64-bit (checked). Remaining difference to linux hw_init: no zap shader (TZ refuses the load), and we never leave secure mode; linux writes RBBM_SECVID_TRUST_CNTL=0 then (a6xx_gpu.c, with a warning that the write is blocked where a zap shader is required). 0106: that write behind boot-arg adreno_trust=1.
+
 ## 2026-10-26 00:4x: SSH over USB works (ssh root@192.168.7.2, key-only; prefix + Sileo + OpenSSH on the root via tools/mk-jb.sh + tools/jb-to-root.sh, root pulled and written back). gputest by hand over SSH (boot shim/out/shim-0104-gpu-ssh.img, adreno=21 adreno_keep=1): MESA REACHES THE ADRENO: renderer "FD618", "4.6 (Compatibility Profile) Mesa 25.0.7", no jetsam kill outside launchd (the job limit was the killer). But the pixels are 0 (clear + triangle; also with FD_MESA_DEBUG=sysmem): 2 submissions (245 and 68 words), no timeout. Our space_commit already cleans SMMU tables (dc civac). Topaz (same lineage, Adreno 610) ended with SMMU pass-through for Mesa buffers (their 0909/0910). 0105: sweet_gpu_report() after each of the first 4 submissions (CP state + SMMU context fault).
 
 ## 2026-10-26 ~00:00: STOCK APPS ON THE HOME SCREEN (user: "yeah there are apps"). logs/phone-root.img (pulled root + the 32 staged apps in /Applications + migration marker + no LS csstore) written back to userdata over adb (13m54s, 7 sample MiB verified), booted shim/out/shim-0104-apps.img (kernel 0104, firmware, sweetusb=2, no drop) 23:55:34.
