@@ -64,6 +64,11 @@ The iOS root image is the same as on sweet (iPhone X 16.7.16). Flash it to
 bootloader must be unlocked (`fastboot flashing unlock`). Then run
 `fastboot boot shim/out/shim-boot.img`. Nothing is flashed to `boot_a`/`boot_b`.
 
+Run `fastboot set_active b` (the slot you boot from) before each `fastboot boot`. ABL counts every
+boot of a slot as an attempt until the system marks it successful, which iOS never does; once the
+attempts run out it no longer boots, even with `fastboot boot`. Setting the slot active again
+resets the count.
+
 Read the persistent log from TWRP for sunfish (adb root) with
 `tools/sweet-log-pull.sh`. It finds `userdata` by name.
 
