@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 7aade5d..e4a9ee9 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -592,6 +592,13 @@ SweetGPUUserClient::submit(struct msm_gem_submit * request)
+ 	if (request->fence != 0 && fSubmits++ < 4) {
+ 		IOLog("SWEET GPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
+ 		    addresses[0], words[0]);
++		/*
++		 * Mesa's first draws came back as zeros with no timeout: say what the core and its SMMU
++		 * context think once each of the first submissions is done (a fault there means the GPU's
++		 * writes went nowhere while the fence, in memory of the kernel's, still landed).
++		 */
++		bool done = gpuWait(request->fence, 1000);
++		sweet_gpu_report(done ? "after a submission" : "a submission not done after 1 s");
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
