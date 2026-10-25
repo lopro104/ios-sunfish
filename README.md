@@ -196,6 +196,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0096 | A UFS start-up failure now puts its cause (host registers, last SCSI command and its status) into the panic text, which is on screen after the console lines scroll away |
 | 0097 | Pixel 4a first boot: TEST UNIT READY answered CHECK CONDITION three times. The UFS driver now reads the sense key, starts a not-ready unit (START STOP UNIT), retries ten times and prints sense key/asc/ascq in the panic |
 | 0098 | The Pixel bootloader leaves the UFS device powered down (sense: NOT READY, initializing command required). The driver now sends REQUEST SENSE then START STOP UNIT (Active) to the UFS Device well-known LU (0xD0), as the Pixel kernel's ufshcd_set_dev_pwr_mode does |
+| 0099 | Battery board check reads the device tree root (IODeviceTree:/), not the registry root: on the Pixel the sunfish profile (3140 mAh, PM6150 fuel gauge polling) was never selected, so iOS saw a fixed 100%, charging |
 
 ## Key hardware facts (sunfish)
 
