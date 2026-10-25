@@ -1,5 +1,7 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+
+## 0096, 2026-10-25: first sunfish boot panicked: `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 5` (EIO) from `sweet_ufs_init`. EIO there is either "host did not take our request list" or a failed SCSI command (TUR, GPT read); the console line saying which scrolled off, and the log needs UFS, so it stayed empty. 0096 puts the host registers and the last command status into the panic string. Observation: kernel reached root mount with 6 cores; everything about the cause is still a guess until the next boot.
 ## 0094-0095, 2026-10-24: Bergamota 0116, 0119 (= topaz 0135-0137), 0122 (= topaz 0138), 0136; topaz 0131, 0128, all applied as they are (Bergamota builds xnu for macOS 15.3, but these only use functions xnu-8796 has). Not taken: Bergamota 0141 FJCVTZS (iOS 18 arm64e only; the iPhone X userland never uses it); topaz 0127/0132-0134/0139 and Bergamota 0097/0120/0121/0123 (conflict with our SweetFramebuffer/SweetSurface; need porting by hand).
 
 ## 0093, 2026-10-24: from NWylynko/ios-flame: 0084 (early fb Device-GRE; sunfish's 32 MB block covers dfps_data and undescribed memory), 0104 (planar IOSurface bpr), 0121 (vsync period), 0114 (AMFI dyld policy, policy renamed "AMFI"). 0104 and 0114 applied as they are.

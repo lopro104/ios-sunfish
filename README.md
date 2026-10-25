@@ -193,6 +193,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0093 | From [ios-flame](https://github.com/NWylynko/ios-flame) (Pixel 4): early framebuffer as Device memory (no speculative reads past it), planar IOSurface bytes-per-row (blank Safari pages), vsync refresh period for Core Animation, AMFI answers dyld's policy query (third-party apps with frameworks load) |
 | 0094 | From [Bergamota](https://github.com/ry-diffusion/Bergamota) and [ios-topaz](https://github.com/MakrSas/ios-topaz): sandbox extensions (TCC grants such as Photos work), the container query answered, IOSurface views released at the right trap (a backboardd crash), an empty `IOAcceleratorES` (no 30 s wait in Core Animation at every backboardd start) |
 | 0095 | From ios-topaz: IOSurface calls that would hand out a zeroed client refused (a Core Animation crash), and IOKit allowed to quiesce (configd, Wi-Fi setup and SpringBoard waited for it) |
+| 0096 | A UFS start-up failure now puts its cause (host registers, last SCSI command and its status) into the panic text, which is on screen after the console lines scroll away |
 
 ## Key hardware facts (sunfish)
 
