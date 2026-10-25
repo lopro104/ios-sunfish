@@ -1,0 +1,108 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0ad97e8..32114f5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_adreno.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_drop.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_drop.c b/bsd/dev/sweet_drop.c
+new file mode 100644
+index 0000000..0d33660
+--- /dev/null
++++ b/bsd/dev/sweet_drop.c
+@@ -0,0 +1,73 @@
++/*
++ * SWEET file drop: files the boot image carries, written onto the root right after it is mounted,
++ * before launchd starts. Putting a few files onto the phone's root otherwise means writing the
++ * whole multi-gigabyte image again.
++ *
++ * The device tree's /sweet-drop node has one child per file, with the properties "path" (absolute,
++ * NUL-terminated; its directory must exist), "data" (the contents) and "mode" (u32, optional,
++ * default 0644). tools/mkadt.py --drop SPEC makes the node. A file that is there already is
++ * replaced. Nothing happens without the node.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <pexpert/device_tree.h>
++
++void sweet_drop_files(void);
++
++static int
++drop_one(DTEntry entry)
++{
++	vfs_context_t context = vfs_context_kernel();
++	void const *path = NULL, *data = NULL, *modep = NULL;
++	unsigned int path_size = 0, data_size = 0, mode_size = 0;
++	vnode_t vnode = NULLVP;
++	int mode = 0644, resid = 0, error;
++
++	if (SecureDTGetProperty(entry, "path", &path, &path_size) != kSuccess || path_size < 2 ||
++	    ((const char *)path)[path_size - 1] != '\0' || ((const char *)path)[0] != '/' ||
++	    SecureDTGetProperty(entry, "data", &data, &data_size) != kSuccess) {
++		printf("SWEET DROP: an entry without a path or data; skipped\n");
++		return EINVAL;
++	}
++	if (SecureDTGetProperty(entry, "mode", &modep, &mode_size) == kSuccess && mode_size == sizeof(uint32_t)) {
++		uint32_t value;
++		memcpy(&value, modep, sizeof(value));
++		mode = (int)(value & 07777);
++	}
++	error = vnode_open((const char *)path, O_CREAT | O_TRUNC | FWRITE, mode, 0, &vnode, context);
++	if (error == 0) {
++		error = vn_rdwr(UIO_WRITE, vnode, (caddr_t)(uintptr_t)data, (int)data_size, 0, UIO_SYSSPACE, IO_SYNC,
++		    vfs_context_ucred(context), &resid, vfs_context_proc(context));
++		int closed = vnode_close(vnode, FWRITE, context);
++		error = error ? error : closed;
++	}
++	if (error != 0 || resid != 0) {
++		printf("SWEET DROP: %s: error %d (%d bytes not written)\n", (const char *)path, error, resid);
++		return error ? error : EIO;
++	}
++	printf("SWEET DROP: %s: %u bytes, mode %o\n", (const char *)path, data_size, mode);
++	return 0;
++}
++
++void
++sweet_drop_files(void)
++{
++	DTEntry node, child;
++	OpaqueDTEntryIterator iterator;
++	unsigned int files = 0, failed = 0;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-drop", &node) != kSuccess ||
++	    SecureDTInitEntryIterator(node, &iterator) != kSuccess) {
++		return;
++	}
++	while (SecureDTIterateEntries(&iterator, &child) == kSuccess) {
++		files++;
++		if (drop_one(child) != 0) {
++			failed++;
++		}
++	}
++	printf("SWEET DROP: %u files from the boot image, %u failed\n", files, failed);
++}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index bb2a2bf..39fd036 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -950,6 +950,12 @@ bsd_init(void)
+ 		}
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Files the boot image carries, onto the root before launchd reads it (bsd/dev/sweet_drop.c). */
++	extern void sweet_drop_files(void);
++	sweet_drop_files();
++#endif
++
+ 
+ #if CONFIG_NETBOOT
+ 	if (netboot) {

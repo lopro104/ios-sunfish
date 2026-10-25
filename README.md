@@ -200,6 +200,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0100 | Pixel battery percentage as the mainline sunfish qcom_qg driver computes it: voltage corrected by I x 150 mOhm, charge counted from the current every 5 s (pulled back to the voltage estimate while idle), shown value moves at most 1% per 20 s and never against the current |
 | 0101 | GPU firmware from the boot image: `mkadt.py --firmware DIR` puts the GMU firmware, SQE microcode and zap shader into the device tree (`/sweet-fw`); the GPU steps read it there before `/fw/adreno/` on the root |
 | 0102 | GPU SMMU stream matches without the downstream mask 0x400 (first Pixel run: the hypervisor dropped SMR 0x84000005 at step 13); exact matches as in the mainline sm7150.dtsi and ios-surya |
+| 0103 | File drop: `mkadt.py --drop SPEC` puts files into the device tree (`/sweet-drop`), and the kernel writes them onto the root right after mounting it, before launchd starts (for Mesa and its test without rewriting the root image) |
 
 ## Key hardware facts (sunfish)
 

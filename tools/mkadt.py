@@ -276,6 +276,19 @@ if __name__ == '__main__':
         if missing:
             raise SystemExit(f'--firmware {fwdir}: missing {", ".join(missing)}')
         root.children.append(node('sweet-fw', [(f, open(os.path.join(fwdir, f), 'rb').read()) for f in names]))
+    if '--drop' in sys.argv:
+        # bsd/dev/sweet_drop.c: files written onto the root after it is mounted. SPEC has one
+        # "LOCAL_FILE ROOT_PATH [OCTAL_MODE]" per line; ROOT_PATH's directory must exist on the root.
+        spec = sys.argv[sys.argv.index('--drop') + 1]
+        files = []
+        for i, line in enumerate(l.split() for l in open(spec) if l.strip() and not l.startswith('#')):
+            local, path = line[0], line[1]
+            mode = int(line[2], 8) if len(line) > 2 else 0o644
+            if not path.startswith('/'):
+                raise SystemExit(f'--drop {spec}: {path} is not absolute')
+            files.append(node(f'file{i}', [('path', cstr(path)), ('data', open(local, 'rb').read()),
+                                           ('mode', u32(mode))]))
+        root.children.append(node('sweet-drop', [], files))
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

@@ -5,7 +5,7 @@ which checks that it reaches the GPU. The kernel side is patch 0090 (`SweetGPU`,
 `adreno=21 adreno_keep=1`, see [`docs/GPU.md`](../docs/GPU.md)).
 
 Built by [`build.sh`](build.sh) in CI ([`.github/workflows/mesa.yml`](../.github/workflows/mesa.yml),
-artifact `mesa-ios`). Status: **not yet built or run.**
+artifact `mesa-ios`). Status: **builds in CI; not yet run on the phone.** The files go to `/usr/lib/libOSMesa.8.dylib` and `/usr/bin/gputest`, put onto the root by the kernel from the boot image (patch 0103, `mkadt.py --drop`).
 
 ## Credits
 

@@ -3,6 +3,10 @@
  * when there is one, softpipe on the CPU with OSMESA_SOFTWARE=1), a clear and a triangle into a
  * 64x64 buffer, read back. Everything it finds goes to /dev/console, which is in the persistent
  * log (tools/sweet-log-pull.sh), as lines starting with "SWEET GPUTEST:".
+ *
+ * Started by launchd at boot (tools/gputest-drop.py adds the job), it first waits up to five
+ * minutes for SweetGPU, which the kernel starts about a minute after the root is mounted
+ * (adreno=21 adreno_keep=1); without it Mesa would quietly draw on the CPU.
  */
 #include <fcntl.h>
 #include <stdarg.h>
@@ -10,6 +14,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <IOKit/IOKitLib.h>
 
 #include <GL/osmesa.h>
 #include <GL/gl.h>
@@ -42,6 +48,21 @@ main(void)
 {
 	int console = open("/dev/console", O_WRONLY);
 	out = console >= 0 ? fdopen(console, "w") : stdout;
+
+	io_service_t service = 0;
+	for (int waited = 0; waited <= 300; waited += 5) {
+		service = IOServiceGetMatchingService(0, IOServiceMatching("SweetGPU"));
+		if (service != 0) {
+			break;
+		}
+		sleep(5);
+	}
+	if (service == 0) {
+		say("no SweetGPU service after 300 s (boot-args adreno=21 adreno_keep=1?); drawing anyway");
+	} else {
+		say("SweetGPU is there");
+		IOObjectRelease(service);
+	}
 
 	unsigned char *buffer = calloc(SIZE * SIZE, 4);
 	OSMesaContext context = OSMesaCreateContextExt(OSMESA_RGBA, 0, 0, 0, NULL);

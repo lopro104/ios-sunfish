@@ -139,7 +139,7 @@ jobs:
               'SWEET GPU: step %u: done' 'SWEET RTC: PM6150 counts' 'kicking CTL %d with CTL_START' \
               'SWEET THERMAL: %s:%s' 'SWEET CPUFREQ: %s raised' 'SWEET RPMH: DDR bandwidth %s %u on MC0' \
               'SWEET THERMAL: battery %s C (PM6150 ADC5' 'TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER' \
-              'THE 3D CORE WRITES OUR MEMORY ON COMMAND' 'SweetGPUUserClient' 'SWEET BATTERY: %s battery, %u mAh' 'hlos1_vote_gpu_smmu' 'SWEET AMFI: %s syscall %d' 'empty IOAcceleratorES published' 'SWEET UFS init failed' 'SWEET UFS: unit not ready' 'START STOP UNIT (Active) to the device W-LU'; do
+              'THE 3D CORE WRITES OUR MEMORY ON COMMAND' 'SweetGPUUserClient' 'SWEET BATTERY: %s battery, %u mAh' 'hlos1_vote_gpu_smmu' 'SWEET AMFI: %s syscall %d' 'empty IOAcceleratorES published' 'SWEET UFS init failed' 'SWEET UFS: unit not ready' 'START STOP UNIT (Active) to the device W-LU' 'SWEET DROP: %u files from the boot image'; do
             if grep -qF "$s" kernel-strings.txt; then echo "ok:      $s"; else echo "MISSING: $s"; missing=1; fi
           done
           [ "$missing" = 0 ] || { echo "::error::board patches are missing from $k"; exit 1; }

@@ -10,8 +10,8 @@
 #
 #   mesa/build.sh OUT_DIR
 #
-# OUT_DIR gets libOSMesa.8.dylib (install name /sweet/lib/libOSMesa.8.dylib), any other dylib
-# Mesa builds next to it, gputest (/sweet/bin/gputest) and the GL headers it was built with.
+# OUT_DIR gets libOSMesa.8.dylib (install name /usr/lib/libOSMesa.8.dylib, a directory the root has), any other dylib
+# Mesa builds next to it, gputest (/usr/bin/gputest) and the GL headers it was built with.
 set -euo pipefail
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
@@ -61,7 +61,7 @@ INI
 
 # HackiOS's options, with the prefix of this port.
 meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/sweet --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/usr --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers=softpipe,freedreno -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled \
 	-Degl=disabled -Dgbm=disabled -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled \
 	-Dgles2=enabled -Dopengl=true -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled \
@@ -69,28 +69,28 @@ meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 	-Dgallium-va=disabled -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false
 ninja -C build
 
-# Every dylib the build made, with /sweet/lib install names (libOSMesa links the others by those).
+# Every dylib the build made, with /usr/lib install names (libOSMesa links the others by those).
 for lib in $(find build -name '*.dylib' -type f); do
 	cp "$lib" "$OUT/"
 done
-# Their references to each other (meson's @rpath/... or build paths) by /sweet/lib too.
+# Their references to each other (meson's @rpath/... or build paths) by /usr/lib too.
 fixup() {
 	for dep in $(otool -L "$1" | awk 'NR > 1 { print $1 }'); do
 		name=$(basename "$dep")
-		if [ -f "$OUT/$name" ] && [ "$dep" != "/sweet/lib/$name" ]; then
-			install_name_tool -change "$dep" "/sweet/lib/$name" "$1"
+		if [ -f "$OUT/$name" ] && [ "$dep" != "/usr/lib/$name" ]; then
+			install_name_tool -change "$dep" "/usr/lib/$name" "$1"
 		fi
 	done
 }
 for lib in "$OUT"/*.dylib; do
-	install_name_tool -id /sweet/lib/$(basename "$lib") "$lib"
+	install_name_tool -id /usr/lib/$(basename "$lib") "$lib"
 	fixup "$lib"
 done
 mkdir -p "$OUT/include"
 cp -r mesa-$VERSION/include/GL mesa-$VERSION/include/KHR "$OUT/include/"
 
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror \
-	-I"$OUT/include" -o "$OUT/gputest" "$HERE/gputest.c" "$OUT/libOSMesa.8.dylib"
+	-I"$OUT/include" -o "$OUT/gputest" "$HERE/gputest.c" "$OUT/libOSMesa.8.dylib" -framework IOKit
 fixup "$OUT/gputest"
 codesign -f -s - "$OUT"/*.dylib "$OUT/gputest"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
