@@ -199,6 +199,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0099 | Battery board check reads the device tree root (IODeviceTree:/), not the registry root: on the Pixel the sunfish profile (3140 mAh, PM6150 fuel gauge polling) was never selected, so iOS saw a fixed 100%, charging |
 | 0100 | Pixel battery percentage as the mainline sunfish qcom_qg driver computes it: voltage corrected by I x 150 mOhm, charge counted from the current every 5 s (pulled back to the voltage estimate while idle), shown value moves at most 1% per 20 s and never against the current |
 | 0101 | GPU firmware from the boot image: `mkadt.py --firmware DIR` puts the GMU firmware, SQE microcode and zap shader into the device tree (`/sweet-fw`); the GPU steps read it there before `/fw/adreno/` on the root |
+| 0102 | GPU SMMU stream matches without the downstream mask 0x400 (first Pixel run: the hypervisor dropped SMR 0x84000005 at step 13); exact matches as in the mainline sm7150.dtsi and ios-surya |
 
 ## Key hardware facts (sunfish)
 

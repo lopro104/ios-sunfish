@@ -1,0 +1,19 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index c43e56b..493bb43 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -1186,7 +1186,13 @@ fw_file(const char *name, uint64_t *size)
+ 
+ #define SMMU_S2CR_FAULT         (2u << 16)
+ #define SMMU_SMR_VALID          (1u << 31)
+-#define SMMU_STREAM_MASK        0x400           /* dt: the second cell of every "iommus" of this SMMU */
++/*
++ * Exact stream matches. The downstream dt's mask 0x400 made the first Pixel run fail: the hypervisor
++ * dropped SMR 0x84000005 (read back 0), probably as a match that also covers stream 0x405. The mainline
++ * sm7150.dtsi has #iommu-cells = <1> for this SMMU (GMU: <&adreno_smmu 5>), and ios-surya, on the
++ * same SoC, attaches its stream as SMR = valid | SID.
++ */
++#define SMMU_STREAM_MASK        0x0
+ #define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
+ #define SMMU_CBA2R(n)           (0x800 + 4 * (n))
+ #define SMMU_CBA2R_64_BIT       1
