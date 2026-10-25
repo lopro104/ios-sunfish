@@ -11,3 +11,4 @@ __pycache__/
 # AOSP mkbootimg and avbtool cloned for shim/build.sh
 tools-android/
 mesa/out/
+jb/
