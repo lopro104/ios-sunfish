@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 2026-10-26 ~00:00: STOCK APPS ON THE HOME SCREEN (user: "yeah there are apps"). logs/phone-root.img (pulled root + the 32 staged apps in /Applications + migration marker + no LS csstore) written back to userdata over adb (13m54s, 7 sample MiB verified), booted shim/out/shim-0104-apps.img (kernel 0104, firmware, sweetusb=2, no drop) 23:55:34.
+
 ## Data migration result (2026-10-25 21:42-23:30, logs/boot-migrate.txt + root pulled to logs/phone-root.img): migration ran ~2 h and never finished (progress bar at the end, 194k swaps). installd log (/private/var/installd/Library/Logs/MobileInstallation): every staged system app failed: MICodeSigningVerifier ... Failed to verify code signature ... 0xe8008001 -> Verification/Preflight stage failed (Shortcuts: Code 107 staging); the staged apps were then deleted from /private/var/staged_system_apps. Our AMFI stub has no userspace signature verification for installd. Fix (as HackiOS): the 32 staged apps from the IPSW copied into /Applications of the pulled root image (175 apps there now), com.apple.migration.plist LastSystemVersion 20H392 restored (migration had left only DMUserDataDisposition), LaunchServices csstore (mobile/Containers/Data/InternalDaemon/.../com.apple.LaunchServices-4035-v2.csstore) deleted so lsd reseeds; fsck OK. tools/sweet-root-tweaks.py now moves staged apps for new images. Pending: write logs/phone-root.img back to userdata (user to confirm).
 
 ## HANDOFF 2026-10-25 21:45 (user rebooting the PC to Windows)
