@@ -1,5 +1,5 @@
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 9cd5de7..4dad520 100644
+index 9cd5de7..fbd66ec 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -149,7 +149,7 @@ dma_clean(uint32_t off, uint32_t len)
@@ -27,25 +27,28 @@ index 9cd5de7..4dad520 100644
  		sweet_ufs_last_fail.cmd = cdb[0];
  		sweet_ufs_last_fail.ocs = ocs;
  		sweet_ufs_last_fail.upiu = ucd->resp[0];
-@@ -319,6 +321,26 @@ ufs_sync_cache(void)
+@@ -319,6 +321,29 @@ ufs_sync_cache(void)
  	return ufs_scsi(cdb, sizeof(cdb), 0, false);
  }
  
 +#define UFS_DEVICE_WLUN 0xd0            /* UFS Device well-known LU, as UPIU LUN field */
 +
-+/* Set the device's Active power condition (START STOP UNIT to the device W-LU). */
++/*
++ * Set the device's Active power condition, as the Pixel kernel's
++ * ufshcd_set_dev_pwr_mode does: REQUEST SENSE to the device W-LU (clears
++ * its unit attention), then START STOP UNIT with POWER CONDITION Active.
++ */
 +static void
 +ufs_wake_device(void)
 +{
-+	static const uint8_t tur[6] = { 0x00 };
++	static const uint8_t sense[6] = { 0x03, 0, 0, 0, 18, 0 };     /* REQUEST SENSE, 18 bytes */
 +	static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };     /* POWER CONDITION 1: Active */
 +	uint8_t lun = su.lun;
 +	int error;
 +
 +	su.lun = UFS_DEVICE_WLUN;
-+	/* Clear a pending unit attention on the W-LU first. */
-+	for (int i = 0; i < 3 && ufs_scsi(tur, sizeof(tur), 0, false); i++) {
-+	}
++	error = ufs_scsi(sense, sizeof(sense), 18, false);
++	printf("SWEET UFS: REQUEST SENSE to the device W-LU: %d\n", error);
 +	error = ufs_scsi(ssu, sizeof(ssu), 0, false);
 +	su.lun = lun;
 +	printf("SWEET UFS: START STOP UNIT (Active) to the device W-LU: %d\n", error);
@@ -54,7 +57,7 @@ index 9cd5de7..4dad520 100644
  static int
  ufs_find_partition(const char *want)
  {
-@@ -646,13 +668,18 @@ sweet_ufs_init(void)
+@@ -646,13 +671,18 @@ sweet_ufs_init(void)
  	if (!error) {
  		static const uint8_t tur[6] = { 0x00 };
  		/* The first command after the bootloader may report a unit attention. */
@@ -77,7 +80,7 @@ index 9cd5de7..4dad520 100644
  			}
  			delay(50000);
  		}
-@@ -851,11 +878,11 @@ sweet_ufs_rootdev(dev_t *dev)
+@@ -851,11 +881,11 @@ sweet_ufs_rootdev(dev_t *dev)
  			 */
  			if (su.regs) {
  				panic("SWEET UFS init failed: error %d; hce 0x%x hcs 0x%x is 0x%x cap 0x%x "
