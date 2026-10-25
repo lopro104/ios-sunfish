@@ -1,0 +1,56 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index a4de944..9cd5de7 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -150,6 +150,7 @@ dma_clean(uint32_t off, uint32_t len)
+  */
+ static struct {
+ 	uint32_t cmd, ocs, upiu, resp, status;
++	uint32_t key, asc, ascq;        /* fixed-format sense data of CHECK CONDITION */
+ 	bool timed_out;
+ } sweet_ufs_last_fail;
+ 
+@@ -264,6 +265,10 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		sweet_ufs_last_fail.upiu = ucd->resp[0];
+ 		sweet_ufs_last_fail.resp = ucd->resp[6];
+ 		sweet_ufs_last_fail.status = ucd->resp[7];
++		/* Response UPIU: sense data length in bytes 32-33, the sense data from 34. */
++		sweet_ufs_last_fail.key = ucd->resp[34 + 2] & 0xf;
++		sweet_ufs_last_fail.asc = ucd->resp[34 + 12];
++		sweet_ufs_last_fail.ascq = ucd->resp[34 + 13];
+ 		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+ 		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
+ 		return EIO;
+@@ -641,7 +646,15 @@ sweet_ufs_init(void)
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		static const uint8_t start[6] = { 0x1b, 0, 0, 0, 0x01 };      /* START STOP UNIT: start */
++		for (int i = 0; i < 10 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			/* Pixel: the bootloader may leave the unit not started (key 2, NOT READY). */
++			if (sweet_ufs_last_fail.key == 0x2) {
++				printf("SWEET UFS: unit not ready (asc 0x%x ascq 0x%x), starting it\n",
++				    sweet_ufs_last_fail.asc, sweet_ufs_last_fail.ascq);
++				(void)ufs_scsi(start, sizeof(start), 0, false);
++			}
++			delay(50000);
+ 		}
+ 	}
+ 	if (!error) {
+@@ -839,12 +852,13 @@ sweet_ufs_rootdev(dev_t *dev)
+ 			if (su.regs) {
+ 				panic("SWEET UFS init failed: error %d; hce 0x%x hcs 0x%x is 0x%x cap 0x%x "
+ 				    "utrlba 0x%x:%x rsr 0x%x dbr 0x%x; last cmd 0x%02x%s ocs 0x%x upiu 0x%x "
+-				    "resp 0x%x status 0x%x; dma 0x%llx",
++				    "resp 0x%x status 0x%x sense key 0x%x asc 0x%x ascq 0x%x; dma 0x%llx",
+ 				    error, ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_IS), ufs_rd(REG_CAP),
+ 				    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLRSR), ufs_rd(REG_UTRLDBR),
+ 				    sweet_ufs_last_fail.cmd, sweet_ufs_last_fail.timed_out ? " timed out" : "",
+ 				    sweet_ufs_last_fail.ocs, sweet_ufs_last_fail.upiu, sweet_ufs_last_fail.resp,
+-				    sweet_ufs_last_fail.status, su.dma_pa);
++				    sweet_ufs_last_fail.status, sweet_ufs_last_fail.key, sweet_ufs_last_fail.asc,
++				    sweet_ufs_last_fail.ascq, su.dma_pa);
+ 			}
+ 			return error;
+ 		}

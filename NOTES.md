@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0097, 2026-10-25: first sunfish boot with 0096, photographed panic: `SWEET UFS init failed: error 5; hce 0x1 hcs 0x10f is 0x0 cap 0x1587031f utlba 0x1:4538000 rsr 0x1 dbr 0x0; last cmd 0x00 ocs 0x0 upiu 0x21 resp 0x1 status 0x2; dma 0x104538000`. Observations: host enabled and ready, request list accepted, TEST UNIT READY (0x00) completes at transport level and the unit answers CHECK CONDITION (status 2) on all 3 tries. Sense key unknown (the driver did not read it). Guess, not verified: unit left not started / unit attention by the Pixel bootloader. 0097 reads the sense data, sends START STOP UNIT on key 2, retries 10x with 50 ms waits, and prints key/asc/ascq in the panic.
+
 ## 0096, 2026-10-25: first sunfish boot panicked: `IOFindBSDRoot: SWEET UFS root ufsroot0 unavailable: 5` (EIO) from `sweet_ufs_init`. EIO there is either "host did not take our request list" or a failed SCSI command (TUR, GPT read); the console line saying which scrolled off, and the log needs UFS, so it stayed empty. 0096 puts the host registers and the last command status into the panic string. Observation: kernel reached root mount with 6 cores; everything about the cause is still a guess until the next boot.
 ## 0094-0095, 2026-10-24: Bergamota 0116, 0119 (= topaz 0135-0137), 0122 (= topaz 0138), 0136; topaz 0131, 0128, all applied as they are (Bergamota builds xnu for macOS 15.3, but these only use functions xnu-8796 has). Not taken: Bergamota 0141 FJCVTZS (iOS 18 arm64e only; the iPhone X userland never uses it); topaz 0127/0132-0134/0139 and Bergamota 0097/0120/0121/0123 (conflict with our SweetFramebuffer/SweetSurface; need porting by hand).
 
