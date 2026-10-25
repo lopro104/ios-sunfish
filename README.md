@@ -205,6 +205,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0105 | `SweetGPU` reports the command processor and SMMU state after each of the first four submissions (Mesa drew zeros without a timeout) |
 | 0106 | Boot-arg `adreno_trust=1`: with no zap shader, leave the GPU's secure mode by writing `RBBM_SECVID_TRUST_CNTL` as Linux does (Mesa's draws came back empty; may be blocked by the secure world) |
 | 0107 | The crypto engine's bandwidth vote (RPMh BCMs CE0, SN11, SN0, plus the DDR vote) before the zap shader's PAS calls, as mainline's qcom_scm.c does: our PAS_MEM_SETUP failed without it |
+| 0108 | Boot-arg `adreno_zap_fresh=1`: load the zap shader in the downstream kernel's order (no shutdown of an image that never ran; with `adreno_skip=4096` no step-12 init either) |
 
 ## Key hardware facts (sunfish)
 

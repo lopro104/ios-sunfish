@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index e813bd7..7c4df00 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -2362,6 +2362,14 @@ static bool core_space_is_on, core_runs, zap_is_loaded;
+  * permissions violation (the phone may reset).
+  */
+ static uint32_t trust_wanted;
++/*
++ * boot-arg adreno_zap_fresh=1: the zap shader is loaded as the downstream Pixel kernel does it
++ * (subsys-pil-tz.c, peripheral-loader.c): init_image, mem_setup, the image, auth_and_reset, once,
++ * without asking TrustZone first to shut down an image that never ran. With that shutdown, and
++ * after step 12's own init_image, PAS_MEM_SETUP came back -3145798. (adreno_skip=4096 leaves out
++ * step 12.)
++ */
++static uint32_t zap_fresh;
+ static uint32_t core_match;             /* its entry of the stream table */
+ #define RING_WORDS              (CORE_RING_SIZE / 4)
+ static uint32_t ring_at, ring_sent;
+@@ -2548,9 +2556,11 @@ zap_load(void)
+ 	announce("vote the crypto engine's path to memory (CE0, SN11, SN0; MC0, SH0, ACV), as Linux does for the PAS calls");
+ 	printf("SWEET GPU: %u: crypto vote %d, memory vote %d\n", step, sweet_rpmh_crypto_vote(0x3fff),
+ 	    sweet_rpmh_ddr_vote(0x3fff, true));
+-	announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
+-	printf("SWEET GPU: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+-	    "TrustZone does not give it up: the next answers tell whether it keeps one");
++	if (!zap_fresh) {
++		announce("ask TrustZone to give up a zap shader that a kernel before this one may have left");
++		printf("SWEET GPU: %u: %s\n", step, zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
++		    "TrustZone does not give it up: the next answers tell whether it keeps one");
++	}
+ 	if (!zap_header(&header)) {
+ 		return false;
+ 	}
+@@ -3197,6 +3207,7 @@ sweet_adreno_init(void)
+ 	PE_parse_boot_argn("adreno_keep", &keep, sizeof(keep));
+ 	PE_parse_boot_argn("adreno_zap", &zap_wanted, sizeof(zap_wanted));
+ 	PE_parse_boot_argn("adreno_trust", &trust_wanted, sizeof(trust_wanted));
++	PE_parse_boot_argn("adreno_zap_fresh", &zap_fresh, sizeof(zap_fresh));
+ 	if (last_step > STEPS) {
+ 		last_step = STEPS;
+ 	}
