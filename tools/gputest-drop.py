@@ -30,6 +30,8 @@ jobs['/System/Library/LaunchDaemons/com.sweet.gputest.plist'] = {
     'RunAtLoad': True,
     'POSIXSpawnType': 'Interactive',
     'UserName': 'root',
+    # Without a limit jetsam killed it (reason code 7, per-process limit) while Mesa (16 MB) made its context.
+    'JetsamProperties': {'JetsamMemoryLimit': 512},
 }
 with open(os.path.join(out, 'launchd.plist'), 'wb') as f:
     plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)
