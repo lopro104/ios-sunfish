@@ -671,16 +671,25 @@ surface_shared(struct eagl *e, struct image *image)
  * a frame, when the texture is about to be drawn with, the memory is added up, and copied again
  * if the sum has changed.
  */
+static size_t plane_row(IOSurfaceRef surface, size_t plane);
+
 static bool
 surface_changed(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
-	size_t size = IOSurfaceGetBytesPerRow(surface) * (size_t)(image->height - 1) +
+	/*
+	 * ios-sunfish: the planes of multi-plane surfaces too, each with its own rows (YUV pictures:
+	 * the tiles of a HEIC wallpaper were made into textures once, some before the decoder had
+	 * written them, and stayed black).
+	 */
+	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
+	size_t row = planar ? plane_row(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t size = row * (size_t)(image->height - 1) +
 	    (size_t)image->width * bytes_a_pixel(image->format, image->type);
-	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+	const uint8_t *base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
 	uint64_t sum = size, word;
 
-	if (image->looked == e->frames + 1 || base == NULL || IOSurfaceGetPlaneCount(surface) > 0) {
+	if (image->looked == e->frames + 1 || base == NULL || row == 0) {
 		return false;
 	}
 	/*
