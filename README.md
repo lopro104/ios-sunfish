@@ -208,6 +208,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0108 | Boot-arg `adreno_zap_fresh=1`: load the zap shader in the downstream kernel's order (no shutdown of an image that never ran; with `adreno_skip=4096` no step-12 init either) |
 | 0109 | Boot-arg `adreno_zap_meta=PHYS`: the zap shader's PAS metadata at a physical address below 4 GiB (all of our RAM is above; Linux's buffer is normally below) |
 | 0110 | The zap shader's `PAS_MEM_SETUP` size rounded up to a 4 KB page (0x1000, not 0x7c0), as ios-topaz's working loader does |
+| 0111 | No jetsam memory limit for `backboardd` (and `gputest`): the window server with Mesa needs more than the iPhone X limit (ios-topaz 0915) |
 
 ## Key hardware facts (sunfish)
 
