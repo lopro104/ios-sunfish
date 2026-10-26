@@ -106,6 +106,18 @@ fixup "$OUT/libsunfish-gl.dylib"
 	-install_name /usr/lib/libsunfish-inject.dylib -framework CoreFoundation -framework IOKit -lobjc \
 	-o "$OUT/libsunfish-inject.dylib" "$G/sunfish_inject.c"
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -o "$OUT/bbd_wrap" "$G/bbd_wrap.c"
+# The USB network as a configd network service (userland/net).
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -framework CoreFoundation \
+	-framework SystemConfiguration -o "$OUT/sweet-net" "$HERE/../userland/net/sweet-net.c"
+cat > "$WORK/sweet-net.entitlements" <<'ENT'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>com.apple.SystemConfiguration.SCDynamicStore-write-access</key><true/>
+	<key>platform-application</key><true/>
+</dict></plist>
+ENT
 codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap"
+codesign -f -s - --entitlements "$WORK/sweet-net.entitlements" "$OUT/sweet-net"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
