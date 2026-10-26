@@ -8,6 +8,7 @@
 - Facts from the sunfish dts: mpss_mem 0x8b000000 size 0x9800000 (no-map); wlan_msa_mem 0x98d00000 size 0x200000; smem_mem 0x86000000 size 0x200000; WCN3990 MMIO 0x18800000 size 0x800000, SPIs 414-425; MPSS regs 0x04080000; power domains CX/MX/MSS via RPMh; needs AOSS QMP, SMP2P (modem in/out), SMEM.
 - Modem image is 73 MB: too big for the boot image (the GPU firmware rides in it), so read it from the iOS root (e.g. /usr/share/sweet-fw/modem.*) by a userland helper or vn_rdwr after the root mounts. Not decided.
 - Rules from the peer session: patches numbered from 0130; never write modemst1/2, fsg, persist (serve rmtfs from a RAM copy); ask the user before any reboot/fastboot boot (the phone is shared); sweet-live.sh is already running (don't start another).
+- 2026-10-27: patch xnu/patches/0130-sweet-mpss-pas-boot.patch (NEW bsd/dev/sweet_mpss.c, hooked from sweet_ufs_init, boot-arg mpss=1): reads /fw/modem/modem.mdt + modem.bNN from the iOS root (copy research/fw-local/image/modem.* there), PAS shutdown / init_image / mem_setup(0x8b000000) / copy segments / auth_and_reset(4). `git apply --check` passes on the work tree; NOT compiled, NOT booted. It does no CX/MX/MSS power votes, AOSS QMP or SMP2P yet: add them when the log shows TrustZone's answer. Building in tools/xnu-docker/work needs the peer session's OK (shared tree).
 - Open question: iOS userland needs IO80211Family/apple80211 kexts-equivalent in our XNU build; decide step 5 shape after step 3.
 
 ## 2026-10-26 ~03:00: CoreAnimation GL on the Pixel (handoff)
