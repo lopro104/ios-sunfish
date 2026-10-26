@@ -1,0 +1,5 @@
+#!/bin/bash
+# the Mach-O linker of the cctools (theos Linux toolchain), without Xcode 15's -new_linker
+args=(); for a in "$@"; do [ "$a" = "-new_linker" ] || args+=("$a"); done
+L=/opt/toolchain/linux/iphone/bin/ld
+exec "$L" "${args[@]}"

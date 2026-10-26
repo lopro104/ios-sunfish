@@ -1,0 +1,15 @@
+#!/bin/bash
+# Stand-in for Apple's closed iig: the files Xcode's iig made for this very kernel, from the CI build
+# tree (xnu-buildtree artifact, build/xnu.obj/<config>/iokit/DriverKit/), so the DriverKit glue is the
+# same as in the CI kernel. IIG_TREE: that build tree's xnu.obj directory.
+def=""; hdr=""; impl=""
+while [ $# -gt 0 ]; do case "$1" in
+  --def) def="$2"; shift 2;; --header) hdr="$2"; shift 2;; --impl) impl="$2"; shift 2;;
+  --) break;; *) shift;; esac; done
+name="$(basename "$def" .iig)"
+T="${IIG_TREE:?IIG_TREE not set}"
+h="$(find "$T" -name "$name.h" -path '*DriverKit*' | head -1)"
+c="$(find "$T" -name "$name.iig.cpp" | head -1)"
+[ -n "$hdr" ] && { [ -n "$h" ] || { echo "iig: no $name.h in $T" >&2; exit 1; }; cp "$h" "$hdr"; }
+[ -n "$impl" ] && { [ -n "$c" ] || { echo "iig: no $name.iig.cpp in $T" >&2; exit 1; }; cp "$c" "$impl"; }
+exit 0

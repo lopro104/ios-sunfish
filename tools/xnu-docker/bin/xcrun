@@ -1,0 +1,25 @@
+#!/bin/bash
+# xcrun for building XNU on Linux, macOS SDK edition (after HackiOS's xnu-deps/host/bin/xcrun):
+# one SDK (MacOSX14.0), tools from this directory, the toolchain and /usr/bin.
+HB="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"   # (also when called as /usr/bin/xcrun)
+sdk=""; find=""; show=""
+while [ $# -gt 0 ]; do case "$1" in
+  -sdk|--sdk) sdk="$2"; shift 2;; -verbose|--verbose|-l|--log|-n|--no-cache) shift;;
+  -find|--find|-f) find="$2"; shift 2;;
+  -show-sdk-path|--show-sdk-path) show=path; shift;;
+  -show-sdk-version|--show-sdk-version|-show-sdk-platform-version|--show-sdk-platform-version) show=version; shift;;
+  -show-sdk-build-version|--show-sdk-build-version) show=build; shift;;
+  -show-sdk-platform-path|--show-sdk-platform-path) show=platform; shift;;
+  *) break;; esac; done
+case "$show" in
+  path) echo "${XNU_SDK_PATH:-/opt/sdk/MacOSX14.0.sdk}"; exit 0;;
+  version) echo "${XNU_SDK_VERSION:-14.0}"; exit 0;;
+  build) echo "${XNU_SDK_BUILD:-23A334}"; exit 0;;
+  platform) echo "${XNU_PLATFORM_PATH:-/opt/platform/MacOSX.platform}"; exit 0;;
+esac
+if [ -n "$find" ]; then
+  case "$find" in cc|clang) find=xnu-clang;; c++|clang++) find=xnu-clang++;; ld) find=ld64;; esac
+  for d in "$HB" /opt/toolchain/linux/iphone/bin /usr/bin; do [ -x "$d/$find" ] && { echo "$d/$find"; exit 0; }; done
+  echo "xcrun: no $find" >&2; exit 1
+fi
+[ $# -gt 0 ] && exec "$@"
