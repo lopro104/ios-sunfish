@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,362 @@
 +/*
 + * The modem (MPSS, a Hexagon DSP) of the SM7150, started through TrustZone. The Pixel 4a's Wi-Fi
 + * (WCN3990) has its firmware run on the modem, so nothing of Wi-Fi works until this does.
@@ -31,6 +31,7 @@ new file mode 100644
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
++#include <stdarg.h>
 +#include <sys/systm.h>
 +#include <sys/errno.h>
 +#include <sys/fcntl.h>
@@ -44,8 +45,11 @@ new file mode 100644
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
 +
-+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
 +extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern int sweet_rpmh_crypto_vote(uint32_t vote);
++extern int sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
++extern int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
 +extern uint64_t kvtophys(vm_offset_t va);
 +extern kern_return_t thread_terminate(thread_t);
 +void sweet_mpss_init(void);
@@ -54,6 +58,7 @@ new file mode 100644
 +#define MPSS_MEMORY             0x8b000000ull
 +#define MPSS_MEMORY_SIZE        0x9800000u
 +#define PAS_MODEM               4
++#define WIMG_WCOMB              0x6u    /* VM_WIMG_WCOMB: not cacheable | coherent (osfmk/arm/memory_types.h) */
 +#define FW_DIRECTORY            "/fw/modem/"
 +#define CHUNK                   0x100000
 +
@@ -71,6 +76,22 @@ new file mode 100644
 +
 +#define ELF_PT_LOAD             1
 +#define MDT_TYPE_HASH           (2u << 24)
++
++/* What happened, repeated in the "alive" lines: the live log starts after this thread has begun. */
++static char report[400];
++static size_t report_length;
++
++static void
++note(const char *format, ...)
++{
++	va_list arguments;
++
++	va_start(arguments, format);
++	if (report_length < sizeof(report)) {
++		report_length += (size_t)vsnprintf(report + report_length, sizeof(report) - report_length, format, arguments);
++	}
++	va_end(arguments);
++}
 +
 +struct elf32_phdr {
 +	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
@@ -105,6 +126,7 @@ new file mode 100644
 +		session = x6;
 +		if (x0 != SCM_INTERRUPTED) {
 +			printf("SWEET MPSS: TrustZone returns %d, answer %#llx\n", (int32_t)x0, x1);
++			note("[%#llx -> %d,%#llx]", function & 0xff, (int32_t)x0, x1);
 +			*answer = x1;
 +			return (int32_t)x0;
 +		}
@@ -156,7 +178,7 @@ new file mode 100644
 +		volatile uint8_t *window;
 +
 +		n = MIN(n, base + CHUNK - phys);
-+		window = (volatile uint8_t *)ml_io_map_wcomb((vm_offset_t)base, CHUNK);
++		window = (volatile uint8_t *)ml_io_map_unmappable((vm_offset_t)base, CHUNK, WIMG_WCOMB);
 +		if (window == NULL) {
 +			printf("SWEET MPSS: cannot map %#llx\n", base);
 +			return;
@@ -173,6 +195,22 @@ new file mode 100644
 +	}
 +}
 +
++/* The first 8 bytes of the modem's memory, to see that the copy landed. */
++static uint64_t
++mpss_first_word(void)
++{
++	volatile uint8_t *window = (volatile uint8_t *)ml_io_map_unmappable(MPSS_MEMORY, CHUNK, WIMG_WCOMB);
++	uint64_t word = 0;
++
++	if (window != NULL) {
++		for (int b = 7; b >= 0; b--) {
++			word = word << 8 | window[b];
++		}
++		ml_io_unmap((vm_offset_t)window, CHUNK);
++	}
++	return word;
++}
++
 +static bool
 +loadable(const struct elf32_phdr *segment)
 +{
@@ -187,7 +225,7 @@ new file mode 100644
 +	uint8_t *mdt;
 +	uint64_t answer = ~0ull, low = ~0ull, high = 0;
 +	off_t mdt_size = 0;
-+	uint32_t segments;
++	uint32_t segments, loaded = 0;
 +
 +	if (kmem_alloc(kernel_map, &page, 4 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS ||
 +	    kmem_alloc(kernel_map, &chunk, CHUNK, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
@@ -227,11 +265,30 @@ new file mode 100644
 +			high = MAX(high, (uint64_t)segment.paddr + segment.memsz);
 +		}
 +	}
++	note("[%u segs %#llx..%#llx]", segments, low, high);
 +	printf("SWEET MPSS: %u segments, loadable span %#llx..%#llx (reserved %#llx at %#llx)\n", segments, low, high,
 +	    (uint64_t)MPSS_MEMORY_SIZE, MPSS_MEMORY);
 +	if (high <= low || high - low > MPSS_MEMORY_SIZE) {
 +		printf("SWEET MPSS: does not fit the reserved memory\n");
 +		return false;
++	}
++
++	/* The modem's power domains (CX and MSS), as qcom_q6v5_pas votes them (max) and msm-4.14 sdmmagpie.dtsi pil_modem (TURBO). */
++	{
++		static const char *const rails[2] = { "cx.lvl", "mss.lvl" };
++		static const uint32_t levels[2] = { 384, 384 };
++
++		int rail_error = sweet_rpmh_arc_votes(rails, levels, 2);
++
++		printf("SWEET MPSS: rail votes %d\n", rail_error);
++		note("[rails %d]", rail_error);
++	}
++	/* Linux's qcom_scm_bw_enable() around every PAS call: the crypto engine's path to memory (see sweet_rpmh.c). */
++	{
++		int crypto_error = sweet_rpmh_crypto_vote(0x3fff), memory_error = sweet_rpmh_ddr_vote(0x3fff, true);
++
++		printf("SWEET MPSS: crypto vote %d, memory vote %d\n", crypto_error, memory_error);
++		note("[crypto %d ddr %d]", crypto_error, memory_error);
 +	}
 +
 +	/* A modem image left by an earlier boot is given up first. */
@@ -247,6 +304,7 @@ new file mode 100644
 +		printf("SWEET MPSS: TrustZone does not take the place (%#llx)\n", answer);
 +		return false;
 +	}
++	note("[first word before %#llx]", mpss_first_word());
 +	for (uint32_t i = 0; i < segments; i++) {
 +		char name[24];
 +		off_t size = 0, done = 0;
@@ -260,6 +318,7 @@ new file mode 100644
 +			printf("SWEET MPSS: %s missing or short (%lld, need %u)\n", name, (long long)size, segment.filesz);
 +			return false;
 +		}
++		loaded++;
 +		printf("SWEET MPSS: %u bytes of %s at %#llx\n", segment.filesz, name, MPSS_MEMORY + segment.paddr - low);
 +		while (done < segment.filesz) {
 +			int n = (int)MIN((off_t)CHUNK, (off_t)segment.filesz - done);
@@ -275,6 +334,7 @@ new file mode 100644
 +		mpss_write(segment.paddr - low + segment.filesz, NULL, segment.memsz - segment.filesz);
 +	}
 +	__asm__ volatile ("dsb sy" ::: "memory");
++	note("[%u segments copied, first word after %#llx]", loaded, mpss_first_word());
 +	if (scm("to authenticate the modem and start it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_MODEM,
 +	    0, 0, &answer) != 0 || answer != 0) {
 +		printf("SWEET MPSS: TrustZone does not authenticate/start the modem (%#llx)\n", answer);
@@ -292,7 +352,7 @@ new file mode 100644
 +
 +	for (int s = 1; s <= 30; s++) {
 +		sleep_ms(1000);
-+		printf("SWEET MPSS: alive %d s after %s\n", s, ok ? "the start" : "the failure");
++		printf("SWEET MPSS: alive %d s after %s: %s\n", s, ok ? "the start" : "the failure", report);
 +	}
 +	(void)thread_terminate(current_thread());
 +	thread_block(THREAD_CONTINUE_NULL);

@@ -1,0 +1,61 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -21,6 +21,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
+ int sweet_rpmh_crypto_vote(uint32_t vote);
++int sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -52,6 +53,7 @@
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
+ #define RH_BCM          5u
+ #define RH_TIMEOUT_US   100000u
+@@ -374,6 +376,41 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * Rail (ARC) votes, as Linux's rpmhpd does for a remote processor's power domains (qcom_q6v5_pas
++ * adsp_pds_enable): the resource's cmd-db address gets the level (the "vlvl" of the resource: 64
++ * low SVS, 128 SVS, 192 SVS L1, 256 nominal, ...). Up to three resources in one ACTIVE request.
++ */
++int
++sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n)
++{
++	uint32_t addresses[3];
++	int error;
++
++	if (n == 0 || n > 3) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	for (unsigned i = 0; !error && i < n; i++) {
++		error = rh_lookup(res[i], RH_ARC, &addresses[i]);
++	}
++	if (!error) {
++		error = rh_send(addresses, level, n, "rail levels");
++	}
++out:
++	printf("SWEET RPMH: rail votes (%s %u, ...): %s (errno %d)\n", res[0], level[0], error ? "FAILED" : "ok", error);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ 
+ #define BCM_COMMIT      (1u << 30)
+ #define BCM_VALID       (1u << 29)
