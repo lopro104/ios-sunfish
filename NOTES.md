@@ -1,5 +1,11 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-10-26 ~03:00: CoreAnimation GL on the Pixel (handoff)
+- launchd drops DYLD_* from a system daemon's EnvironmentVariables: backboardd never got libsunfish-inject. Fix (from ios-topaz): userland/gpu/bbd_wrap.c, installed BY HAND over SSH on the phone's root as /usr/libexec/backboardd (sets DYLD_INSERT_LIBRARIES, execs /usr/libexec/real/backboardd = the original, kept). Boot-arg sweetgl=0 skips the loader. Not yet in tools/jb-to-root.sh.
+- With it (logs/live-0111-bbdwrap.txt): "SWEET GL: /usr/lib/libsunfish-gl.dylib loaded into backboardd"; OpenGL ES 3.2 Mesa 25.0.7 FD618; shaders compile; GPU submissions complete. But every glDrawElements gave 0x506: -attachImage refused the screen surfaces, which are 'b3a8' 1125x2436, 2 planes. Commit "b3a8 screen surfaces" draws them via a texture + glReadPixels into plane 0 (mesa run 40251948375): to test, scp out/libsunfish-gl.dylib to /usr/lib and `launchctl kickstart -k system/com.apple.backboardd`.
+- PANIC cause found: `dd if=/dev/rufsroot0` = kernel data abort (task dd): physio handed the user address to sweet_ufs_strategy's memcpy (PAN). xnu 0112 reads/writes the char device through uiomove (xnu run 40251539197, untested). Until it is booted, do NOT dd the raw UFS device on the phone.
+- The PC's 192.168.7.1 on enp0s20f0u12 gets dropped (NetworkManager): `nmcli dev set enp0s20f0u12 managed no` then re-add.
+
 
 ## MILESTONE 2026-10-26 ~02:3x: THE PIXEL 4A GPU DRAWS FOR iOS-SIDE CODE. Kernel 0110 (CI 40248625050), shim/out/shim-0110-zap4k.img (adreno=21 adreno_keep=1 adreno_pause=0 adreno_zap_fresh=1 adreno_skip=4096), logs/live-0110.txt: PAS_MEM_SETUP(13, 0x98f95000, 0x1000) -> 0 (the 4K-rounded size was the fix, from ios-topaz), image written, AUTH_AND_RESET 0: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER; step 21 left secure mode with CP_SET_SECURE_MODE; gputest (Mesa freedreno FD618 via SweetGPU): corner 0x0000ffff, middle 0xff0000ff: THE PIXELS ARE RIGHT. Secure mode was why Mesa drew zeros. Not yet checked: whether adreno_zap_fresh/adreno_skip are still needed with the 4K size.
 
