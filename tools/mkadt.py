@@ -70,7 +70,13 @@ def d22ap_product(path=D22AP_ADT):
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            # The iPhone X's panel is wide-gamut ("P3"): iOS then takes the screen for one with
+            # extended colour and, with the GL renderer, draws it into 'b3a8' surfaces (10 bits
+            # + an alpha plane) the GPU path here cannot share. The panel shows sRGB, so say so
+            # (HackiOS's loader does the same; SWEET_GAMUT_P3=1 keeps the iPhone's value).
+            keep_p3 = os.environ.get('SWEET_GAMUT_P3') == '1'
+            return [(k, b'sRGB\0' if k == 'artwork-display-gamut' and not keep_p3 else v)
+                    for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)
