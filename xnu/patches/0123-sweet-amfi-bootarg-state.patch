@@ -1,0 +1,32 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -417,6 +417,18 @@
+  * Other calls fail with ENOPOLICY as before the policy had this name.
+  */
+ #define SWEET_AMFI_DYLD_POLICY_SELF     0x5a
++/*
++ * Call 0x60, "query boot-arg state" (amfi_interface_query_bootarg_state() in libamfi): the argument
++ * points to 64 bits of flags, one for each boot-arg that switches part of AMFI off. ExtensionKit
++ * asks; unless one of the bits 0x86 is set it wants the signature of the system's table of
++ * extension points (/System/Library/xpc/extensions.plist.sig) verified by AMFI's IOKit service,
++ * which does not exist here. The table was then not read, LaunchServices knew no extension point
++ * (pkd: "could not create extension point record ... -10814"; PosterBoard: "extension point not
++ * found for query ... com.apple.posterkit.provider": no wallpaper, an empty gallery). Nothing is
++ * enforced by this kernel, so that is what it says. (From HackiOS's kern_minimac.c, which found it.)
++ */
++#define SWEET_AMFI_QUERY_BOOTARG_STATE  0x60
++#define SWEET_AMFI_BOOTARG_NOT_ENFORCING 0x86ULL
+ #define SWEET_AMFI_DYLD_IN_RESTRICTED   (1ULL << 1)
+ #define SWEET_AMFI_DYLD_IN_ENCRYPTED    (1ULL << 2)
+ #define SWEET_AMFI_DYLD_AT_PATH         (1ULL << 0)
+@@ -433,6 +445,10 @@
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET AMFI: %s syscall %d\n", name, call);
+ 	}
++	if (call == SWEET_AMFI_QUERY_BOOTARG_STATE) {
++		uint64_t state = SWEET_AMFI_BOOTARG_NOT_ENFORCING;
++		return copyout(&state, arg, sizeof(state));
++	}
+ 	if (call != SWEET_AMFI_DYLD_POLICY_SELF) {
+ 		return ENOPOLICY;
+ 	}
