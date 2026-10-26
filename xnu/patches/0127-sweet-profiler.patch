@@ -1,0 +1,173 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -11,11 +11,20 @@
+  * syscall stub in pc and its caller in lr/bt.
+  *
+  * First sample 90 s after start, then every 120 s, 40 samples at most.
++ *
++ * A profiler too: `sysctl kern.sweetprof=N` takes N samples 50 ms apart of the threads of the same
++ * processes that run or wait for a core ("PRF name thread-id pc ... lr ... bt ..."), and once the
++ * header lines ("SMP name[pid] slide ... mh ...") and the executable files mapped below the shared
++ * region ("PRF img name start size file-offset path") to symbolicate them. Where the CPU time goes
++ * while CoreAnimation draws.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ #include <sys/proc_internal.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/bsdtask_info.h>
+ #include <kern/task.h>
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+@@ -25,6 +34,9 @@
+ extern void sweet_sample_start(void);
+ 
+ static char sweet_sample_names[128];
++static int sweet_prof_left;
++SYSCTL_INT(_kern, OID_AUTO, sweetprof, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_prof_left, 0,
++    "samples of the running threads still to take, 50 ms apart");
+ 
+ static bool
+ sweet_sample_wanted(const char *name)
+@@ -44,17 +56,52 @@
+ 	return false;
+ }
+ 
+-extern void sweet_sample_task(const char *name, int pid, task_t task);  /* osfmk/kern/exception.c */
++extern void sweet_sample_task(const char *name, int pid, task_t task, bool running_only);  /* osfmk/kern/exception.c */
++
++/* the executable mappings of files below the shared region: our dylibs (Mesa, the GL layer) and the program */
++static void
++sweet_sample_images(const char *name, task_t task)
++{
++	struct proc_regioninfo_internal ri;
++	uint64_t address = 0;
++	uintptr_t vnode;
++	uint32_t vid;
++
++	for (int n = 0; n < 400; n++) {
++		bzero(&ri, sizeof(ri));
++		vnode = 0;
++		if (fill_procregioninfo_onlymappedvnodes(task, address, &ri, &vnode, &vid) == 0 ||
++		    ri.pri_address >= 0x180000000ULL || ri.pri_size == 0) {
++			break;
++		}
++		if ((ri.pri_protection & VM_PROT_EXECUTE) && vnode != 0 && vnode_getwithvid((vnode_t)vnode, vid) == 0) {
++			char path[MAXPATHLEN];
++			int length = sizeof(path);
++
++			if (vn_getpath((vnode_t)vnode, path, &length) != 0) {
++				strlcpy(path, "?", sizeof(path));
++			}
++			vnode_put((vnode_t)vnode);
++			printf("PRF img %s 0x%llx 0x%llx 0x%llx %s\n", name, ri.pri_address, ri.pri_size, ri.pri_offset, path);
++		}
++		address = ri.pri_address + ri.pri_size;
++	}
++}
+ 
+ static int
+-sweet_sample_proc(proc_t p, __unused void *arg)
++sweet_sample_proc(proc_t p, void *arg)
+ {
+ 	char name[32];
+ 	proc_name(proc_pid(p), name, sizeof(name));
+ 	if (sweet_sample_wanted(name)) {
+ 		task_t task = proc_task(p);
+ 		if (task != TASK_NULL) {
+-			sweet_sample_task(name, proc_pid(p), task);
++			if (arg == (void *)2) {
++				sweet_sample_task(name, proc_pid(p), task, false);
++				sweet_sample_images(name, task);
++			} else {
++				sweet_sample_task(name, proc_pid(p), task, arg != NULL);
++			}
+ 		}
+ 	}
+ 	return PROC_RETURNED;
+@@ -70,11 +117,27 @@
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+-	(void)tsleep(&chan, PZERO, "sweetsmp", 90 * hz);
+-	for (int i = 0; i < 40; i++) {
+-		printf("SMP --- sample %d\n", i);
+-		proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+-		(void)tsleep(&chan, PZERO, "sweetsmp", 120 * hz);
++	int i = 0, ticks = 0, profiling = 0;
++
++	for (;; ticks++) {
++		/* every 50 ms: a profile sample when asked for; the plain samples at 90 s, then every 120 s */
++		if (sweet_prof_left > 0) {
++			if (!profiling) {
++				profiling = 1;
++				printf("PRF --- start\n");
++				proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, (void *)2, NULL, NULL);
++			}
++			sweet_prof_left--;
++			proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, (void *)1, NULL, NULL);
++		} else if (profiling) {
++			profiling = 0;
++			printf("PRF --- end\n");
++		}
++		if (i < 40 && ticks >= 1800 && (ticks - 1800) % 2400 == 0) {
++			printf("SMP --- sample %d\n", i++);
++			proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
++		}
++		(void)tsleep(&chan, PZERO, "sweetsmp", hz / 20 ? hz / 20 : 1);
+ 	}
+ }
+ 
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -994,10 +994,15 @@
+  * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
+  * pointer backtrace of every thread of a task, from the saved user state.
+  */
+-void sweet_sample_task(const char *name, int pid, task_t task);
++void sweet_sample_task(const char *name, int pid, task_t task, bool running_only);
+ 
++/*
++ * running_only (the profiler, kern.sweetprof): only threads that run or wait for a core, each with
++ * its thread id, without the header; their pc is where they last entered the kernel (a timer
++ * interrupt, for a thread that computes).
++ */
+ void
+-sweet_sample_task(const char *name, int pid, task_t task)
++sweet_sample_task(const char *name, int pid, task_t task, bool running_only)
+ {
+ 	vm_map_t map = get_task_map(task);
+ 	uint64_t slide = 0;
+@@ -1009,7 +1014,9 @@
+ 		slide = sr->sr_slide;
+ 		vm_shared_region_deallocate(sr);
+ 	}
+-	printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	if (!running_only) {
++		printf("SMP %s[%d] slide 0x%llx mh 0x%llx\n", name, pid, slide, task->mach_header_vm_address);
++	}
+ 
+ 	task_lock(task);
+ 	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+@@ -1021,9 +1028,17 @@
+ 		if (ss == NULL || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
++		if (running_only && ((thread->state & TH_RUN) == 0 || (thread->state & TH_WAIT) != 0)) {
++			continue;
++		}
+ 		fp = get_saved_state_fp(ss);
+-		n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
+-		    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		if (running_only) {
++			n = snprintf(line, sizeof(line), "PRF %s %llu pc 0x%llx lr 0x%llx bt", name, thread->thread_id,
++			    get_saved_state_pc(ss), get_saved_state_lr(ss));
++		} else {
++			n = snprintf(line, sizeof(line), "SMP %s t%d pc 0x%llx lr 0x%llx sp 0x%llx bt", name, tn++,
++			    get_saved_state_pc(ss), get_saved_state_lr(ss), get_saved_state_sp(ss));
++		}
+ 		for (int i = 0; i < 16 && fp != 0 && (fp & 7) == 0 && n < (int)sizeof(line) - 20; i++) {
+ 			uint64_t frame[2];
+ 			if (vm_map_read_user(map, fp, frame, sizeof(frame)) != KERN_SUCCESS) {

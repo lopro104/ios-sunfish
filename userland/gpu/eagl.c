@@ -137,6 +137,13 @@ struct eagl;
 static int eagl_tracing;                /* this frame's calls are written down (boot-arg gltrace=FIRST-LAST) */
 static int frame_lines;                 /* boot-arg glframes=1: a line for every frame (see frame_end()) */
 static int latency_lines;               /* boot-arg touch_lat=1: when every frame began and ended (see frame_end()) */
+/*
+ * ios-sunfish: the sums of IOSurfaces whose seed stayed the same (surface_changed()): boot-arg glhash=N, a quiet memory
+ * is added up every Nth frame (2); how many sums, of how many bytes, and how many of the refills only a sum found (the
+ * others the seed did). The profiler (kern.sweetprof) found the sums 6% of backboardd's time.
+ */
+static unsigned hash_every = 2;
+static unsigned long long hash_runs, hash_bytes, hash_found, all_uploads;
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
 static uint64_t now_us(void);
@@ -504,6 +511,8 @@ summary(struct eagl *e)
 	    e->frames, e->all_calls / frames, e->all_draws / frames, e->all_triangles / frames, e->most_calls,
 	    e->most_triangles, e->frame_us / frames, e->flush_us / frames, e->wait_us / frames, e->readback_us / frames,
 	    e->attach_us / frames, e->shared, e->refused, e->shaders, e->programs, widest_texture, tallest_texture, e->errors);
+	say("redwood-gl: IOSurface sums (glhash=%u): %llu, %llu MB; of %llu refills %llu found by a sum, the others by the seed\n",
+	    hash_every, hash_runs, hash_bytes >> 20, all_uploads, hash_found);
 	{
 		/* topaz profile: inside GL calls (Mesa) vs. the rest of the frame (CoreAnimation), cores, top entries */
 		unsigned top[5] = { 0, 0, 0, 0, 0 };
@@ -696,10 +705,12 @@ surface_changed(struct eagl *e, struct image *image)
 	 * Adding up 11 MB was 3-4 ms a frame (glBindTexture). A memory whose sum has stayed the
 	 * same for 30 looks in a row is added up every 2nd frame only, until it changes again (8 made app launches lag).
 	 */
-	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < 2) {
+	if (image->quiet >= 30 && image->looked != 0 && e->frames + 1 - image->looked < hash_every) {
 		return false;
 	}
 	image->looked = e->frames + 1;
+	hash_runs++;
+	hash_bytes += size;
 	for (size_t at = 0; at + 8 <= size; at += 8) {
 		memcpy(&word, base + at, 8);
 		sum = (sum ^ word) * 0x9e3779b97f4a7c15ull;
@@ -711,6 +722,7 @@ surface_changed(struct eagl *e, struct image *image)
 	}
 	image->sum = sum;
 	image->quiet = 0;
+	hash_found++;
 	return true;
 }
 
@@ -852,6 +864,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 	free(flipped);
 	image->seed = IOSurfaceGetSeed(surface);
 	e->uploads++;
+	all_uploads++;
 	e->upload_bytes += row * (size_t)image->height;
 }
 
@@ -3768,6 +3781,9 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		if ((argument = strstr(arguments, "glhash=")) != NULL && strtoul(argument + 7, NULL, 10) >= 1) {
+			hash_every = (unsigned)strtoul(argument + 7, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "glslow=")) != NULL) {
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
 		}

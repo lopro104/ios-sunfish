@@ -1,0 +1,212 @@
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -16,7 +16,9 @@
+  * processes that run or wait for a core ("PRF name thread-id pc ... lr ... bt ..."), and once the
+  * header lines ("SMP name[pid] slide ... mh ...") and the executable files mapped below the shared
+  * region ("PRF img name start size file-offset path") to symbolicate them. Where the CPU time goes
+- * while CoreAnimation draws.
++ * while CoreAnimation draws. Meanwhile the timer interrupt keeps samples of the first process named
++ * in sweetprof_proc (default backboardd) when it is on a core, in the kernel or not; they follow at
++ * the end as "PRK ..." lines (osfmk/kern/exception.c sweet_prof_tick), with the kernel's slide.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -57,6 +59,23 @@
+ }
+ 
+ extern void sweet_sample_task(const char *name, int pid, task_t task, bool running_only);  /* osfmk/kern/exception.c */
++extern task_t sweet_prof_target;
++extern void sweet_prof_dump(void);
++extern void sweet_prof_poke(void);
++static char sweet_prof_proc[32] = "backboardd";
++
++static int
++sweet_prof_find(proc_t p, __unused void *arg)
++{
++	char name[32];
++
++	proc_name(proc_pid(p), name, sizeof(name));
++	if (sweet_prof_target == TASK_NULL && strcmp(name, sweet_prof_proc) == 0 && proc_task(p) != TASK_NULL) {
++		task_reference(proc_task(p));
++		sweet_prof_target = proc_task(p);
++	}
++	return PROC_RETURNED;
++}
+ 
+ /* the executable mappings of files below the shared region: our dylibs (Mesa, the GL layer) and the program */
+ static void
+@@ -114,6 +133,7 @@
+ 	if (!PE_parse_boot_argn("sweetsample", sweet_sample_names, sizeof(sweet_sample_names))) {
+ 		strlcpy(sweet_sample_names, "SpringBoard,backboardd", sizeof(sweet_sample_names));
+ 	}
++	(void)PE_parse_boot_argn("sweetprof_proc", sweet_prof_proc, sizeof(sweet_prof_proc));
+ 	if (sweet_sample_names[0] == '-') {
+ 		return;
+ 	}
+@@ -126,18 +146,34 @@
+ 				profiling = 1;
+ 				printf("PRF --- start\n");
+ 				proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, (void *)2, NULL, NULL);
++				proc_iterate(PROC_ALLPROCLIST, sweet_prof_find, NULL, NULL, NULL);
+ 			}
+ 			sweet_prof_left--;
+ 			proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, (void *)1, NULL, NULL);
+ 		} else if (profiling) {
++			task_t target = sweet_prof_target;
++
+ 			profiling = 0;
++			sweet_prof_target = TASK_NULL;
+ 			printf("PRF --- end\n");
++			if (target != TASK_NULL) {
++				delay_for_interval(10, NSEC_PER_MSEC);     /* a timer interrupt still at work on it */
++				task_deallocate(target);
++				sweet_prof_dump();
++			}
+ 		}
+ 		if (i < 40 && ticks >= 1800 && (ticks - 1800) % 2400 == 0) {
+ 			printf("SMP --- sample %d\n", i++);
+ 			proc_iterate(PROC_ALLPROCLIST, sweet_sample_proc, NULL, NULL, NULL);
+ 		}
+-		(void)tsleep(&chan, PZERO, "sweetsmp", hz / 20 ? hz / 20 : 1);
++		if (profiling) {
++			for (int k = 0; k < 25; k++) {
++				sweet_prof_poke();
++				delay_for_interval(2, NSEC_PER_MSEC);
++			}
++		} else {
++			(void)tsleep(&chan, PZERO, "sweetsmp", hz / 20 ? hz / 20 : 1);
++		}
+ 	}
+ }
+ 
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -823,6 +823,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
++#include <arm/cpu_data_internal.h>
+ 
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+@@ -1055,6 +1056,100 @@
+ 	task_unlock(task);
+ }
+ 
++/*
++ * The kernel half of the profiler (kern.sweetprof): while sweet_prof_target is set, every timer
++ * interrupt that finds one of that task's threads on the core keeps where it was, in the kernel
++ * (pc, lr and a few callers off its kernel stack) or in user space (pc, lr), for
++ * sweet_prof_dump() to print as "PRK cpu k|u pc lr callers...". The timer alone pops too seldom
++ * (40 samples in 30 s): sweet_prof_poke() interrupts the other cores as well, the profiler calls it
++ * every 2 ms.
++ */
++task_t sweet_prof_target;
++#define SWEET_PROF_RING         8192
++#define SWEET_PROF_FRAMES       8
++static struct {
++	uint64_t frame[SWEET_PROF_FRAMES];
++	uint32_t cpu, user;
++} sweet_prof_ring[SWEET_PROF_RING];
++static uint32_t sweet_prof_taken;
++
++void sweet_prof_tick(arm_saved_state_t *state);
++void sweet_prof_dump(void);
++void sweet_prof_poke(void);
++
++void
++sweet_prof_tick(arm_saved_state_t *state)
++{
++	thread_t thread = current_thread();
++	uint32_t i;
++
++	if (sweet_prof_target == TASK_NULL || get_threadtask(thread) != sweet_prof_target || !is_saved_state64(state)) {
++		return;
++	}
++	i = os_atomic_inc_orig(&sweet_prof_taken, relaxed);
++	if (i >= SWEET_PROF_RING) {
++		return;
++	}
++	bzero(&sweet_prof_ring[i], sizeof(sweet_prof_ring[i]));
++	sweet_prof_ring[i].cpu = cpu_number();
++	sweet_prof_ring[i].user = PSR64_IS_USER(get_saved_state_cpsr(state));
++	sweet_prof_ring[i].frame[0] = get_saved_state_pc(state);
++	sweet_prof_ring[i].frame[1] = get_saved_state_lr(state);
++	if (!sweet_prof_ring[i].user && thread->kernel_stack != 0) {
++		uint64_t fp = get_saved_state_fp(state), low = thread->kernel_stack, high = low + kernel_stack_size;
++
++		for (int f = 2; f < SWEET_PROF_FRAMES && fp >= low && fp + 16 <= high && (fp & 7) == 0; f++) {
++			sweet_prof_ring[i].frame[f] = VM_KERNEL_STRIP_PTR(((uint64_t *)fp)[1]);
++			if (((uint64_t *)fp)[0] <= fp) {
++				break;
++			}
++			fp = ((uint64_t *)fp)[0];
++		}
++	}
++}
++
++/* on each core, from the interrupt: what it interrupted (no state when called outside one) */
++static void
++sweet_prof_xcall(__unused void *arg)
++{
++	arm_saved_state_t *state = getCpuDatap()->cpu_int_state;
++
++	if (state != NULL) {
++		sweet_prof_tick(state);
++	}
++}
++
++void
++sweet_prof_poke(void)
++{
++	static int arg;
++
++	(void)cpu_broadcast_immediate_xcall(NULL, FALSE, sweet_prof_xcall, &arg);
++}
++
++/* after the run (sweet_prof_target cleared): the samples, 40 lines at a time for the console's stream */
++void
++sweet_prof_dump(void)
++{
++	uint32_t n = MIN(os_atomic_load(&sweet_prof_taken, relaxed), SWEET_PROF_RING);
++
++	printf("PRK --- %u samples, kernel slide 0x%lx\n", n, vm_kernel_slide);
++	for (uint32_t i = 0; i < n; i++) {
++		char line[300];
++		int used = snprintf(line, sizeof(line), "PRK %u %c", sweet_prof_ring[i].cpu, sweet_prof_ring[i].user ? 'u' : 'k');
++
++		for (int f = 0; f < SWEET_PROF_FRAMES && sweet_prof_ring[i].frame[f] != 0; f++) {
++			used += snprintf(line + used, sizeof(line) - used, " 0x%llx", sweet_prof_ring[i].frame[f]);
++		}
++		printf("%s\n", line);
++		if (i % 40 == 39) {
++			delay_for_interval(100, NSEC_PER_MSEC);
++		}
++	}
++	printf("PRK --- end\n");
++	os_atomic_store(&sweet_prof_taken, 0, relaxed);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ kern_return_t
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -1636,6 +1636,9 @@
+ }
+ 
+ extern void syscall_trace(struct arm_saved_state * regs);
++#if defined(SWEET)
++extern void sweet_prof_tick(arm_saved_state_t *state);  /* osfmk/kern/exception.c */
++#endif
+ 
+ static void
+ handle_svc(arm_saved_state_t *state)
+@@ -1869,6 +1872,7 @@
+ 	}
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
++		sweet_prof_tick(state);
+ 		cdp->cpu_decrementer = -1; /* Large */
+ 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
