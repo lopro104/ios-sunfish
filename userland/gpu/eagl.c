@@ -875,6 +875,21 @@ target_to_surface(struct eagl *e, struct image *image)
 			}
 		}
 		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+		/* ios-sunfish: what came out, for the first frames (is the GPU's picture black, or the way to the screen?) */
+		static unsigned sampled;
+		if (sampled < 12) {
+			size_t lit = 0, n = 0;
+			uint32_t px, mid;
+			for (GLsizei y = 0; y < image->height; y += 37) {
+				for (GLsizei x = 0; x < image->width; x += 29, n++) {
+					memcpy(&px, base + row * (size_t)y + (size_t)x * 4, 4);
+					lit += (px & 0xffffff) != 0;
+				}
+			}
+			memcpy(&mid, base + row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * 4, 4);
+			say("redwood-gl: out %u: IOSurface %u plane %d row %zu: %zu of %zu samples not black, middle %#x, gl error %#x\n",
+			    sampled++, IOSurfaceGetID(surface), image->plane, row, lit, n, mid, glGetError());
+		}
 		IOSurfaceUnlock(surface, 0, NULL);
 	}
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
