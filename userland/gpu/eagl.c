@@ -622,7 +622,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 	GLint bound = 0;
 
-	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
+	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first || IOSurfaceGetPlaneCount(surface) > 0 ||
 	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
 		return false;
@@ -650,7 +650,8 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+	if (!share_surfaces || image->invert || image->alpha_first || IOSurfaceGetPlaneCount(surface) > 0 ||
+	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !redwood_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
@@ -820,7 +821,8 @@ static void
 target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
-	size_t row = IOSurfaceGetBytesPerRow(surface);
+	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
+	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
 	uint8_t *base;
 
 	image->drawn = false;
@@ -862,7 +864,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
+		base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (!image->invert) {
@@ -3554,8 +3556,14 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+	/*
+	 * ios-sunfish: the screen's surfaces are 'b3a8' here (the iPhone X's wide colour: blue-first
+	 * pixels in plane 0, opacity in plane 1); the display shows plane 0, so that is drawn into.
+	 */
+	bool b3a8 = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2 &&
+	    IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4;
+	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0 && !b3a8) ||
+	    (!b3a8 && (IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0)) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("redwood-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
