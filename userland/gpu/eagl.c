@@ -777,6 +777,21 @@ surface_to_texture(struct eagl *e, struct image *image)
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001, &had_height);
 		glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1003, &had_format);
 	}
+	/* ios-sunfish: is what CoreAnimation hands over (a layer's IOSurface) empty? */
+	static unsigned looked_in;
+	if (looked_in < 24 && base != NULL) {
+		size_t used = (size_t)image->width * pixel, lit = 0, n = 0;
+		for (GLsizei y = 0; y < image->height; y += 7) {
+			for (size_t x = 0; x + 4 <= used; x += 4 * 5, n++) {
+				uint32_t v;
+				memcpy(&v, base + row * (size_t)y + x, 4);
+				lit += v != 0;
+			}
+		}
+		say("redwood-gl: in %u: IOSurface %u ('%.4s' %d x %d, plane %d, row %zu, format %#x): %zu of %zu samples not 0\n",
+		    looked_in++, IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(IOSurfaceGetPixelFormat(surface)) },
+		    image->width, image->height, image->plane, row, image->format, lit, n);
+	}
 	if (simple && had_width == image->width && had_height == image->height &&
 	    had_format == (GLint)internal_format(image->internal, image->format)) {
 		static unsigned sub_told;
@@ -891,8 +906,8 @@ target_to_surface(struct eagl *e, struct image *image)
 		}
 		glPixelStorei(GL_PACK_ROW_LENGTH, 0);
 		/* ios-sunfish: what came out, for the first frames (is the GPU's picture black, or the way to the screen?) */
-		static unsigned sampled;
-		if (sampled < 12) {
+		static unsigned sampled, sampled_big;
+		if (sampled < 6 || (e->draws > 4 && sampled_big++ < 16)) {
 			size_t lit = 0, n = 0;
 			uint32_t px, mid;
 			for (GLsizei y = 0; y < image->height; y += 37) {
@@ -902,8 +917,8 @@ target_to_surface(struct eagl *e, struct image *image)
 				}
 			}
 			memcpy(&mid, base + row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * 4, 4);
-			say("redwood-gl: out %u: IOSurface %u plane %d row %zu (reported %zu/%zu, plane 1 at +%td): %zu of %zu samples not black, middle %#x, gl error %#x\n",
-			    sampled++, IOSurfaceGetID(surface), image->plane, row, IOSurfaceGetBytesPerRowOfPlane(surface, 0),
+			say("redwood-gl: out %u (%u draws): IOSurface %u plane %d row %zu (reported %zu/%zu, plane 1 at +%td): %zu of %zu samples not black, middle %#x, gl error %#x\n",
+			    sampled++, e->draws, IOSurfaceGetID(surface), image->plane, row, IOSurfaceGetBytesPerRowOfPlane(surface, 0),
 			    IOSurfaceGetBytesPerRowOfPlane(surface, 1), planar ? (uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, 1) - base : 0,
 			    lit, n, mid, glGetError());
 		}
