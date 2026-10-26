@@ -1,0 +1,170 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 213149c..3974fae 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -344,8 +344,9 @@ ufs_wake_device(void)
+ 	printf("SWEET UFS: START STOP UNIT (Active) to the device W-LU: %d\n", error);
+ }
+ 
++/* The first block and size of the GPT partition named want, on the current LUN. */
+ static int
+-ufs_find_partition(const char *want)
++ufs_lookup_partition(const char *want, uint64_t *first_out, uint64_t *count_out)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -390,14 +391,26 @@ ufs_find_partition(const char *want)
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_out = first;
++		*count_out = last - first + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+ 	return ENOENT;
+ }
+ 
++static int
++ufs_find_partition(const char *want)
++{
++	uint64_t first, count;
++	int error = ufs_lookup_partition(want, &first, &count);
++	if (error == 0) {
++		su.first_block = first;
++		su.nblocks = count;
++	}
++	return error;
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -913,6 +926,53 @@ sweet_log_start(void)
+ }
+ 
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
++/*
++ * Make the next boot stop in the bootloader's fastboot, once: the bootloader message at the start
++ * of the misc partition gets the command "bootonce-bootloader" (Android's bootloader_message:
++ * command[32] first; bootloaders since Android 10 act on it and clear it). Called by
++ * SweetPlatformExpert::haltRestart just before the PSCI reset. Only the 32 command bytes of the
++ * one block are changed; this is the only write outside the root partition.
++ */
++int sweet_ufs_reboot_to_bootloader(void);
++
++int
++sweet_ufs_reboot_to_bootloader(void)
++{
++	static const char command[32] = "bootonce-bootloader";
++	uint64_t first = 0, count = 0;
++	uint8_t *b;
++	int error;
++
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_lookup_partition("misc", &first, &count);
++	if (error == 0 && (count == 0 || first > UINT32_MAX)) {
++		error = ENXIO;
++	}
++	if (error == 0) {
++		error = ufs_read_blocks(first, 1);
++	}
++	if (error == 0) {
++		b = (uint8_t *)(su.dma + DMA_BOUNCE);
++		printf("SWEET UFS: misc at block %llu (%llu blocks), command was \"%.32s\"\n", first, count, (const char *)b);
++		memcpy(b, command, sizeof(command));
++		uint8_t cdb[10] = {
++			0x2a, 0,
++			(uint8_t)(first >> 24), (uint8_t)(first >> 16), (uint8_t)(first >> 8), (uint8_t)first,
++			0, 0, 1, 0
++		};
++		error = ufs_scsi(cdb, sizeof(cdb), UFS_BLOCK, true);
++		if (error == 0) {
++			error = ufs_sync_cache();
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET UFS: next boot to the bootloader: %d\n", error);
++	return error;
++}
++
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+ int
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 6e234f5..d4e4c59 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -14,6 +14,8 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_ufs.c */
++extern "C" int sweet_ufs_reboot_to_bootloader(void);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -24,6 +26,7 @@ public:
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ 
+ private:
+ 	bool rtcRead(uint32_t *secs);
+@@ -33,6 +36,50 @@ private:
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+ 
++/* PSCI SYSTEM_OFF / SYSTEM_RESET (SMCCC 1.0 through smc, as CPU_ON in SweetCPU); they do not return. */
++#define SWEET_PSCI_SYSTEM_OFF   0x84000008ULL
++#define SWEET_PSCI_SYSTEM_RESET 0x84000009ULL
++
++static void
++sweet_psci_call(uint64_t function)
++{
++	register uint64_t x0 __asm__("x0") = function;
++	__asm__ volatile("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	    "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++/*
++ * Restart and power off. There was no way to either: a reboot ended in "Halt/Restart Timed Out".
++ * A restart stops in the bootloader's fastboot by default (the bootloader message in misc, see
++ * sweet_ufs_reboot_to_bootloader), where the next test image is booted from; boot-arg
++ * sweet_reboot=normal restarts normally. Panics keep their screen (no reset), for the photo.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	char how[16] = "";
++
++	switch (type) {
++	case kPERestartCPU:
++		PE_parse_boot_arg_str("sweet_reboot", how, sizeof(how));
++		if (strcmp(how, "normal") != 0) {
++			(void)sweet_ufs_reboot_to_bootloader();
++		}
++		IOLog("SWEET: PSCI SYSTEM_RESET\n");
++		IODelay(10000);
++		sweet_psci_call(SWEET_PSCI_SYSTEM_RESET);
++		break;
++	case kPEHaltCPU:
++		IOLog("SWEET: PSCI SYSTEM_OFF\n");
++		IODelay(10000);
++		sweet_psci_call(SWEET_PSCI_SYSTEM_OFF);
++		break;
++	default:
++		break;
++	}
++	return IODTPlatformExpert::haltRestart(type);
++}
++
+ bool
+ SweetPlatformExpert::start(IOService *provider)
+ {
