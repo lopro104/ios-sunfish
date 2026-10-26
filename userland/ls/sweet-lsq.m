@@ -12,10 +12,14 @@
  */
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
+#include <dlfcn.h>
 
 static id
 workspace(void)
 {
+	/* (MobileCoreServices is not linked by Foundation) */
+	dlopen("/System/Library/Frameworks/MobileCoreServices.framework/MobileCoreServices", RTLD_NOW);
+	dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_NOW);
 	Class c = NSClassFromString(@"LSApplicationWorkspace");
 	return c ? ((id (*)(Class, SEL))objc_msgSend)(c, NSSelectorFromString(@"defaultWorkspace")) : nil;
 }
