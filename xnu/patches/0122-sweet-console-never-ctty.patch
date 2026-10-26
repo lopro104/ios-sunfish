@@ -1,0 +1,21 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -4785,7 +4785,17 @@
+ 	 * results in it being set as the controlling terminal.
+ 	 */
+ 	if (vnode_istty(vp) && !(p->p_flag & P_CONTROLT) &&
+-	    !(flags & O_NOCTTY)) {
++	    !(flags & O_NOCTTY)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(SWEET)
++	    /*
++	     * sweet/sunfish: /dev/console (devfs makedev(0, 0)) never becomes a controlling terminal.
++	     * Daemons are session leaders; one that opened the console made it its terminal, and its
++	     * exit revoked the console for every daemon whose output went there (applog: all of
++	     * PosterBoard's, lsd's, backboardd's fds 1 and 2 were "(revoked)").
++	     */
++	    && vnode_specrdev(vp) != makedev(0, 0)
++#endif
++	    ) {
+ 		int tmp = 0;
+ 
+ 		(void)(*fp->fp_glob->fg_ops->fo_ioctl)(fp, (int)TIOCSCTTY,

@@ -15,5 +15,8 @@ for a in "$@"; do
     *) args+=("$a");;
   esac
 done
-exec /usr/bin/$drv -include /opt/host/inc/xnu_clang_compat.h -target arm64-apple-macos14.0 --ld-path="$HB/ld64" \
+# -mcpu=generic: for an arm64-apple-macos target stock clang otherwise assumes an Apple M1 and, next to
+# the kernel's -march=armv8.2-a, emitted ARMv8.3/8.4 instructions (xpaci, ldapur, stlur) the
+# Pixel's Cortex-A76/A55 do not have: the first one hung the boot after SWEET EARLY 5.
+exec /usr/bin/$drv -include /opt/host/inc/xnu_clang_compat.h -target arm64-apple-macos14.0 -mcpu=generic --ld-path="$HB/ld64" \
   -w "${extra[@]}" "${args[@]}"

@@ -32,5 +32,11 @@ clang 18, Apple's ld64/cctools (theos Linux toolchain), the macOS 14.0 SDK (Xcod
   buffer helpers (no PGO here) and `__cxa_atexit` (clang 18 registers C++ global destructors with
   it under -fapple-kext; the kernel never exits).
 - /bsd.syscalls.master is made before make (a parallel-build race on Linux left sysproto.h empty).
+- `-mcpu=generic` in `bin/xnu-clang`: without it stock clang assumes an Apple M1 for the macOS target and
+  emitted ARMv8.3/8.4 instructions (xpaci, ldapur, stlur) the Pixel lacks: the first local kernel hung
+  after SWEET EARLY 5. (ldapr is fine: CI's kernel has 188, the Cortex-A76 has it.)
+- make exits 2 at the end: `check_all_exports` (kextsymboltool cannot write its output to /dev/null on
+  Linux) runs after the kernel is linked; the kernel is complete.
 First comparison (0121 local vs 0120 CI): same segments within 3% (__TEXT_EXEC 8.51 vs 8.78 MB),
 24174 vs 24170 global symbols, 180 sweet_ symbols in both; fewer local labels.
+BOOTED on the Pixel (2026-10-26 18:40, logs/live-local-0121b.txt): SpringBoard, SSH, 247 programs.
