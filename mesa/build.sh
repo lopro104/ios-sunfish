@@ -120,7 +120,10 @@ ENT
 # What LaunchServices knows about application extensions (userland/ls).
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -fobjc-arc -framework Foundation \
 	-o "$OUT/sweet-lsq" "$HERE/../userland/ls/sweet-lsq.m"
-codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq"
+# Plane layout probe for SweetSurface (userland/tools).
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -framework CoreFoundation -framework IOSurface \
+	-o "$OUT/sweet-surfplane" "$HERE/../userland/tools/sweet-surfplane.c"
+codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq" "$OUT/sweet-surfplane"
 codesign -f -s - --entitlements "$WORK/sweet-net.entitlements" "$OUT/sweet-net"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
