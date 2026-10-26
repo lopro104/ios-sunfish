@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -652,6 +652,13 @@
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
++		/*
++		 * IOSurfaceGetBytesPerRowOfPlane reads +0x10 (found with markers in the unused offsets and
++		 * userland/tools/sweet-surfplane: it returned the one at 0x10); with only +0x08 every plane
++		 * of every multi-plane surface had 0 bytes a row: HEIC decodes came out empty (the iOS 16
++		 * wallpaper black), and the GL layer had to guess the rows of the screen's 'b3a8' surfaces.
++		 */
++		put32(p, 0x10, pl->bytesPerRow);
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
