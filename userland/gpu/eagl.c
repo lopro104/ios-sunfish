@@ -145,7 +145,7 @@ static int latency_lines;               /* boot-arg touch_lat=1: when every fram
  */
 static unsigned hash_every = 2;
 /*
- * ios-sunfish: boot-arg glbig=N (with enable_skstb): the thread that draws (CoreAnimation's render server) binds itself to
+ * ios-sunfish: boot-arg glbig=N (kernel 0129, kern.sweet_bigcore): the thread that draws (CoreAnimation's render server) binds itself to
  * core N, one of the Pixel's two big A76 cores (6, 7). The kernel takes all eight cores as the same, and the profiler saw
  * that thread on the little A55s 94% of the time.
  */
@@ -1068,7 +1068,7 @@ frame_end(struct eagl *e, bool finished)
 			int cpu = big_core;
 
 			bound = 1;
-			if (sysctlbyname("kern.sched_thread_bind_cpu", NULL, NULL, &cpu, sizeof(cpu)) == 0) {
+			if (sysctlbyname("kern.sweet_bigcore", NULL, NULL, &cpu, sizeof(cpu)) == 0) {
 				say("redwood-gl: the drawing thread is bound to core %d\n", cpu);
 			} else {
 				say("redwood-gl: the drawing thread could not be bound to core %d: errno %d\n", cpu, errno);
