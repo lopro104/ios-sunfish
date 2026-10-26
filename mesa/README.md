@@ -11,7 +11,9 @@ artifact `mesa-ios`). Status: **builds in CI; not yet run on the phone.** The fi
 
 The approach, the pinned Mesa release (25.0.7), the patches in `patches/` and the libdrm stand-in in
 `hakios-drm/` are HackiOS's ([oosexgang/hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel),
-`tools/mk-mesa.sh` and `tools/mesa/`, commit `5fbd7fd`), under the MIT License:
+`tools/mk-mesa.sh` and `tools/mesa/`, commit `5fbd7fd`), under the MIT License. The AIR frontend in
+`air/` (their `tools/mesa/air`: Metal shader bitcode to NIR, and `air_run`) and `patches/air-*.patch`
+are also HackiOS's, from commit `8851317`, under the same license:
 
 ```
 Copyright (c) 2025-2026 the HakiOS authors

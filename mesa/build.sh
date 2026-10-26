@@ -33,6 +33,10 @@ for p in "$HERE"/patches/*.patch; do
 	patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"
 done
 cp -r "$HERE/hakios-drm" mesa-$VERSION/src/hakios-drm
+# HackiOS's AIR frontend (mesa/air, their tools/mesa/air): reads Apple's Metal shader bitcode (AIR,
+# in .metallib files) and makes NIR, which ir3 compiles for the Adreno. patches/air-frontend.patch
+# and patches/air-ir3.patch hook it into the build; air_run draws with one Metal shader.
+cp -r "$HERE/air" mesa-$VERSION/src/compiler/air
 
 python3 -m venv venv
 venv/bin/pip -q install mako pyyaml packaging meson
@@ -68,6 +72,9 @@ meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 	-Dvalgrind=disabled -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled \
 	-Dgallium-va=disabled -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false
 ninja -C build
+# air_run (not built by default): a Metal shader of the system's, translated, drawn on the Adreno
+ninja -C build src/gallium/drivers/freedreno/air_run
+cp build/src/gallium/drivers/freedreno/air_run "$OUT/air_run"
 
 # Every dylib the build made, with /usr/lib install names (libOSMesa links the others by those).
 for lib in $(find build -name '*.dylib' -type f); do
@@ -125,7 +132,8 @@ ENT
 	-o "$OUT/sweet-surfplane" "$HERE/../userland/tools/sweet-surfplane.c"
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -framework CoreFoundation -framework IOSurface \
 	-o "$OUT/sweet-shot" "$HERE/../userland/tools/sweet-shot.c"
-codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq" "$OUT/sweet-surfplane" "$OUT/sweet-shot"
+fixup "$OUT/air_run"
+codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq" "$OUT/sweet-surfplane" "$OUT/sweet-shot" "$OUT/air_run"
 codesign -f -s - --entitlements "$WORK/sweet-net.entitlements" "$OUT/sweet-net"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
