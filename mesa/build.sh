@@ -117,7 +117,10 @@ cat > "$WORK/sweet-net.entitlements" <<'ENT'
 	<key>platform-application</key><true/>
 </dict></plist>
 ENT
-codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap"
+# What LaunchServices knows about application extensions (userland/ls).
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -fobjc-arc -framework Foundation \
+	-o "$OUT/sweet-lsq" "$HERE/../userland/ls/sweet-lsq.m"
+codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq"
 codesign -f -s - --entitlements "$WORK/sweet-net.entitlements" "$OUT/sweet-net"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
