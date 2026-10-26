@@ -1,0 +1,74 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index fbd66ec..213149c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -586,19 +586,65 @@ sweet_ufs_psize(__unused dev_t dev)
+ 	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
++/*
++ * The character device: physio() would hand sweet_ufs_strategy the caller's own (user) address,
++ * which the memcpy there may not touch (PAN: a dd of /dev/rufsroot0 was a kernel data abort).
++ * So these copy through the bounce buffer with uiomove().
++ */
++static int
++sweet_ufs_rw(struct uio *uio, bool rd)
++{
++	int error = 0;
++	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++
++	if (uio_offset(uio) < 0 || (uio_offset(uio) % su.secsize) || (uio_resid(uio) % su.secsize)) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	while (uio_resid(uio) > 0 && (uint64_t)uio_offset(uio) < part_bytes) {
++		uint64_t pos = (uint64_t)uio_offset(uio);
++		uint64_t lba = pos / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN((uint64_t)uio_resid(uio), MIN(BOUNCE_SIZE - skip, part_bytes - pos));
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		char *bounce = (char *)(su.dma + DMA_BOUNCE);
++		if (rd) {
++			error = ufs_read_blocks(su.first_block + lba, blocks);
++			if (!error) {
++				error = uiomove(bounce + skip, (int)want, uio);
++			}
++		} else {
++			if (skip || (want % UFS_BLOCK)) {
++				error = ufs_read_blocks(su.first_block + lba, blocks);
++			}
++			if (!error) {
++				error = uiomove(bounce + skip, (int)want, uio);
++			}
++			if (!error) {
++				error = ufs_write_blocks(su.first_block + lba, blocks);
++			}
++		}
++		if (error) {
++			break;
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+-sweet_ufs_read(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return physio(sweet_ufs_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++	return sweet_ufs_rw(uio, true);
+ }
+ 
+ static int
+-sweet_ufs_write(dev_t dev, struct uio *uio, __unused int ioflag)
++sweet_ufs_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+ 	if (!su.writable) {
+ 		return EROFS;
+ 	}
+-	return physio(sweet_ufs_strategy, NULL, dev, B_WRITE, minphys, uio, (int)su.secsize);
++	return sweet_ufs_rw(uio, false);
+ }
+ 
+ static const struct bdevsw sweet_ufs_bdevsw = {
