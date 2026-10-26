@@ -78,6 +78,7 @@ s = s.replace(a, '\t\tstatic_assert(XNU_NO_TYPE_BUILTINS || KALLOC_TYPE_IS_DATA_
 open(p, 'w').write(s)
 print('OSData.h: data-only check off without the builtins')
 PY
+	python3 /opt/host/kalloc_tolerate.py
 fi
 
 echo "== fakeroot"

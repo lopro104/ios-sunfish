@@ -33,5 +33,6 @@ COPY hackios /opt/hackios
 COPY bin /opt/host/bin
 COPY hostinc /opt/host/inc
 COPY cc_kext /opt/host/cc_kext
+COPY kalloc_tolerate.py /opt/host/kalloc_tolerate.py
 ENV PATH=/opt/host/bin:$PATH
 WORKDIR /work

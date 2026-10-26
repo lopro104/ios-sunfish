@@ -12,5 +12,5 @@ mkdir -p "$HERE/work"
 docker image inspect ios-sunfish-xnu >/dev/null 2>&1 || docker build -t ios-sunfish-xnu "$HERE"
 exec docker run --rm -e FRESH="${FRESH:-1}" -e MAKE_K="${MAKE_K:-}" -e JOBS="${JOBS:-}" \
 	-v "$HERE/work:/work:z" -v "$HERE/../../xnu/patches:/patches:ro,z" \
-	-v "$HERE/bin:/opt/host/bin2:ro,z" -v "$HERE/hostinc:/opt/host/inc:ro,z" -v "$HERE/cc_kext:/opt/host/cc_kext:ro,z" -v "$HERE/build-in-container.sh:/build.sh:ro,z" \
+	-v "$HERE/bin:/opt/host/bin2:ro,z" -v "$HERE/hostinc:/opt/host/inc:ro,z" -v "$HERE/cc_kext:/opt/host/cc_kext:ro,z" -v "$HERE/kalloc_tolerate.py:/opt/host/kalloc_tolerate.py:ro,z" -v "$HERE/build-in-container.sh:/build.sh:ro,z" \
 	ios-sunfish-xnu bash -c 'cp /opt/host/bin2/* /opt/host/bin/ && bash /build.sh'

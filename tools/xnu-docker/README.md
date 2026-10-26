@@ -28,7 +28,10 @@ clang 18, Apple's ld64/cctools (theos Linux toolchain), the macOS 14.0 SDK (Xcod
   and C++ alike (`hostinc/xnu_clang_compat.h`; a C++-only "data" answer for plain types made C and
   C++ disagree about an element's heap: "found in zone data.kalloc.128 instead of ..." panics);
   two compile-time checks (`KALLOC_TYPE_IS_COMPATIBLE_PTR`, OSData's data-only assert) are off.
-  Heap zone choice differs from the CI kernel.
+  Heap zone choice differs from the CI kernel. Code that allocates with kalloc_data and frees with
+  kfree_type(uint8_t, ...) (the oslog stream device) then names the wrong heap: `kalloc_tolerate.py`
+  lets kfree accept a data vs non-data heap disagreement (freed into its own zone, as always);
+  without it diagnosticd panicked the kernel ("found in heap data.* instead of *").
 - corecrypto's assembly macros take the branch Apple's clang takes (same instructions).
 - `cc_kext/cc_kext_stubs.c` stands in for Xcode's libclang_rt.cc_kext.a: the profile runtime's two
   buffer helpers (no PGO here) and `__cxa_atexit` (clang 18 registers C++ global destructors with
