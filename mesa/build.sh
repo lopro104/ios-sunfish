@@ -105,6 +105,7 @@ fixup "$OUT/libsunfish-gl.dylib"
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -dynamiclib \
 	-install_name /usr/lib/libsunfish-inject.dylib -framework CoreFoundation -framework IOKit -lobjc \
 	-o "$OUT/libsunfish-inject.dylib" "$G/sunfish_inject.c"
-codesign -f -s - "$OUT"/*.dylib "$OUT/gputest"
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -o "$OUT/bbd_wrap" "$G/bbd_wrap.c"
+codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
