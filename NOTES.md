@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0110: ios-topaz zap_load (their 0901, works on SM6225) rounds each segment end up to 4 KB: PIL_MEM_SETUP(13, region, 0x1000). Ours (and downstream/mainline arithmetic) passed 0x7c0. 0110 rounds up. Test with adreno_zap_fresh=1 adreno_skip=4096.
+
 ## 0109 result (logs/live-0109.txt): metadata at 0xb0000000 (below 4 GiB), init_image 0, PAS_MEM_SETUP still -3145798. So: not args, not bw vote, not order, not metadata address. adreno_trust blocked.
 
 ## 0108 result: same -3145798 with the downstream order (no step 12, no shutdown). Peer session (mainline kernel, Driver port 4.14 to 7.1): the GPU NEVER worked on mainline sunfish (a630_sqe.fw missing; the zap shader was never attempted; no KGSL port). Its lead: Linux metadata is below 4 GiB; some QTI TZ reject >4 GiB. 0109: adreno_zap_meta=0xb0000000 (free low RAM, our non-highmem base).

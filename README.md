@@ -207,6 +207,7 @@ Many names still say `sweet` (drivers, boot-args, the `SWEET` machine config). T
 | 0107 | The crypto engine's bandwidth vote (RPMh BCMs CE0, SN11, SN0, plus the DDR vote) before the zap shader's PAS calls, as mainline's qcom_scm.c does: our PAS_MEM_SETUP failed without it |
 | 0108 | Boot-arg `adreno_zap_fresh=1`: load the zap shader in the downstream kernel's order (no shutdown of an image that never ran; with `adreno_skip=4096` no step-12 init either) |
 | 0109 | Boot-arg `adreno_zap_meta=PHYS`: the zap shader's PAS metadata at a physical address below 4 GiB (all of our RAM is above; Linux's buffer is normally below) |
+| 0110 | The zap shader's `PAS_MEM_SETUP` size rounded up to a 4 KB page (0x1000, not 0x7c0), as ios-topaz's working loader does |
 
 ## Key hardware facts (sunfish)
 

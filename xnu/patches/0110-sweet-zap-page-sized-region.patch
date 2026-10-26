@@ -1,0 +1,15 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index 56b7c37..874ab78 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -2588,7 +2588,9 @@ zap_load(void)
+ 		memcpy(&segment, zap_mdt + 52 + 32 * i, sizeof(segment));
+ 		if (loadable(&segment)) {
+ 			low = MIN(low, segment.paddr);
+-			high = MAX(high, (uint64_t)segment.paddr + segment.memsz);
++			/* ending on a 4K page, as ios-topaz's zap_load (working on SM6225's TrustZone): PAS_MEM_SETUP
++			 * with the bare 0x7c0 came back -3145798 here */
++			high = MAX(high, ((uint64_t)segment.paddr + segment.memsz + 0xfff) & ~0xfffull);
+ 		}
+ 	}
+ 	if (high <= low || high - low > ZAP_MEMORY_SIZE) {
