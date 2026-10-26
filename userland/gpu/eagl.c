@@ -705,13 +705,28 @@ surface_changed(struct eagl *e, struct image *image)
 	return true;
 }
 
+/*
+ * ios-sunfish: the kernel's SweetSurface reports 0 bytes a row for the planes of the screen's 'b3a8'
+ * surfaces (5696 in all = 4544 for plane 0 + 1152 for plane 1): rows of plane elements, 64-byte aligned.
+ */
+static size_t
+plane_row(IOSurfaceRef surface, size_t plane)
+{
+	size_t row = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+
+	if (row == 0) {
+		row = (IOSurfaceGetWidthOfPlane(surface, plane) * IOSurfaceGetBytesPerElementOfPlane(surface, plane) + 63) & ~(size_t)63;
+	}
+	return row;
+}
+
 /* Fill a texture, which is bound, from its IOSurface, unless it is the surface. */
 static void
 surface_to_texture(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
-	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t row = planar ? plane_row(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
 	unsigned pixel = bytes_a_pixel(image->format, image->type);
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
@@ -822,7 +837,7 @@ target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
-	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t row = planar ? plane_row(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
 	uint8_t *base;
 
 	image->drawn = false;
@@ -887,8 +902,10 @@ target_to_surface(struct eagl *e, struct image *image)
 				}
 			}
 			memcpy(&mid, base + row * (size_t)(image->height / 2) + (size_t)(image->width / 2) * 4, 4);
-			say("redwood-gl: out %u: IOSurface %u plane %d row %zu: %zu of %zu samples not black, middle %#x, gl error %#x\n",
-			    sampled++, IOSurfaceGetID(surface), image->plane, row, lit, n, mid, glGetError());
+			say("redwood-gl: out %u: IOSurface %u plane %d row %zu (reported %zu/%zu, plane 1 at +%td): %zu of %zu samples not black, middle %#x, gl error %#x\n",
+			    sampled++, IOSurfaceGetID(surface), image->plane, row, IOSurfaceGetBytesPerRowOfPlane(surface, 0),
+			    IOSurfaceGetBytesPerRowOfPlane(surface, 1), planar ? (uint8_t *)IOSurfaceGetBaseAddressOfPlane(surface, 1) - base : 0,
+			    lit, n, mid, glGetError());
 		}
 		IOSurfaceUnlock(surface, 0, NULL);
 	}
