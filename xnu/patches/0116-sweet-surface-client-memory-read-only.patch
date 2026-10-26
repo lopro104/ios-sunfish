@@ -1,0 +1,48 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0e26c15..24b8d61 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -101,7 +101,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
++		kernelMap = memory->map(wrapped ? mapCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() + wrapDelta : 0;
+@@ -694,18 +694,29 @@ sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, ui
+ 	}
+ 	uint64_t first = trunc_page_64(address);
+ 	uint64_t length = round_page_64(address + size) - first;
++	/*
++	 * Read and write if the task may write there; else (the pictures of applications' icons are
++	 * read-only memory: prepare() failed with VMError for every 180x180 one) read-only, which is
++	 * all the GPU and the window server need of them, and mapped read-only for everybody.
++	 */
++	bool read_only = false;
+ 	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(first, length, kIODirectionInOut, task);
++	if (md != NULL && md->prepare() != kIOReturnSuccess) {
++		md->release();
++		read_only = true;
++		md = IOMemoryDescriptor::withAddressRange(first, length, kIODirectionOut, task);
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			md->release();
++			return kIOReturnVMError;
++		}
++	}
+ 	if (md == NULL) {
+ 		return kIOReturnNoMemory;
+ 	}
+-	if (md->prepare() != kIOReturnSuccess) {
+-		md->release();
+-		return kIOReturnVMError;
+-	}
+ 	s->memory = md;
+ 	s->wrapped = true;
+ 	s->wrapDelta = (uint32_t)(address - first);
+-	s->mapCache = kIOMapDefaultCache;
++	s->mapCache = kIOMapDefaultCache | (read_only ? kIOMapReadOnly : 0);
+ 	return kIOReturnSuccess;
+ }
+ 
