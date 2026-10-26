@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -56,7 +56,8 @@
+  *   adreno_delay=S     start S seconds after the root is mounted (default 40), after the GUI
+  *   adreno_keep=1      do not switch off again what the steps switched on; after all 21, the GPU
+  *                      stays on for the system (the service SweetGPU: "the GPU kept on" below)
+- *   adreno_speed=N     step 16/17: the 3D core's speed, 1 180 MHz, 2 267 MHz, 3 355 MHz (default)
++ *   adreno_speed=N     step 16/17: the 3D core's speed, 1 180 MHz, 2 267 MHz, 3 355 MHz, 4 430 MHz,
++ *                      5 565 MHz (default)
+  *   adreno_zap=0       step 19 loads no zap shader (step 12 can be skipped too: adreno_skip=0x1800)
+  *
+  * Sources (all in the repositories of this port):
+@@ -2130,7 +2131,16 @@
+  */
+ static const struct {
+ 	uint32_t khz, level;
+-} gpu_speeds[] = { { 0, 0 }, { 180000, 48 }, { 267000, 64 }, { 355000, 128 } };
++} gpu_speeds[] = {
++	/*
++	 * kHz and the 3D core's rail level (RPMh, without the +1 of the dt-bindings) as the Pixel's own
++	 * kernel pairs them (msm-4.14 gpucc-sdmmagpie.c, gpu_cc_gx_gfx3d_clk_src rate_max over
++	 * vdd_gx_corner): 180 MIN_SVS, 267 LOW_SVS, 355 SVS, 430 SVS_L1, 565 NOM. Every speed bin of
++	 * sdmmagpie-gpu.dtsi goes to 565 MHz at least (610 to 825 above it, by bin): 565 is the fastest
++	 * that holds for any chip. At 355 MHz CoreAnimation drew 20-24 frames a second.
++	 */
++	{ 0, 0 }, { 180000, 48 }, { 267000, 64 }, { 355000, 128 }, { 430000, 192 }, { 565000, 256 },
++};
+ #define GPU_SPEEDS              ((uint32_t)(sizeof(gpu_speeds) / sizeof(gpu_speeds[0])))
+ static uint32_t gpu_votes[GPU_SPEEDS], gpu_speed = GPU_SPEEDS - 1;
+ 
