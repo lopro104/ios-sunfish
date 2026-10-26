@@ -1,5 +1,11 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-10-27: Wi-Fi started (plan, nothing in the kernel yet)
+- User chose the full path. Facts: sunfish Wi-Fi = WCN3990 (ath10k snoc); its firmware (wlanmdsp.mbn) runs as a protection domain on the MODEM (MPSS), so MPSS must boot first. Android side: remoteproc q6v5_mss + tqftpserv (serves wlanmdsp.mbn) + rmtfs + pd-mapper + qrtr, then ath10k talks WLFW/QMI over QRTR (SUNFISH_PROGRESS.md 2026-10-08).
+- Local firmware (untracked, research/ is git-ignored): research/fw-local/image/modem.* (mdt + b00-b30, from ~/sunfishbackupp/part/modem_a.img, read-only mcopy), qdsp6m.qdb, research/fw-local/wlanmdsp.mbn (from ~/evox17 vendor/firmware). The MBA image (needed by q6v5_mss on SM7150) was NOT found in modem_a or evox17 vendor/firmware: find it (xbl/imagefv/other partition or the stock A-image firmware) before the MPSS step.
+- Steps: 1 find MBA; 2 SCM PAS (peripheral 4) / MBA boot of MPSS from XNU (reuse the GPU zap SCM code, patches 0089-0110); 3 SMEM + SMP2P + GLINK/QRTR in the kernel; 4 rmtfs (modemst1/2, fsg) + tqftpserv userland; 5 WLFW QMI + WCN3990 data path as an IO80211 interface so wifid sees it; MACs are in /chosen/cdt/cdb2/wlan_mac1.
+- Open question: iOS userland needs IO80211Family/apple80211 kexts-equivalent in our XNU build; decide step 5 shape after step 3.
+
 ## 2026-10-26 ~03:00: CoreAnimation GL on the Pixel (handoff)
 - launchd drops DYLD_* from a system daemon's EnvironmentVariables: backboardd never got libsunfish-inject. Fix (from ios-topaz): userland/gpu/bbd_wrap.c, installed BY HAND over SSH on the phone's root as /usr/libexec/backboardd (sets DYLD_INSERT_LIBRARIES, execs /usr/libexec/real/backboardd = the original, kept). Boot-arg sweetgl=0 skips the loader. Not yet in tools/jb-to-root.sh.
 - With it (logs/live-0111-bbdwrap.txt): "SWEET GL: /usr/lib/libsunfish-gl.dylib loaded into backboardd"; OpenGL ES 3.2 Mesa 25.0.7 FD618; shaders compile; GPU submissions complete. But every glDrawElements gave 0x506: -attachImage refused the screen surfaces, which are 'b3a8' 1125x2436, 2 planes. Commit "b3a8 screen surfaces" draws them via a texture + glReadPixels into plane 0 (mesa run 40251948375): to test, scp out/libsunfish-gl.dylib to /usr/lib and `launchctl kickstart -k system/com.apple.backboardd`.
