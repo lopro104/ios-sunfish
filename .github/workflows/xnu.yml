@@ -15,6 +15,9 @@ on:
       keep_going:
         description: make -k (collect all compile errors in one run)
         default: "true"
+      runner:
+        description: macOS runner image (macos-14 has Xcode 15; on others an Xcode 15.x is selected if the image has one)
+        default: macos-14
   push:
     branches: [main]
     paths:
@@ -22,7 +25,7 @@ on:
       - ".github/workflows/xnu.yml"
 
 concurrency:
-  group: xnu-${{ github.ref }}
+  group: xnu-${{ github.ref }}-${{ inputs.runner || 'macos-14' }}
   cancel-in-progress: true
 
 env:
@@ -36,10 +39,21 @@ jobs:
   build:
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
-    runs-on: macos-14
+    runs-on: ${{ inputs.runner || 'macos-14' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Xcode 15
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          x=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$x" ]; then sudo xcode-select -s "$x/Contents/Developer"; fi
+          xcodebuild -version
+          case "$(xcodebuild -version | head -1)" in
+            "Xcode 15"*) ;;
+            *) echo "::error::no Xcode 15 on ${{ inputs.runner || 'macos-14' }}: Xcode 16's iig does not fit xnu-8796"; exit 1 ;;
+          esac
 
       - name: Fetch build script
         run: |

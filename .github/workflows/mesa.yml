@@ -16,7 +16,8 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15: only an iOS SDK and clang are needed here (the kernel stays on macos-14, see xnu.yml)
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
