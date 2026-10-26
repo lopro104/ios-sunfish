@@ -57,6 +57,7 @@
  * every frame (see frame_end()).
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <errno.h>
 #include <IOKit/IOKitLib.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <mach/mach_time.h>
@@ -143,6 +144,12 @@ static int latency_lines;               /* boot-arg touch_lat=1: when every fram
  * others the seed did). The profiler (kern.sweetprof) found the sums 6% of backboardd's time.
  */
 static unsigned hash_every = 2;
+/*
+ * ios-sunfish: boot-arg glbig=N (with enable_skstb): the thread that draws (CoreAnimation's render server) binds itself to
+ * core N, one of the Pixel's two big A76 cores (6, 7). The kernel takes all eight cores as the same, and the profiler saw
+ * that thread on the little A55s 94% of the time.
+ */
+static int big_core = -1;
 static unsigned long long hash_runs, hash_bytes, hash_found, all_uploads;
 static uint64_t slow_calls_us;          /* boot-arg glslow=US: a line for every call that takes longer (eagl_leave()) */
 static uint64_t call_began_us;          /* (when the call in progress began) */
@@ -1054,6 +1061,20 @@ frame_end(struct eagl *e, bool finished)
 	unsigned copied = 0, in_place = 0;
 
 	clear_now(e);
+	if (big_core >= 0) {
+		static __thread int bound;
+
+		if (!bound) {
+			int cpu = big_core;
+
+			bound = 1;
+			if (sysctlbyname("kern.sched_thread_bind_cpu", NULL, NULL, &cpu, sizeof(cpu)) == 0) {
+				say("redwood-gl: the drawing thread is bound to core %d\n", cpu);
+			} else {
+				say("redwood-gl: the drawing thread could not be bound to core %d: errno %d\n", cpu, errno);
+			}
+		}
+	}
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
@@ -3781,6 +3802,9 @@ install(void)
 		census_on = strstr(arguments, "glcensus=1") != NULL;
 		frame_lines = strstr(arguments, "glframes=1") != NULL;
 		latency_lines = strstr(arguments, "touch_lat=1") != NULL;
+		if ((argument = strstr(arguments, "glbig=")) != NULL) {
+			big_core = (int)strtol(argument + 6, NULL, 10);
+		}
 		if ((argument = strstr(arguments, "glhash=")) != NULL && strtoul(argument + 7, NULL, 10) >= 1) {
 			hash_every = (unsigned)strtoul(argument + 7, NULL, 10);
 		}
