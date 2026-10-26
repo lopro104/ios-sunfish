@@ -1,0 +1,18 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index b6376db..286cf58 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2746,7 +2746,12 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 			const char *open_path = exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path);
+ 			int open_flags = psfa->psfaa_openargs.psfao_oflag;
+ 			if (open_path != psfa->psfaa_openargs.psfao_path) {
+-				open_flags = (open_flags & ~O_ACCMODE) | O_WRONLY;
++				/*
++				 * O_NOCTTY: a session leader that opens the console makes it its controlling
++				 * terminal, and when it exits the console is revoked for every holder: all the
++				 * daemons' fds 1 and 2 were "(revoked)" a minute after boot.
++				 */
++				open_flags = (open_flags & ~O_ACCMODE) | O_WRONLY | O_NOCTTY;
+ 			}
+ 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
+ 			    CAST_USER_ADDR_T(open_path), imgp->ip_vfs_context);
