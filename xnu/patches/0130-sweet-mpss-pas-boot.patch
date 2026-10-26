@@ -13,7 +13,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_mpss.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,276 @@
 +/*
 + * The modem (MPSS, a Hexagon DSP) of the SM7150, started through TrustZone. The Pixel 4a's Wi-Fi
 + * (WCN3990) has its firmware run on the modem, so nothing of Wi-Fi works until this does.
@@ -39,6 +39,7 @@ new file mode 100644
 +#include <sys/kauth.h>
 +#include <kern/thread.h>
 +#include <kern/clock.h>
++#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
 +#include <vm/vm_kern.h>
