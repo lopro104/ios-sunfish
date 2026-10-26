@@ -123,7 +123,9 @@ ENT
 # Plane layout probe for SweetSurface (userland/tools).
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -framework CoreFoundation -framework IOSurface \
 	-o "$OUT/sweet-surfplane" "$HERE/../userland/tools/sweet-surfplane.c"
-codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq" "$OUT/sweet-surfplane"
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror -framework CoreFoundation -framework IOSurface \
+	-o "$OUT/sweet-shot" "$HERE/../userland/tools/sweet-shot.c"
+codesign -f -s - "$OUT"/*.dylib "$OUT/gputest" "$OUT/bbd_wrap" "$OUT/sweet-lsq" "$OUT/sweet-surfplane" "$OUT/sweet-shot"
 codesign -f -s - --entitlements "$WORK/sweet-net.entitlements" "$OUT/sweet-net"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
