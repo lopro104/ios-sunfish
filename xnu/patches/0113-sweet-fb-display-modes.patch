@@ -1,0 +1,113 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a40915a..5e883ff 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -65,6 +65,7 @@ enum {
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBGetBlock                = 79,
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -173,6 +174,75 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * The display's modes, the way CoreAnimation reads them (TimingElements, ColorElements): one timing
++ * at 60 Hz and one colour mode, 8-bit RGB. Without them backboardd took the iPhone X's wide colour
++ * and drew the screen into 'b3a8' surfaces (10-bit + alpha plane), which the GL layer cannot draw.
++ * From HackiOS's MiniIOMobileFramebuffer.cpp publishModes(); the identifiers are what block 0x40
++ * (the current mode, selector 79) answers with.
++ */
++#define SWEET_FB_COLOR_ID       1
++#define SWEET_FB_TIMING_ID      1
++
++static void
++sweet_fb_set_number(OSDictionary *dict, const char *key, uint64_t value)
++{
++	OSNumber *n = OSNumber::withNumber(value, 32);
++	if (n != NULL) {
++		dict->setObject(key, n);
++		n->release();
++	}
++}
++
++static void
++sweet_fb_publish_modes(IOService *fb, uint32_t width, uint32_t height)
++{
++	OSDictionary *timing = OSDictionary::withCapacity(8);
++	OSDictionary *horizontal = OSDictionary::withCapacity(4);
++	OSDictionary *vertical = OSDictionary::withCapacity(4);
++	OSDictionary *color = OSDictionary::withCapacity(8);
++	OSArray *timings = OSArray::withCapacity(1);
++	OSArray *colors = OSArray::withCapacity(1);
++	const uint32_t rate = 60 << 16;                         /* 16.16 fixed point */
++
++	if (timing != NULL && horizontal != NULL && vertical != NULL && color != NULL && timings != NULL &&
++	    colors != NULL) {
++		sweet_fb_set_number(color, "ID", SWEET_FB_COLOR_ID);
++		sweet_fb_set_number(color, "PixelEncoding", 0);         /* RGB 4:4:4 */
++		sweet_fb_set_number(color, "Depth", 8);
++		sweet_fb_set_number(color, "Colorimetry", 1);
++		sweet_fb_set_number(color, "EOTF", 1);
++		sweet_fb_set_number(color, "DynamicRange", 0);
++		sweet_fb_set_number(color, "Score", 1);
++		color->setObject("IsVirtual", kOSBooleanFalse);
++		colors->setObject(color);
++		sweet_fb_set_number(horizontal, "Active", width);
++		sweet_fb_set_number(horizontal, "Total", width);
++		sweet_fb_set_number(horizontal, "SyncRate", rate);
++		sweet_fb_set_number(horizontal, "PreciseSyncRate", rate);
++		sweet_fb_set_number(vertical, "Active", height);
++		sweet_fb_set_number(vertical, "Total", height);
++		sweet_fb_set_number(vertical, "SyncRate", rate);
++		sweet_fb_set_number(vertical, "PreciseSyncRate", rate);
++		sweet_fb_set_number(timing, "ID", SWEET_FB_TIMING_ID);
++		sweet_fb_set_number(timing, "Score", 1);
++		timing->setObject("IsVirtual", kOSBooleanFalse);
++		timing->setObject("IsOverscanned", kOSBooleanFalse);
++		timing->setObject("HorizontalAttributes", horizontal);
++		timing->setObject("VerticalAttributes", vertical);
++		timing->setObject("ColorModes", colors);
++		timings->setObject(timing);
++		fb->setProperty("TimingElements", timings);
++		fb->setProperty("ColorElements", colors);
++	}
++	OSSafeReleaseNULL(timings);
++	OSSafeReleaseNULL(colors);
++	OSSafeReleaseNULL(timing);
++	OSSafeReleaseNULL(horizontal);
++	OSSafeReleaseNULL(vertical);
++	OSSafeReleaseNULL(color);
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -238,6 +308,11 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	uint32_t nomodes = 0;           /* boot-arg sweetfb_nomodes=1: as before (no modes: wide colour) */
++	PE_parse_boot_argn("sweetfb_nomodes", &nomodes, sizeof(nomodes));
++	if (!nomodes) {
++		sweet_fb_publish_modes(this, fLogicalW, fLogicalH);
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -700,6 +775,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	}
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
++		/* block 0x40, the current mode: its colour and timing identifiers (HackiOS) */
++		if (selector == kSweetFBGetBlock && args->scalarInputCount >= 1 && args->scalarInput[0] == 0x40 &&
++		    args->structureOutputSize >= 12) {
++			uint32_t ids[2] = { SWEET_FB_COLOR_ID, SWEET_FB_TIMING_ID };
++			memcpy((uint8_t *)args->structureOutput + 4, ids, sizeof(ids));
++		}
+ 	}
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
