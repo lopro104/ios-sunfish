@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0109 result (logs/live-0109.txt): metadata at 0xb0000000 (below 4 GiB), init_image 0, PAS_MEM_SETUP still -3145798. So: not args, not bw vote, not order, not metadata address. adreno_trust blocked.
+
 ## 0108 result: same -3145798 with the downstream order (no step 12, no shutdown). Peer session (mainline kernel, Driver port 4.14 to 7.1): the GPU NEVER worked on mainline sunfish (a630_sqe.fw missing; the zap shader was never attempted; no KGSL port). Its lead: Linux metadata is below 4 GiB; some QTI TZ reject >4 GiB. 0109: adreno_zap_meta=0xb0000000 (free low RAM, our non-highmem base).
 
 ## adreno_trust=1 result (logs/live-0107t.txt, 01:45-01:52): the GPU thread stops at "about to write gpu rbbm_secvid_trust_cntl at 0x503d000: 0" and never returns; iOS keeps running (ping, log). The secure world blocks that register on sunfish (as linux a6xx_gpu.c warns). So secure mode can only be left through the zap shader: 0108 test next (adreno_zap_fresh=1 adreno_skip=4096).
