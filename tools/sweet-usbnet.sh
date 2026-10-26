@@ -22,6 +22,26 @@ sudo ip addr replace 192.168.7.1/24 dev "$ifname"
 sudo ip link set "$ifname" up
 echo "$ifname up: 192.168.7.1 <-> phone 192.168.7.2; live log on udp/5140" >&2
 
+# Internet for the phone (its sweet-net job publishes 192.168.7.1 as its router, DNS 1.1.1.1):
+# forwarding and NAT out of the PC's default route. Runtime only; SWEET_NO_NAT=1 skips it.
+if [ -z "${SWEET_NO_NAT:-}" ]; then
+	uplink=$(ip route show default | awk '{print $5; exit}')
+	sudo sysctl -qw net.ipv4.ip_forward=1
+	if command -v firewall-cmd >/dev/null 2>&1 && sudo firewall-cmd -q --state 2>/dev/null; then
+		sudo firewall-cmd -q --zone=trusted --change-interface="$ifname"
+		zone=$(sudo firewall-cmd --get-zone-of-interface="$uplink" 2>/dev/null || sudo firewall-cmd --get-default-zone)
+		sudo firewall-cmd -q --zone="$zone" --add-masquerade
+	else
+		sudo iptables -t nat -C POSTROUTING -s 192.168.7.0/24 -o "$uplink" -j MASQUERADE 2>/dev/null ||
+		    sudo iptables -t nat -A POSTROUTING -s 192.168.7.0/24 -o "$uplink" -j MASQUERADE
+	fi
+	# Docker's FORWARD policy is DROP: let the phone's traffic through it.
+	sudo iptables -C FORWARD -i "$ifname" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i "$ifname" -j ACCEPT
+	sudo iptables -C FORWARD -o "$ifname" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+	    sudo iptables -I FORWARD -o "$ifname" -m state --state RELATED,ESTABLISHED -j ACCEPT
+	echo "NAT: 192.168.7.0/24 out through $uplink" >&2
+fi
+
 listen_udp() {
 	port=5140
 	if command -v python3 >/dev/null 2>&1; then
