@@ -1,8 +1,23 @@
 diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
-index 7c4df00..7de18ad 100644
+index 7c4df00..56b7c37 100644
 --- a/bsd/dev/sweet_adreno.c
 +++ b/bsd/dev/sweet_adreno.c
-@@ -1582,6 +1582,16 @@ zap_header(uint64_t *phys)
+@@ -1563,6 +1563,14 @@ step_trustzone(void)
+  * that memory while it works on it: it is not touched again, and never freed.
+  */
+ static const uint8_t *zap_mdt;
++/*
++ * boot-arg adreno_zap_meta=PHYS: the zap shader's header for PAS_INIT_IMAGE at that physical
++ * address instead of a page of the kernel's. All of this kernel's RAM is above 4 GiB (mkadt.py
++ * --highmem); Linux's metadata buffer (dma_alloc_coherent) is normally below, and some TrustZone
++ * versions accept a header above 4 GiB at init_image yet fail what follows (our PAS_MEM_SETUP:
++ * -3145798). 0xb0000000 is free low RAM: the base this kernel itself used without --highmem.
++ */
++static uint64_t zap_meta;
+ static uint64_t zap_mdt_size;
+ 
+ static bool
+@@ -1582,6 +1590,16 @@ zap_header(uint64_t *phys)
  		    zap_mdt[0], zap_mdt[1], zap_mdt[2], zap_mdt[3], segments, zap_mdt_size);
  		return false;
  	}
@@ -19,22 +34,15 @@ index 7c4df00..7de18ad 100644
  	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		return false;
  	}
-@@ -2370,6 +2380,14 @@ static uint32_t trust_wanted;
+@@ -2370,6 +2388,7 @@ static uint32_t trust_wanted;
   * step 12.)
   */
  static uint32_t zap_fresh;
-+/*
-+ * boot-arg adreno_zap_meta=PHYS: the zap shader's header for PAS_INIT_IMAGE at that physical
-+ * address instead of a page of the kernel's. All of this kernel's RAM is above 4 GiB (mkadt.py
-+ * --highmem); Linux's metadata buffer (dma_alloc_coherent) is normally below, and some TrustZone
-+ * versions accept a header above 4 GiB at init_image yet fail what follows (our PAS_MEM_SETUP:
-+ * -3145798). 0xb0000000 is free low RAM: the base this kernel itself used without --highmem.
-+ */
-+static uint64_t zap_meta;
++
  static uint32_t core_match;             /* its entry of the stream table */
  #define RING_WORDS              (CORE_RING_SIZE / 4)
  static uint32_t ring_at, ring_sent;
-@@ -3208,6 +3226,7 @@ sweet_adreno_init(void)
+@@ -3208,6 +3227,7 @@ sweet_adreno_init(void)
  	PE_parse_boot_argn("adreno_zap", &zap_wanted, sizeof(zap_wanted));
  	PE_parse_boot_argn("adreno_trust", &trust_wanted, sizeof(trust_wanted));
  	PE_parse_boot_argn("adreno_zap_fresh", &zap_fresh, sizeof(zap_fresh));
