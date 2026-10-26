@@ -1,0 +1,37 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index ff8da14..b6376db 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2737,13 +2737,28 @@ exec_handle_file_actions(struct image_params *imgp, short psa_flags)
+ 
+ 			AUDIT_SUBCALL_ENTER(OPEN, p, uthread);
+ 
++			/*
++			 * applog: /dev/console is 0622, and launchd opens a job's output O_RDWR, which only
++			 * root may do there: every other job's xpcproxy failed here and launchd respawned it
++			 * forever. The console is opened write-only (all that output needs), and should even
++			 * that fail, the job gets its /dev/null as before.
++			 */
++			const char *open_path = exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path);
++			int open_flags = psfa->psfaa_openargs.psfao_oflag;
++			if (open_path != psfa->psfaa_openargs.psfao_path) {
++				open_flags = (open_flags & ~O_ACCMODE) | O_WRONLY;
++			}
+ 			NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
+-			    CAST_USER_ADDR_T(exec_applog_path(psfa->psfaa_filedes, psfa->psfaa_openargs.psfao_path)),
+-			    imgp->ip_vfs_context);
++			    CAST_USER_ADDR_T(open_path), imgp->ip_vfs_context);
+ 
+-			error = open1(imgp->ip_vfs_context, ndp,
+-			    psfa->psfaa_openargs.psfao_oflag,
++			error = open1(imgp->ip_vfs_context, ndp, open_flags,
+ 			    vap, NULL, NULL, &origfd, AUTH_OPEN_NOAUTHFD);
++			if (error && open_path != psfa->psfaa_openargs.psfao_path) {
++				NDINIT(ndp, LOOKUP, OP_OPEN, FOLLOW | AUDITVNPATH1, UIO_SYSSPACE,
++				    CAST_USER_ADDR_T(psfa->psfaa_openargs.psfao_path), imgp->ip_vfs_context);
++				error = open1(imgp->ip_vfs_context, ndp, psfa->psfaa_openargs.psfao_oflag,
++				    vap, NULL, NULL, &origfd, AUTH_OPEN_NOAUTHFD);
++			}
+ 
+ 			kfree_type(typeof(*__open_data), __open_data);
+ 
