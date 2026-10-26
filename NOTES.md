@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## MILESTONE 2026-10-26 ~02:3x: THE PIXEL 4A GPU DRAWS FOR iOS-SIDE CODE. Kernel 0110 (CI 40248625050), shim/out/shim-0110-zap4k.img (adreno=21 adreno_keep=1 adreno_pause=0 adreno_zap_fresh=1 adreno_skip=4096), logs/live-0110.txt: PAS_MEM_SETUP(13, 0x98f95000, 0x1000) -> 0 (the 4K-rounded size was the fix, from ios-topaz), image written, AUTH_AND_RESET 0: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER; step 21 left secure mode with CP_SET_SECURE_MODE; gputest (Mesa freedreno FD618 via SweetGPU): corner 0x0000ffff, middle 0xff0000ff: THE PIXELS ARE RIGHT. Secure mode was why Mesa drew zeros. Not yet checked: whether adreno_zap_fresh/adreno_skip are still needed with the 4K size.
+
 ## 0110: ios-topaz zap_load (their 0901, works on SM6225) rounds each segment end up to 4 KB: PIL_MEM_SETUP(13, region, 0x1000). Ours (and downstream/mainline arithmetic) passed 0x7c0. 0110 rounds up. Test with adreno_zap_fresh=1 adreno_skip=4096.
 
 ## 0109 result (logs/live-0109.txt): metadata at 0xb0000000 (below 4 GiB), init_image 0, PAS_MEM_SETUP still -3145798. So: not args, not bw vote, not order, not metadata address. adreno_trust blocked.

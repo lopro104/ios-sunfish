@@ -1,6 +1,6 @@
 # GPU bring-up (Adreno 618)
 
-Status (2026-10-25): **all 21 steps pass on the Pixel 4a** (kernel 0102, `adreno=21`, firmware from
+Status (2026-10-26): **the GPU draws for programs.** With patch 0110 TrustZone loads the zap shader (the `PAS_MEM_SETUP` region must be page-sized, 0x1000, as ios-topaz passes it), the core leaves secure mode, and Mesa freedreno through `SweetGPU` draws a correct clear and triangle (`mesa/gputest`). Earlier: **all 21 steps pass on the Pixel 4a** (kernel 0102, `adreno=21`, firmware from
 the boot image): the GMU firmware runs, the 3D core takes commands and writes memory. The zap
 shader's signature is accepted, but TrustZone refuses to load it (step 19); the core runs without it.
 Before: steps 1-21 written and built, not run on a phone. The goal is
