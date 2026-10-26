@@ -1,0 +1,44 @@
+diff --git a/bsd/dev/sweet_adreno.c b/bsd/dev/sweet_adreno.c
+index 7c4df00..7de18ad 100644
+--- a/bsd/dev/sweet_adreno.c
++++ b/bsd/dev/sweet_adreno.c
+@@ -1582,6 +1582,16 @@ zap_header(uint64_t *phys)
+ 		    zap_mdt[0], zap_mdt[1], zap_mdt[2], zap_mdt[3], segments, zap_mdt_size);
+ 		return false;
+ 	}
++	if (zap_meta != 0) {
++		volatile uint8_t *low = (volatile uint8_t *)ml_io_map_wcomb(zap_meta, PAGE_SIZE);
++		for (uint64_t i = 0; i < PAGE_SIZE; i++) {
++			low[i] = i < zap_mdt_size ? zap_mdt[i] : 0;
++		}
++		__builtin_arm_dsb(0xf);
++		*phys = zap_meta;
++		printf("SWEET GPU: %u: the zap shader's header at %#llx, below 4 GiB (adreno_zap_meta)\n", step, zap_meta);
++		return true;
++	}
+ 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return false;
+ 	}
+@@ -2370,6 +2380,14 @@ static uint32_t trust_wanted;
+  * step 12.)
+  */
+ static uint32_t zap_fresh;
++/*
++ * boot-arg adreno_zap_meta=PHYS: the zap shader's header for PAS_INIT_IMAGE at that physical
++ * address instead of a page of the kernel's. All of this kernel's RAM is above 4 GiB (mkadt.py
++ * --highmem); Linux's metadata buffer (dma_alloc_coherent) is normally below, and some TrustZone
++ * versions accept a header above 4 GiB at init_image yet fail what follows (our PAS_MEM_SETUP:
++ * -3145798). 0xb0000000 is free low RAM: the base this kernel itself used without --highmem.
++ */
++static uint64_t zap_meta;
+ static uint32_t core_match;             /* its entry of the stream table */
+ #define RING_WORDS              (CORE_RING_SIZE / 4)
+ static uint32_t ring_at, ring_sent;
+@@ -3208,6 +3226,7 @@ sweet_adreno_init(void)
+ 	PE_parse_boot_argn("adreno_zap", &zap_wanted, sizeof(zap_wanted));
+ 	PE_parse_boot_argn("adreno_trust", &trust_wanted, sizeof(trust_wanted));
+ 	PE_parse_boot_argn("adreno_zap_fresh", &zap_fresh, sizeof(zap_fresh));
++	PE_parse_boot_argn("adreno_zap_meta", &zap_meta, sizeof(zap_meta));
+ 	if (last_step > STEPS) {
+ 		last_step = STEPS;
+ 	}

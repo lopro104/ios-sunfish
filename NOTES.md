@@ -1,6 +1,8 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
 
+## 0108 result: same -3145798 with the downstream order (no step 12, no shutdown). Peer session (mainline kernel, Driver port 4.14 to 7.1): the GPU NEVER worked on mainline sunfish (a630_sqe.fw missing; the zap shader was never attempted; no KGSL port). Its lead: Linux metadata is below 4 GiB; some QTI TZ reject >4 GiB. 0109: adreno_zap_meta=0xb0000000 (free low RAM, our non-highmem base).
+
 ## adreno_trust=1 result (logs/live-0107t.txt, 01:45-01:52): the GPU thread stops at "about to write gpu rbbm_secvid_trust_cntl at 0x503d000: 0" and never returns; iOS keeps running (ping, log). The secure world blocks that register on sunfish (as linux a6xx_gpu.c warns). So secure mode can only be left through the zap shader: 0108 test next (adreno_zap_fresh=1 adreno_skip=4096).
 
 ## 0108: downstream msm-4.14 (subsys-pil-tz.c pil_init_image_trusted / pil_mem_setup_trusted, peripheral-loader.c pil_boot) makes the same PAS_MEM_SETUP(13, region, max-min) call; mem_setup has no bw vote there (only init_image/auth). Difference is the sequence: downstream init_image -> mem_setup -> load -> auth once; ours step 12 init_image (dangling) then step 19 shutdown + init_image + mem_setup. 0108 adreno_zap_fresh=1 skips the shutdown; test with adreno_skip=4096 (no step 12).
