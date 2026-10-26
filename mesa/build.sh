@@ -92,6 +92,19 @@ cp -r mesa-$VERSION/include/GL mesa-$VERSION/include/KHR "$OUT/include/"
 "$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -Wall -Werror \
 	-I"$OUT/include" -o "$OUT/gputest" "$HERE/gputest.c" "$OUT/libOSMesa.8.dylib" -framework IOKit
 fixup "$OUT/gputest"
+# The OpenGL ES layer behind EAGLContext for backboardd (userland/gpu: ios-topaz's, after HackiOS)
+# and the library that loads it into backboardd (DYLD_INSERT_LIBRARIES in its launchd job).
+G=$HERE/../userland/gpu
+nm -gU "$OUT/libOSMesa.8.dylib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$WORK/exported-gl.txt"
+python3 "$G/mkeagl.py" "$G/eagl_slots.txt" mesa-$VERSION/src/mapi/glapi/registry/gl.xml "$WORK/exported-gl.txt" \
+	"$G/eagl.c" > "$WORK/eagl_gen.h"
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -dynamiclib \
+	-install_name /usr/lib/libsunfish-gl.dylib -I"$WORK" -I"$G" -framework CoreFoundation -framework IOKit \
+	-framework IOSurface -lobjc "$OUT/libOSMesa.8.dylib" -o "$OUT/libsunfish-gl.dylib" "$G/eagl.c" "$G/gl_osmesa.c"
+fixup "$OUT/libsunfish-gl.dylib"
+"$CLANG" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=$MIN -O2 -dynamiclib \
+	-install_name /usr/lib/libsunfish-inject.dylib -framework CoreFoundation -framework IOKit -lobjc \
+	-o "$OUT/libsunfish-inject.dylib" "$G/sunfish_inject.c"
 codesign -f -s - "$OUT"/*.dylib "$OUT/gputest"
 otool -L "$OUT/gputest" "$OUT"/*.dylib
 ls -l "$OUT"
