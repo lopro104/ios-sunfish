@@ -1,0 +1,116 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 43accf3..0e26c15 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -84,6 +84,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (wrapped && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,10 +101,10 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+-	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
++	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() + wrapDelta : 0;
+ }
+ 
+ static uint32_t *
+@@ -599,7 +602,7 @@ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+ 	bzero(out, SWEET_SURFACE_RESULT_SIZE);
+-	put64(out, 0x00, ref->data->getAddress());
++	put64(out, 0x00, ref->data->getAddress() + s->wrapDelta);
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+@@ -678,6 +681,34 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	return ret;
+ }
+ 
++/*
++ * Make s's pixels the memory a task has already at address (size bytes): the range is prepared
++ * (wired) for as long as the surface lives, and every task that looks the surface up maps those
++ * same pages. (ios-topaz 0132/0134.)
++ */
++static IOReturn
++sweet_surface_use_task_memory(SweetSurface *s, task_t task, uint64_t address, uint64_t size)
++{
++	if (address == 0 || size == 0 || size > SWEET_SURFACE_MAX_ALLOC) {
++		return kIOReturnBadArgument;
++	}
++	uint64_t first = trunc_page_64(address);
++	uint64_t length = round_page_64(address + size) - first;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(first, length, kIODirectionInOut, task);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	if (md->prepare() != kIOReturnSuccess) {
++		md->release();
++		return kIOReturnVMError;
++	}
++	s->memory = md;
++	s->wrapped = true;
++	s->wrapDelta = (uint32_t)(address - first);
++	s->mapCache = kIOMapDefaultCache;
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ {
+@@ -716,7 +747,30 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	/*
++	 * IOSurfaceAddress: a surface around memory the creator has already. CoreAnimation's GL
++	 * renderer makes its pictures (applications' icons, layers' contents) into surfaces so; given
++	 * fresh memory instead, every icon was a transparent square. (ios-topaz 0132/0134/0139.)
++	 */
++	OSNumber *client_address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && client_address != NULL) {
++		uint64_t used = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		for (uint32_t i = 0; i < s->planeCount; i++) {
++			if ((uint64_t)s->planes[i].offset + s->planes[i].size > used) {
++				used = (uint64_t)s->planes[i].offset + s->planes[i].size;
++			}
++		}
++		ret = sweet_surface_use_task_memory(s, fTask, client_address->unsigned64BitValue(), used);
++		/* published like any other: with id 0, releasing one unmapped the others (topaz 0139) */
++		if (ret == kIOReturnSuccess && !sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++		static uint32_t told;
++		if (told++ < 6) {
++			IOLog("SWEET SURF: create around client memory %#llx (%llu bytes) %ux%u fmt 0x%x -> 0x%x\n",
++			    client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret);
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..3e1bfa7 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,8 @@ public:
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      wrapped;      /* memory is a task's own (IOSurfaceAddress), prepared */
++	uint32_t                  wrapDelta;    /* where the pixels start in its first page */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
