@@ -1,0 +1,91 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -81,6 +81,8 @@
+ 	uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
+ };
+ 
++static struct elf32_phdr mpss_phdrs[64];
++
+ static void
+ sleep_ms(uint32_t ms)
+ {
+@@ -167,8 +169,25 @@
+ 			printf("SWEET MPSS: cannot map %#llx\n", base);
+ 			return;
+ 		}
+-		for (uint64_t b = 0; b < n; b++) {
+-			window[phys - base + b] = data != NULL ? data[b] : 0;
++		if (data != NULL) {
++			for (uint64_t b = 0; b < n; b++) {
++				window[phys - base + b] = data[b];
++			}
++		} else {
++			uint64_t rem = n;
++			uint64_t off = phys - base;
++			while ((off & 7) && rem > 0) {
++				window[off++] = 0;
++				rem--;
++			}
++			volatile uint64_t *w64 = (volatile uint64_t *)(window + off);
++			uint64_t words = rem / 8;
++			for (uint64_t w = 0; w < words; w++) {
++				w64[w] = 0;
++			}
++			for (uint64_t b = 0; b < (rem & 7); b++) {
++				window[off + words * 8 + b] = 0;
++			}
+ 		}
+ 		ml_io_unmap((vm_offset_t)window, CHUNK);
+ 		offset += n;
+@@ -243,10 +262,10 @@
+ 		return false;
+ 	}
+ 	for (uint32_t i = 0; i < segments; i++) {
+-		memcpy(&segment, mdt + 52 + 32 * i, sizeof(segment));
+-		if (loadable(&segment)) {
+-			low = MIN(low, segment.paddr);
+-			high = MAX(high, (uint64_t)segment.paddr + segment.memsz);
++		memcpy(&mpss_phdrs[i], mdt + 52 + 32 * i, sizeof(struct elf32_phdr));
++		if (loadable(&mpss_phdrs[i])) {
++			low = MIN(low, mpss_phdrs[i].paddr);
++			high = MAX(high, (uint64_t)mpss_phdrs[i].paddr + mpss_phdrs[i].memsz);
+ 		}
+ 	}
+ 	note("[%u segs %#llx..%#llx]", segments, low, high);
+@@ -278,8 +297,9 @@
+ 	/* A modem image left by an earlier boot is given up first. */
+ 	(void)scm("to give up a modem image it may hold", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_MODEM, 0, 0,
+ 	    &answer);
++	memcpy((void *)(page + 2 * PAGE_SIZE), mdt, (size_t)mdt_size);
+ 	if (scm("to take the modem's header", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_MODEM,
+-	    kvtophys(page), 0, &answer) != 0 || answer != 0) {
++	    kvtophys(page + 2 * PAGE_SIZE), 0, &answer) != 0 || answer != 0) {
+ 		printf("SWEET MPSS: TrustZone does not take the modem's header (%#llx)\n", answer);
+ 		return false;
+ 	}
+@@ -293,8 +313,12 @@
+ 		char name[24];
+ 		off_t size = 0, done = 0;
+ 
+-		memcpy(&segment, mdt + 52 + 32 * i, sizeof(segment));
+-		if (!loadable(&segment) || segment.filesz == 0) {
++		segment = mpss_phdrs[i];
++		if (!loadable(&segment)) {
++			continue;
++		}
++		if (segment.filesz == 0) {
++			mpss_write(segment.paddr - low, NULL, segment.memsz);
+ 			continue;
+ 		}
+ 		snprintf(name, sizeof(name), "modem.b%02u", i);
+@@ -315,7 +339,9 @@
+ 			mpss_write(segment.paddr - low + done, (uint8_t *)chunk, (uint64_t)n);
+ 			done += n;
+ 		}
+-		mpss_write(segment.paddr - low + segment.filesz, NULL, segment.memsz - segment.filesz);
++		if (segment.memsz > segment.filesz) {
++			mpss_write(segment.paddr - low + segment.filesz, NULL, segment.memsz - segment.filesz);
++		}
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	note("[%u segments copied, first word after %#llx]", loaded, mpss_first_word());
