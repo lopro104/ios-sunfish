@@ -639,3 +639,15 @@ Observed:
 - CE roles guess (ath10k snoc host config): CE0 htc ctrl rx, CE1 htc ctrl tx, CE2 data tx, CE3 wmi rx, CE4 htt rx.
 Next: read the msm-4.14 icnss / ath10k snoc init order (what the host writes before the HTC ready), try a test that
 writes our rings BEFORE wlan_mode, and look at the SMMU question (does a descriptor ever get written?).
+
+## 2026-10-27 WCN3990 DMA is blocked by the apps SMMU (patch 0138, wlanprobe=3 dump / =4 dump+bypass+DMA test)
+Observed (apps_smmu 0x15000000, 79 stream matchers, 61 context banks, 4K pages):
+- scr0 = 0x2f0406: USFCFG=1, so a stream with no matching entry FAULTS.
+- 6 valid SMRs (ids 0x340/0x2a0/0x2c0/0x300 mask 0xf, 0x540, 0x800 mask 0x440); none matches the WLAN stream 0x240/0x241.
+- I wrote SMR6 = 0x80010240 (id 0x240 mask 1) with S2CR TYPE=bypass (0x10000): the SMR sticks, but S2CR reads back
+  0x20000 (TYPE=fault): the hypervisor refuses bypass. The CE0 DMA test afterwards still saw no HTC ready message.
+- A version that also READ the context-bank registers (cbar page 0x1000+, context banks at 0x80000+) PANICKED
+  (kernel data abort): do not read those blind. Removed again from 0138.
+Next: give stream 0x240 a translation context (S2CR TYPE=0, CBNDX = a free context bank) with a stage-1 page table that
+identity-maps the DMA memory (like the GPU's SMMU work); first find a free context bank without touching the ones the
+hypervisor owns (S2CRs show cb0..cb3 in use). Phone left on shim-local-0144.img (default cmdline).

@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -2301,6 +2301,50 @@
+ 	}
+ }
+ 
++/*
++ * wlanprobe=3: read-only look at the apps SMMU (sm7150.dtsi: apps_smmu 0x15000000) for the WLAN stream
++ * (iommus = <&apps_smmu 0x240 0x1>): global control, and every valid stream match entry with its S2CR.
++ */
++#define APPS_SMMU       0x15000000ull
++#define APPS_SMMU_SIZE  0x10000u
++
++static void
++wlfw_smmu_dump(bool setup)
++{
++	volatile uint32_t *g = (volatile uint32_t *)ml_io_map_unmappable(APPS_SMMU, APPS_SMMU_SIZE, WIMG_IO);
++	uint32_t idr0, nsmr, valid = 0, free_smr = ~0u;
++
++	if (g == NULL) {
++		ev("WLAN SMMU: cannot map");
++		return;
++	}
++	idr0 = g[0x20 / 4];
++	nsmr = idr0 & 0xff;
++	ev("WLAN SMMU: scr0 %#x idr0 %#x idr1 %#x sgfsr %#x sgfar %#x", g[0], idr0, g[0x24 / 4], g[0x48 / 4], g[0x50 / 4]);
++	for (uint32_t i = 0; i < nsmr && i < 128; i++) {
++		uint32_t smr = g[(0x800 + 4 * i) / 4], s2cr = g[(0xc00 + 4 * i) / 4];
++
++		if (!(smr >> 31) && free_smr == ~0u) {
++			free_smr = i;
++		}
++		if (smr >> 31) {
++			valid++;
++			if (valid <= 40 || (smr & 0x7fff) == 0x240) {
++				ev("WLAN SMMU: smr%u %#x s2cr%u %#x", i, smr, i, s2cr);
++			}
++		}
++	}
++	ev("WLAN SMMU: %u stream match registers, %u valid", nsmr, valid);
++	if (setup && free_smr != ~0u) {
++		/* wlanprobe=4: stream 0x240/0x241 unmatched faults (scr0.USFCFG): give it a bypass entry (S2CR type 1) */
++		g[(0xc00 + 4 * free_smr) / 4] = 0x10000;
++		g[(0x800 + 4 * free_smr) / 4] = 0x80000000u | (0x1u << 16) | 0x240;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ev("WLAN SMMU: wrote smr%u -> reads %#x s2cr %#x, sgfsr %#x", free_smr, g[(0x800 + 4 * free_smr) / 4],
++		    g[(0xc00 + 4 * free_smr) / 4], g[0x48 / 4]);
++	}
++}
++
+ /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
+ static void
+ wlfw_probe_hw(void)
+@@ -2323,7 +2367,12 @@
+ 		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
+ 		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
+ 	}
+-	if (g_wlan_probe >= 2) {
++	if (g_wlan_probe == 2) {
++		wlfw_dma_test(regs);
++	} else if (g_wlan_probe == 3) {
++		wlfw_smmu_dump(false);
++	} else if (g_wlan_probe == 4) {
++		wlfw_smmu_dump(true);
+ 		wlfw_dma_test(regs);
+ 	}
+ }
