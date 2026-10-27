@@ -49,7 +49,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	uint32_t num_intents;
  };
  
-@@ -1405,6 +1430,756 @@
+@@ -1405,6 +1430,1226 @@
  	note("[GLINK sent v1]");
  }
  
@@ -645,10 +645,13 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +}
 +
++static void sweet_wlfw_pump(void);
++
 +static void
 +sweet_tftp_pump(void)
 +{
 +	g_pump_clock++;
++	sweet_wlfw_pump();
 +	for (unsigned i = 0; i < TFTP_XFERS; i++) {
 +		struct tftp_xfer *x = &g_tftp[i];
 +
@@ -803,10 +806,477 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	(void)tftp_send_to(qh->src_node_id, qh->src_port_id, SERVREG_LOC_PORT, out, at);
 +}
 +
++/* ---- WLFW: the QMI service of the modem's WLAN firmware, and the host's side of its start-up (ath10k qmi.c) ---- */
++
++/*
++ * Service 69 appears once the modem has booted wlanmdsp.mbn. The host then registers for indications, tells it
++ * its capabilities, gives it the memory it may use (the MSA region, handed over to the modem's and the WLAN's
++ * VMIDs through TrustZone), asks for the chip's capabilities, downloads the board data, reports calibration,
++ * sends the copy-engine configuration the host will use and finally the mode. All steps are requests with
++ * a response; the state machine goes on from each response. Message layouts: ath10k qmi_wlfw_v01.c.
++ */
++#define WLFW_SERVICE            69
++#define WLFW_CLIENT_PORT        100
++#define WLFW_MSA_ADDR           0x98d00000ull
++#define WLFW_MSA_SIZE           0x200000u
++#define WLFW_CLIENT_ID          0x4b4e454cu
++#define WLFW_BDF_PATH           "/fw/wlan/bdwlan-sunfish.bin"
++#define WLFW_BDF_MAX            32768u
++#define WLFW_CHUNK              6144u
++#define WLFW_OUT_MAX            6400u
++#define VMID_WLAN               0x18u
++#define VMID_WLAN_CE            0x19u
++
++#define WLFW_IND_REGISTER       0x20
++#define WLFW_FW_READY_IND       0x21
++#define WLFW_WLAN_MODE          0x22
++#define WLFW_WLAN_CFG           0x23
++#define WLFW_CAP                0x24
++#define WLFW_BDF_DOWNLOAD       0x25
++#define WLFW_CAL_REPORT         0x26
++#define WLFW_MSA_READY_IND      0x2b
++#define WLFW_MSA_INFO           0x2d
++#define WLFW_MSA_READY          0x2e
++#define WLFW_HOST_CAP           0x34
++
++enum { WL_IDLE, WL_IND_REG, WL_HOST_CAP, WL_MSA_INFO, WL_MSA_READY, WL_CAP, WL_BDF, WL_CAL, WL_WAIT_READY, WL_CFG, WL_MODE, WL_DONE, WL_FAILED };
++
++static struct {
++	int state;
++	bool known, msa_ind, cap_done, pending, fw_ready;
++	uint32_t node, port, out_len, bdf_len, bdf_sent, bdf_seg;
++	uint16_t txn;
++	uint8_t out[WLFW_OUT_MAX];
++} g_wlfw;
++static uint8_t g_wlfw_bdf[WLFW_BDF_MAX];
++
++static void
++qmi_put_header(uint8_t *p, uint16_t txn, uint16_t msg)
++{
++	p[0] = 0;                               /* request */
++	p[1] = (uint8_t)txn;
++	p[2] = (uint8_t)(txn >> 8);
++	p[3] = (uint8_t)msg;
++	p[4] = (uint8_t)(msg >> 8);
++	p[5] = p[6] = 0;
++}
++
++static uint32_t
++qmi_put_tlv(uint8_t *p, uint32_t at, uint8_t type, const void *value, uint32_t n)
++{
++	p[at] = type;
++	p[at + 1] = (uint8_t)n;
++	p[at + 2] = (uint8_t)(n >> 8);
++	memcpy(p + at + 3, value, n);
++	return at + 3 + n;
++}
++
++/* Give the message in g_wlfw.out (QMI header already there) its length and queue it; the pump sends it. */
++static void
++wlfw_queue(uint32_t at)
++{
++	g_wlfw.out[5] = (uint8_t)(at - 7);
++	g_wlfw.out[6] = (uint8_t)((at - 7) >> 8);
++	g_wlfw.out_len = at;
++	g_wlfw.pending = true;
++}
++
++static uint32_t
++wlfw_begin(uint16_t msg)
++{
++	qmi_put_header(g_wlfw.out, ++g_wlfw.txn, msg);
++	return 7;
++}
++
++static void
++wlfw_fail(const char *what, unsigned result, unsigned error)
++{
++	g_wlfw.state = WL_FAILED;
++	g_wlfw.pending = false;
++	printf("SWEET WLFW: %s failed (result %u, error %#x)\n", what, result, error);
++	ev("WLFW %s failed (result %u error %#x)", what, result, error);
++}
++
++/* Share a region with the modem and the WLAN (qcom_scm_assign_mem from HLOS only): ath10k_qmi_map_msa_permission(). */
++static bool
++wlfw_assign(uint64_t addr, uint64_t size, bool secure)
++{
++	vm_offset_t page = 0;
++	uint8_t *p;
++	uint64_t answer = ~0ull, phys;
++	uint32_t dest[3] = { VMID_MSS_MSA, VMID_WLAN, VMID_WLAN_CE };
++	unsigned n = secure ? 2 : 3;
++	int32_t result;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	p = (uint8_t *)page;
++	phys = kvtophys(page);
++	*(uint32_t *)(p + 0) = VMID_HLOS;
++	*(uint64_t *)(p + 64) = addr;
++	*(uint64_t *)(p + 72) = size;
++	for (unsigned i = 0; i < n; i++) {
++		*(uint32_t *)(p + 128 + 24 * i) = dest[i];
++		*(uint32_t *)(p + 132 + 24 * i) = SCM_PERM_RW;
++	}
++	*(uint64_t *)(p + 256) = 4;
++	*(uint64_t *)(p + 264) = phys + 128;
++	*(uint64_t *)(p + 272) = 24 * n;
++	*(uint64_t *)(p + 280) = 0;
++	for (int o = 0; o < 512; o += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p + o) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	scm_fifth = phys + 256;
++	result = scm("to share the WLAN memory", SCM_64 | SCM_SIP | SCM_MP_ASSIGN, SCM_ARGS_ASSIGN, phys + 64, 16, phys, &answer);
++	ev("WLFW assign_mem %#llx +%#llx (%s): %d", addr, size, secure ? "secure" : "shared", result);
++	return result == 0;
++}
++
++static void
++wlfw_send_bdf_chunk(void)
++{
++	uint8_t flag;
++	uint32_t at = wlfw_begin(WLFW_BDF_DOWNLOAD), n = MIN(WLFW_CHUNK, g_wlfw.bdf_len - g_wlfw.bdf_sent);
++	uint32_t value;
++	uint16_t len16 = (uint16_t)n;
++	uint8_t *p = g_wlfw.out;
++
++	flag = 1;
++	at = qmi_put_tlv(p, at, 0x01, &flag, 1);                // valid
++	value = 0;
++	at = qmi_put_tlv(p, at, 0x10, &value, 4);               // file_id
++	at = qmi_put_tlv(p, at, 0x11, &g_wlfw.bdf_len, 4);      // total_size
++	at = qmi_put_tlv(p, at, 0x12, &g_wlfw.bdf_seg, 4);      // seg_id
++	p[at] = 0x13;                                           // data: u16 length, bytes
++	p[at + 1] = (uint8_t)(n + 2);
++	p[at + 2] = (uint8_t)((n + 2) >> 8);
++	memcpy(p + at + 3, &len16, 2);
++	memcpy(p + at + 5, g_wlfw_bdf + g_wlfw.bdf_sent, n);
++	at += 5 + n;
++	flag = (g_wlfw.bdf_sent + n >= g_wlfw.bdf_len) ? 1 : 0;
++	at = qmi_put_tlv(p, at, 0x14, &flag, 1);                // end
++	g_wlfw.bdf_sent += n;
++	g_wlfw.bdf_seg++;
++	g_wlfw.state = WL_BDF;
++	wlfw_queue(at);
++}
++
++static void
++wlfw_next_after_cap(void)
++{
++	/* Both the capability response and the MSA ready indication are in: download the board data. */
++	uint64_t size = 0;
++	int error = tftp_file(WLFW_BDF_PATH, 0, NULL, 0, &size);
++
++	if (error == 0 && size > 0 && size <= WLFW_BDF_MAX) {
++		error = tftp_file(WLFW_BDF_PATH, 0, g_wlfw_bdf, (int)size, NULL);
++	} else {
++		error = error ? error : EFBIG;
++	}
++	if (error != 0) {
++		printf("SWEET WLFW: no board data " WLFW_BDF_PATH " (error %d)\n", error);
++		ev("WLFW no board data %s (error %d)", WLFW_BDF_PATH, error);
++		g_wlfw.state = WL_FAILED;
++		return;
++	}
++	g_wlfw.bdf_len = (uint32_t)size;
++	g_wlfw.bdf_sent = 0;
++	g_wlfw.bdf_seg = 0;
++	ev("WLFW board data: %u bytes", g_wlfw.bdf_len);
++	wlfw_send_bdf_chunk();
++}
++
++static void
++wlfw_send_cfg(void)
++{
++	static const struct { uint32_t pipe, dir, entries, bytes, flags; } ce[12] = {
++		{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
++		{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
++		{ 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
++	};
++	static const struct { uint32_t service, dir, pipe; } svc[21] = {
++		{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
++		{ 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
++		{ 0xfe00, 2, 0 }, { 0xfe00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xfe00, 2, 5 }, { 0x301, 1, 9 },
++		{ 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
++	};
++	static const struct { uint16_t ce, offset; } shadow[12] = {
++		{ 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c }, { 1, 0x40 },
++		{ 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
++	};
++	uint32_t at = wlfw_begin(WLFW_WLAN_CFG);
++	uint8_t *p = g_wlfw.out;
++
++	p[at] = 0x11;                                   /* tgt_cfg: u8 count, 12 x 20 bytes */
++	p[at + 1] = (uint8_t)(1 + 12 * 20);
++	p[at + 2] = 0;
++	p[at + 3] = 12;
++	memcpy(p + at + 4, ce, sizeof(ce));
++	at += 4 + sizeof(ce);
++	p[at] = 0x12;                                   /* svc_cfg: u8 count, 21 x 12 bytes */
++	p[at + 1] = (uint8_t)(1 + 21 * 12);
++	p[at + 2] = (uint8_t)((1 + 21 * 12) >> 8);
++	p[at + 3] = 21;
++	memcpy(p + at + 4, svc, sizeof(svc));
++	at += 4 + sizeof(svc);
++	p[at] = 0x13;                                   /* shadow_reg: u8 count, 12 x 4 bytes */
++	p[at + 1] = (uint8_t)(1 + 12 * 4);
++	p[at + 2] = 0;
++	p[at + 3] = 12;
++	memcpy(p + at + 4, shadow, sizeof(shadow));
++	at += 4 + sizeof(shadow);
++	g_wlfw.state = WL_CFG;
++	wlfw_queue(at);
++}
++
++static void
++wlfw_send_mode(void)
++{
++	uint32_t at = wlfw_begin(WLFW_WLAN_MODE), mode = 0;     /* QMI_WLFW_MISSION_V01 */
++	uint8_t hw_debug = 0;
++
++	at = qmi_put_tlv(g_wlfw.out, at, 0x01, &mode, 4);
++	at = qmi_put_tlv(g_wlfw.out, at, 0x10, &hw_debug, 1);
++	g_wlfw.state = WL_MODE;
++	wlfw_queue(at);
++}
++
++static void
++wlfw_handle_response(uint16_t msg, const uint8_t *p, uint32_t len, unsigned result, unsigned error)
++{
++	uint32_t at = 7;
++
++	if (result != 0 && !(msg == WLFW_HOST_CAP)) {
++		wlfw_fail("request", result, error);
++		ev("WLFW request %#x was refused", msg);
++		return;
++	}
++	switch (g_wlfw.state) {
++	case WL_IND_REG: {
++		uint32_t a = wlfw_begin(WLFW_HOST_CAP);
++		uint32_t daemon = 0;
++
++		a = qmi_put_tlv(g_wlfw.out, a, 0x10, &daemon, 4);
++		g_wlfw.state = WL_HOST_CAP;
++		wlfw_queue(a);
++		break;
++	}
++	case WL_HOST_CAP: {
++		uint32_t a = wlfw_begin(WLFW_MSA_INFO);
++		uint64_t addr = WLFW_MSA_ADDR;
++		uint32_t size = WLFW_MSA_SIZE;
++
++		a = qmi_put_tlv(g_wlfw.out, a, 0x01, &addr, 8);
++		a = qmi_put_tlv(g_wlfw.out, a, 0x02, &size, 4);
++		g_wlfw.state = WL_MSA_INFO;
++		wlfw_queue(a);
++		break;
++	}
++	case WL_MSA_INFO: {
++		/* TLV 3: u8 count, then (u64 address, u32 size, u8 secure_flag) each */
++		uint32_t a;
++
++		while (at + 3 <= len) {
++			uint8_t type = p[at];
++			uint16_t tlen = (uint16_t)(p[at + 1] | p[at + 2] << 8);
++
++			if (at + 3 + tlen > len) {
++				break;
++			}
++			if (type == 3 && tlen >= 1) {
++				unsigned count = p[at + 3];
++
++				for (unsigned i = 0; i < count && 1 + 13 * (i + 1) <= tlen; i++) {
++					const uint8_t *r = p + at + 4 + 13 * i;
++					uint64_t addr, size;
++
++					memcpy(&addr, r, 8);
++					size = (uint64_t)(r[8] | r[9] << 8 | r[10] << 16 | (uint32_t)r[11] << 24);
++					ev("WLFW MSA region %u: %#llx +%#llx secure %u", i, addr, size, r[12]);
++					if (addr < WLFW_MSA_ADDR || addr + size > WLFW_MSA_ADDR + WLFW_MSA_SIZE || !wlfw_assign(addr, size, r[12] != 0)) {
++						wlfw_fail("MSA assign", 0, i);
++						return;
++					}
++				}
++			}
++			at += 3 + tlen;
++		}
++		sleep_ms(20);                           /* ath10k: the XPU update needs a moment */
++		a = wlfw_begin(WLFW_MSA_READY);
++		g_wlfw.state = WL_MSA_READY;
++		wlfw_queue(a);
++		break;
++	}
++	case WL_MSA_READY: {
++		uint32_t a = wlfw_begin(WLFW_CAP);
++
++		g_wlfw.state = WL_CAP;
++		wlfw_queue(a);
++		break;
++	}
++	case WL_CAP:
++		while (at + 3 <= len) {
++			uint8_t type = p[at];
++			uint16_t tlen = (uint16_t)(p[at + 1] | p[at + 2] << 8);
++
++			if (at + 3 + tlen > len) {
++				break;
++			}
++			if (type == 0x10 && tlen >= 8) {
++				ev("WLFW chip id %#x family %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24),
++				    (uint32_t)(p[at + 7] | p[at + 8] << 8 | p[at + 9] << 16 | (uint32_t)p[at + 10] << 24));
++			} else if (type == 0x11 && tlen >= 4) {
++				ev("WLFW board id %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24));
++			} else if (type == 0x12 && tlen >= 4) {
++				ev("WLFW soc id %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24));
++			} else if (type == 0x13 && tlen >= 5) {
++				ev("WLFW fw version %#x", (uint32_t)(p[at + 3] | p[at + 4] << 8 | p[at + 5] << 16 | (uint32_t)p[at + 6] << 24));
++			}
++			at += 3 + tlen;
++		}
++		g_wlfw.cap_done = true;
++		if (g_wlfw.msa_ind) {
++			wlfw_next_after_cap();
++		}
++		break;
++	case WL_BDF:
++		if (g_wlfw.bdf_sent < g_wlfw.bdf_len) {
++			wlfw_send_bdf_chunk();
++		} else {
++			uint32_t a = wlfw_begin(WLFW_CAL_REPORT);
++			uint8_t none = 0;
++
++			a = qmi_put_tlv(g_wlfw.out, a, 0x01, &none, 1);         /* meta_data_len 0 */
++			g_wlfw.state = WL_CAL;
++			wlfw_queue(a);
++		}
++		break;
++	case WL_CAL:
++		/* The configuration and the mode are sent when the firmware says it is ready (ath10k: at hif power up). */
++		g_wlfw.state = WL_WAIT_READY;
++		if (g_wlfw.fw_ready) {
++			wlfw_send_cfg();
++		}
++		break;
++	case WL_CFG:
++		wlfw_send_mode();
++		break;
++	case WL_MODE:
++		g_wlfw.state = WL_DONE;
++		ev("WLFW configured: waiting for the firmware to say it is ready");
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++sweet_wlfw_handle(struct sweet_glink_channel *ch, const struct qrtr_hdr_v1 *qh, const uint8_t *p, uint32_t len)
++{
++	uint16_t msg;
++	unsigned result = 0, error = 0;
++
++	(void)qh;
++	g_tftp_ch = ch;
++	if (len < 7) {
++		return;
++	}
++	msg = (uint16_t)(p[3] | p[4] << 8);
++	if (p[0] == 4) {                                        /* indication */
++		ev("WLFW indication %#x", msg);
++		if (msg == WLFW_MSA_READY_IND) {
++			g_wlfw.msa_ind = true;
++			if (g_wlfw.cap_done && g_wlfw.state == WL_CAP) {
++				wlfw_next_after_cap();
++			}
++		} else if (msg == WLFW_FW_READY_IND) {
++			printf("SWEET WLFW: THE WLAN FIRMWARE IS READY\n");
++			ev("WLFW FIRMWARE READY");
++			note("[WLFW READY]");
++			g_wlfw.fw_ready = true;
++			if (g_wlfw.state == WL_WAIT_READY) {
++				wlfw_send_cfg();
++			}
++		}
++		return;
++	}
++	if (p[0] != 2) {
++		return;
++	}
++	for (uint32_t at = 7; at + 3 <= len;) {
++		uint16_t tlen = (uint16_t)(p[at + 1] | p[at + 2] << 8);
++
++		if (at + 3 + tlen > len) {
++			break;
++		}
++		if (p[at] == 2 && tlen >= 4) {
++			result = (unsigned)(p[at + 3] | p[at + 4] << 8);
++			error = (unsigned)(p[at + 5] | p[at + 6] << 8);
++		}
++		at += 3 + tlen;
++	}
++	ev("WLFW response %#x: result %u error %#x (state %d)", msg, result, error, g_wlfw.state);
++	wlfw_handle_response(msg, p, len, result, error);
++}
++
++/* The service has appeared (QRTR NEW_SERVER): start the sequence. */
++static void
++sweet_wlfw_server(struct sweet_glink_channel *ch, uint32_t node, uint32_t port)
++{
++	uint32_t at;
++	uint8_t one = 1;
++	uint32_t client = WLFW_CLIENT_ID;
++
++	if (g_wlfw.state != WL_IDLE) {
++		return;
++	}
++	g_tftp_ch = ch;
++	g_wlfw.known = true;
++	g_wlfw.node = node;
++	g_wlfw.port = port;
++	at = wlfw_begin(WLFW_IND_REGISTER);
++	at = qmi_put_tlv(g_wlfw.out, at, 0x10, &one, 1);        /* fw_ready_enable */
++	at = qmi_put_tlv(g_wlfw.out, at, 0x13, &one, 1);        /* msa_ready_enable */
++	at = qmi_put_tlv(g_wlfw.out, at, 0x15, &client, 4);     /* client_id */
++	g_wlfw.state = WL_IND_REG;
++	ev("WLFW service %u at %u:%u: registering", WLFW_SERVICE, node, port);
++	wlfw_queue(at);
++}
++
++static void
++sweet_wlfw_pump(void)
++{
++	if (!g_wlfw.pending || g_tftp_ch == NULL) {
++		return;
++	}
++	if (tftp_send_to(g_wlfw.node, g_wlfw.port, WLFW_CLIENT_PORT, g_wlfw.out, g_wlfw.out_len)) {
++		g_wlfw.pending = false;
++		return;
++	}
++	if (g_send_failure == 1) {
++		uint32_t need = g_wlfw.out_len + 28, have = 0;
++
++		for (uint32_t i = 0; i < g_tftp_ch->num_intents; i++) {
++			if (!g_tftp_ch->intents[i].in_use && g_tftp_ch->intents[i].size >= need) {
++				have++;
++			}
++		}
++		if (have == 0 && g_pump_clock - g_last_req_clock > 8) {
++			struct glink_msg req = { .cmd = GLINK_CMD_RX_INTENT_REQ, .param1 = g_tftp_ch->lcid, .param2 = need };
++
++			sweet_glink_tx_cmd(&g_glink, &req, sizeof(req));
++			g_last_req_clock = g_pump_clock;
++			g_big_pending = 1;
++		}
++	}
++}
++
  static void
  sweet_glink_poll(void)
  {
-@@ -1525,7 +2300,14 @@
+@@ -1525,7 +2770,14 @@
  				} pair;
  				uint32_t pair_off = (rx_tail + (uint32_t)sizeof(msg) + i * 8) % g_glink.rx_size;
  				sweet_glink_rx_peek(&g_glink, pair_off, &pair, sizeof(pair));
@@ -822,7 +1292,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					ch->intents[ch->num_intents].size = pair.size;
  					ch->intents[ch->num_intents].iid = pair.iid;
  					ch->intents[ch->num_intents].in_use = false;
-@@ -1537,15 +2319,21 @@
+@@ -1537,15 +2789,21 @@
  		}
  		case GLINK_CMD_RX_DONE:
  		case GLINK_CMD_RX_DONE_W_REUSE: {
@@ -848,7 +1318,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  				}
  			}
  			sweet_glink_rx_advance(&g_glink, sizeof(msg));
-@@ -1559,7 +2347,9 @@
+@@ -1559,7 +2817,9 @@
  			uint32_t data_pkt_sz = (sizeof(tdata) + tdata.chunk_size + 7) & ~7;
  			if (avail < data_pkt_sz) return;
  
@@ -859,7 +1329,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  			uint32_t data_off = (rx_tail + (uint32_t)sizeof(tdata)) % g_glink.rx_size;
  			sweet_glink_rx_peek(&g_glink, data_off, payload, MIN(tdata.chunk_size, sizeof(payload)));
  
-@@ -1613,7 +2403,7 @@
+@@ -1613,7 +2873,7 @@
  
  					/* Announce local services */
  					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 14, 1, 14);     /* RMTFS */
@@ -868,17 +1338,22 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 4096, 1, 4096); /* TFTP */
  				} else if (qtype == QRTR_TYPE_NEW_SERVER) {
  					struct qrtr_ctrl_pkt *cp = (struct qrtr_ctrl_pkt *)(payload + sizeof(*qhdr));
-@@ -1621,9 +2411,17 @@
+@@ -1621,9 +2881,22 @@
  					    cp->server.service, cp->server.instance, cp->server.node, cp->server.port);
  					note("[QRTR svc %u inst %#x port %u]",
  					    cp->server.service, cp->server.instance, cp->server.port);
 +					ev("QRTR new server %u inst %#x port %u", cp->server.service, cp->server.instance, cp->server.port);
++					if (cp->server.service == WLFW_SERVICE) {
++						sweet_wlfw_server(ch, cp->server.node, cp->server.port);
++					}
  				} else if (qtype == QRTR_TYPE_DATA) {
 +					if (qhdr->confirm_rx) {
 +						sweet_qrtr_resume_tx(ch, qhdr);
 +					}
  					if (qhdr->dst_port_id == RMTFS_PORT) {
  						sweet_rmtfs_handle_qmi(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
++					} else if (qhdr->dst_port_id == WLFW_CLIENT_PORT) {
++						sweet_wlfw_handle(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
 +					} else if (qhdr->dst_port_id == SERVREG_LOC_PORT) {
 +						sweet_servreg_loc_handle(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
 +					} else if (qhdr->dst_port_id >= TFTP_PORT && qhdr->dst_port_id <= TFTP_PORT + TFTP_XFERS) {
@@ -886,7 +1361,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					} else {
  						printf("SWEET QRTR DATA: p%u -> p%u sz %u\n",
  						    qhdr->src_port_id, qhdr->dst_port_id, qhdr->size);
-@@ -1634,6 +2432,36 @@
+@@ -1634,6 +2907,36 @@
  			}
  			break;
  		}
@@ -923,7 +1398,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		case GLINK_CMD_SIGNALS: {
  			printf("SWEET GLINK RX: SIGNALS rcid %u sigs %#x\n", msg.param1, msg.param2);
  			sweet_glink_rx_advance(&g_glink, sizeof(msg));
-@@ -1750,7 +2578,14 @@
+@@ -1750,7 +3053,14 @@
  
  			/* Fast poll loop: 50 ms ticks = 20 Hz */
  			for (int tick = 1; tick <= 12000; tick++) {
@@ -939,7 +1414,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  
  				/* 1. Outbound SMP2P setup */
  				if (tick <= 100 || tick % 200 == 0) {
-@@ -1831,6 +2666,16 @@
+@@ -1831,6 +3141,16 @@
  SYSCTL_PROC(_kern, OID_AUTO, sweet_mpss, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
      sysctl_mpss_report, "A", "MPSS boot and SMEM report");
  
