@@ -1,0 +1,474 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -28,6 +28,7 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -62,7 +63,7 @@
+ #define MDT_TYPE_HASH           (2u << 24)
+ 
+ /* What happened, repeated in the "alive" lines: the live log starts after this thread has begun. */
+-static char report[400];
++static char report[2048];
+ static size_t report_length;
+ 
+ static void
+@@ -354,20 +355,447 @@
+ 	return true;
+ }
+ 
++
++#define SMEM_MEMORY             0x86000000ull
++#define SMEM_SIZE               0x200000u
++
++struct smem_proc_comm {
++	uint32_t command, status, params[2];
++};
++
++struct smem_global_entry {
++	uint32_t allocated, offset, size, aux_base;
++};
++
++struct smem_header {
++	struct smem_proc_comm proc_comm[4];
++	uint32_t version[32];
++	uint32_t initialized;
++	uint32_t free_offset;
++	uint32_t available;
++	uint32_t reserved;
++	struct smem_global_entry toc[512];
++};
++
++struct smem_ptable_entry {
++	uint32_t offset;
++	uint32_t size;
++	uint32_t flags;
++	uint16_t host0;
++	uint16_t host1;
++	uint32_t cacheline;
++	uint32_t reserved[7];
++};
++
++struct smem_ptable {
++	uint8_t magic[4]; /* "$TOC" */
++	uint32_t version;
++	uint32_t num_entries;
++	uint32_t reserved[5];
++	struct smem_ptable_entry entry[];
++};
++
++struct smem_partition_header {
++	uint8_t magic[4]; /* "$PRT" */
++	uint16_t host0;
++	uint16_t host1;
++	uint32_t size;
++	uint32_t offset_free_uncached;
++	uint32_t offset_free_cached;
++	uint32_t reserved[3];
++};
++
++struct smem_private_entry {
++	uint16_t canary; /* 0xa5a5 */
++	uint16_t item;
++	uint32_t size;
++	uint16_t padding_data;
++	uint16_t padding_hdr;
++	uint32_t reserved;
++};
++
++struct smp2p_smem_item {
++	uint32_t magic; /* 0x504d5324 "$SMP" */
++	uint8_t version;
++	uint32_t features : 24;
++	uint16_t local_pid;
++	uint16_t remote_pid;
++	uint16_t total_entries;
++	uint16_t valid_entries;
++	uint32_t flags;
++	struct {
++		uint8_t name[16];
++		uint32_t value;
++	} entries[16];
++} __attribute__((packed));
++
++
++static void
++sweet_smp2p_setup_outbound(struct smem_partition_header *phdr, uint64_t part_phys, uint64_t part_base, uint64_t map_sz)
++{
++	uint32_t cur = sizeof(*phdr);
++	struct smem_private_entry *existing = NULL;
++	while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
++	       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
++		struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
++		if (e->canary != 0xa5a5) break;
++		if (e->item == 428) {
++			existing = e;
++			break;
++		}
++		cur += sizeof(*e) + e->padding_hdr + e->size;
++	}
++
++	struct smp2p_smem_item *out = NULL;
++
++	if (!existing) {
++		uint32_t alloc_off = phdr->offset_free_uncached;
++		size_t item_sz = sizeof(struct smp2p_smem_item);
++		size_t aligned_sz = (item_sz + 7) & ~7;
++		size_t total_alloc = sizeof(struct smem_private_entry) + aligned_sz;
++
++		if ((part_phys - part_base) + alloc_off + total_alloc <= map_sz) {
++			struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + alloc_off);
++			e->canary = 0xa5a5;
++			e->item = 428;
++			e->size = (uint32_t)aligned_sz;
++			e->padding_data = (uint16_t)(aligned_sz - item_sz);
++			e->padding_hdr = 0;
++			e->reserved = 0;
++
++			out = (struct smp2p_smem_item *)(e + 1);
++			memset((void *)out, 0, aligned_sz);
++			out->magic = 0x504d5324; /* "$SMP" */
++			out->local_pid = 0;      /* APPS */
++			out->remote_pid = 1;     /* MODEM */
++			out->total_entries = 16;
++			out->valid_entries = 2;
++			out->features = 1;       /* SMP2P_FEATURE_SSR_ACK */
++			memcpy(out->entries[0].name, "master-kernel", 14);
++			out->entries[0].value = 0;
++			memcpy(out->entries[1].name, "ipa", 4);
++			out->entries[1].value = 0;
++
++			__asm__ volatile ("dsb sy" ::: "memory");
++			out->version = 1;
++			__asm__ volatile ("dsb sy" ::: "memory");
++
++			phdr->offset_free_uncached += (uint32_t)total_alloc;
++			__asm__ volatile ("dsb sy" ::: "memory");
++
++			printf("SWEET SMP2P: allocated outbound item 428 at off %#x\n", alloc_off);
++			note("[alloc 428 @ %#x]", alloc_off);
++		}
++	} else {
++		uint32_t off = (uint8_t *)existing - (uint8_t *)phdr + sizeof(*existing) + existing->padding_hdr;
++		out = (struct smp2p_smem_item *)((uint8_t *)phdr + off);
++	}
++
++	if (out) {
++		out->version = 1;
++		out->features = 1;
++		out->valid_entries = 2;
++		memcpy(out->entries[0].name, "master-kernel", 14);
++		memcpy(out->entries[1].name, "ipa", 4);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++
++	/* Kick modem via APCS: 1 << 14 at 0x17c0000c */
++	volatile uint32_t *apcs = (volatile uint32_t *)ml_io_map_unmappable(0x17c00000, PAGE_SIZE, WIMG_WCOMB);
++	if (apcs) {
++		apcs[3] = (1u << 14);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap((vm_offset_t)apcs, PAGE_SIZE);
++		printf("SWEET SMP2P: kicked modem via APCS bit 14\n");
++	}
++}
++
++static void
++sweet_mpss_status(char *buf, size_t buflen)
++{
++	size_t len = 0;
++	#define BPRINTF(...) do { \
++		if (len < buflen) { \
++			len += (size_t)snprintf(buf + len, buflen - len, __VA_ARGS__); \
++		} \
++	} while (0)
++
++	BPRINTF("SWEET MPSS: %s\n", report);
++
++	volatile uint8_t *pt_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY + SMEM_SIZE - PAGE_SIZE, PAGE_SIZE, WIMG_WCOMB);
++	if (!pt_win) {
++		BPRINTF("cannot map ptable\n");
++		return;
++	}
++	struct smem_ptable *ptable = (struct smem_ptable *)(pt_win + (PAGE_SIZE - 4096));
++	if (memcmp(ptable->magic, "$TOC", 4) != 0) {
++		BPRINTF("bad ptable magic\n");
++		ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++		return;
++	}
++
++	uint32_t num = ptable->num_entries;
++	struct smem_ptable_entry p7 = {0};
++	bool found_p7 = false;
++	for (uint32_t i = 0; i < num; i++) {
++		if (ptable->entry[i].size == 0) continue;
++		if (ptable->entry[i].host0 == 0 && ptable->entry[i].host1 == 1) {
++			p7 = ptable->entry[i];
++			found_p7 = true;
++			break;
++		}
++	}
++	ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++
++	if (!found_p7) {
++		BPRINTF("no part 0:1 found\n");
++		return;
++	}
++
++	uint64_t part_phys = SMEM_MEMORY + p7.offset;
++	uint64_t part_base = part_phys & ~(uint64_t)PAGE_MASK;
++	uint64_t map_sz = (part_phys - part_base + p7.size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++	map_sz = MIN(map_sz, (uint64_t)CHUNK);
++
++	volatile uint8_t *part_win = (volatile uint8_t *)ml_io_map_unmappable(part_base, map_sz, WIMG_WCOMB);
++	if (!part_win) {
++		BPRINTF("cannot map part 0:1\n");
++		return;
++	}
++
++	struct smem_partition_header *phdr = (struct smem_partition_header *)(part_win + (part_phys - part_base));
++	BPRINTF("Part 0:1 ($PRT) free_uncached: %#x / size %#x\n", phdr->offset_free_uncached, phdr->size);
++
++	uint32_t cur = sizeof(*phdr);
++	while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
++	       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
++		struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
++		if (e->canary != 0xa5a5) break;
++		BPRINTF("  Item %u: size %u\n", e->item, e->size);
++		uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
++		if (e->item == 435 && (part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
++			struct smp2p_smem_item *s = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
++			BPRINTF("    [435 INBOUND] magic %#x ver %u pids %u->%u valid %u/%u flags %#x\n",
++			    s->magic, s->version, s->local_pid, s->remote_pid, s->valid_entries, s->total_entries, s->flags);
++			for (uint32_t v = 0; v < 16; v++) {
++				char name[17] = {0};
++				memcpy(name, s->entries[v].name, 16);
++				if (name[0] || s->entries[v].value || v < s->valid_entries) {
++					BPRINTF("      entry %u: '%s' = %#x%s\n", v, name, s->entries[v].value,
++					    v < s->valid_entries ? " [VALID]" : "");
++				}
++			}
++		}
++		if (e->item == 428 && (part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
++			struct smp2p_smem_item *s = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
++			BPRINTF("    [428 OUTBOUND] magic %#x ver %u pids %u->%u valid %u/%u flags %#x\n",
++			    s->magic, s->version, s->local_pid, s->remote_pid, s->valid_entries, s->total_entries, s->flags);
++			for (uint32_t v = 0; v < s->valid_entries && v < 16; v++) {
++				char name[17] = {0};
++				memcpy(name, s->entries[v].name, 16);
++				BPRINTF("      entry %u: '%s' = %#x\n", v, name, s->entries[v].value);
++			}
++		}
++		cur += sizeof(*e) + e->padding_hdr + e->size;
++	}
++
++	ml_io_unmap((vm_offset_t)part_win, map_sz);
++	#undef BPRINTF
++}
++
++static void
++sweet_smem_poll(int sec)
++{
++	/* Map first 16K of SMEM (header) */
++	volatile uint8_t *hdr_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY, PAGE_SIZE, WIMG_WCOMB);
++	if (hdr_win) {
++		struct smem_header *hdr = (struct smem_header *)hdr_win;
++		if (sec == 1) {
++			printf("SWEET SMEM: header init %u, SBL ver %#x, free %#x, avail %#x\n",
++			    hdr->initialized, hdr->version[7], hdr->free_offset, hdr->available);
++			note("[smem init %u SBL %#x]", hdr->initialized, hdr->version[7]);
++		}
++		ml_io_unmap((vm_offset_t)hdr_win, PAGE_SIZE);
++	}
++
++	/* Map last 16K of SMEM (ptable is in the last 4K, offset 0x3000 within the 16K page) */
++	volatile uint8_t *pt_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY + SMEM_SIZE - PAGE_SIZE, PAGE_SIZE, WIMG_WCOMB);
++	if (!pt_win) {
++		if (sec == 1) {
++			printf("SWEET SMEM: cannot map ptable\n");
++			note("[cannot map ptable]");
++		}
++		return;
++	}
++
++	struct smem_ptable *ptable = NULL;
++	if (memcmp((const void *)(pt_win + (PAGE_SIZE - 4096)), "$TOC", 4) == 0) {
++		ptable = (struct smem_ptable *)(pt_win + (PAGE_SIZE - 4096));
++	} else if (memcmp((const void *)pt_win, "$TOC", 4) == 0) {
++		ptable = (struct smem_ptable *)pt_win;
++	} else {
++		for (uint32_t off = 0; off + sizeof(struct smem_ptable) <= PAGE_SIZE; off += 4) {
++			if (memcmp((const void *)(pt_win + off), "$TOC", 4) == 0) {
++				ptable = (struct smem_ptable *)(pt_win + off);
++				if (sec == 1) {
++					printf("SWEET SMEM: found $TOC at offset %#x\n", off);
++					note("[$TOC @ %#x]", off);
++				}
++				break;
++			}
++		}
++	}
++
++	if (!ptable) {
++		if (sec == 1 || sec % 30 == 0) {
++			printf("SWEET SMEM: bad ptable magic (at +0x3000: %02x%02x%02x%02x, +0: %02x%02x%02x%02x)\n",
++			    pt_win[PAGE_SIZE - 4096], pt_win[PAGE_SIZE - 4095], pt_win[PAGE_SIZE - 4094], pt_win[PAGE_SIZE - 4093],
++			    pt_win[0], pt_win[1], pt_win[2], pt_win[3]);
++			note("[no $TOC: +3k %02x%02x%02x%02x]",
++			    pt_win[PAGE_SIZE - 4096], pt_win[PAGE_SIZE - 4095], pt_win[PAGE_SIZE - 4094], pt_win[PAGE_SIZE - 4093]);
++		}
++		ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++		return;
++	}
++
++	uint32_t num = ptable->num_entries;
++	if (sec == 1) {
++		printf("SWEET SMEM: $TOC ver %u, %u entries\n", ptable->version, num);
++		note("[$TOC v%u %u parts]", ptable->version, num);
++	}
++
++	struct smem_ptable_entry local_entries[32];
++	uint32_t count = MIN(num, 32);
++	for (uint32_t i = 0; i < count; i++) {
++		local_entries[i] = ptable->entry[i];
++	}
++	ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++
++	for (uint32_t i = 0; i < count; i++) {
++		struct smem_ptable_entry *pe = &local_entries[i];
++		if (pe->size == 0) continue;
++
++		if (sec == 1) {
++			printf("SWEET SMEM: part %u: hosts %u:%u, off %#x, size %#x\n",
++			    i, pe->host0, pe->host1, pe->offset, pe->size);
++		}
++
++		/* Check APPS <-> MODEM partition (host0=0, host1=1 or host0=1, host1=0) or GLOBAL (0xfffe) */
++		if ((pe->host0 == 0 && pe->host1 == 1) || (pe->host0 == 1 && pe->host1 == 0) ||
++		    (pe->host0 == 0xfffe && pe->host1 == 0xfffe)) {
++			uint64_t part_phys = SMEM_MEMORY + pe->offset;
++			uint64_t part_base = part_phys & ~(uint64_t)PAGE_MASK;
++			uint64_t map_sz = (part_phys - part_base + pe->size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++			map_sz = MIN(map_sz, (uint64_t)CHUNK);
++
++			volatile uint8_t *part_win = (volatile uint8_t *)ml_io_map_unmappable(part_base, map_sz, WIMG_WCOMB);
++			if (part_win) {
++				struct smem_partition_header *phdr = (struct smem_partition_header *)(part_win + (part_phys - part_base));
++				if (memcmp(phdr->magic, "$PRT", 4) == 0) {
++					/* On APPS <-> MODEM partition, allocate item 428 and kick */
++					if ((pe->host0 == 0 && pe->host1 == 1) || (pe->host0 == 1 && pe->host1 == 0)) {
++						if (sec <= 5 || sec % 10 == 0) {
++							sweet_smp2p_setup_outbound(phdr, part_phys, part_base, map_sz);
++						}
++					}
++
++					uint32_t cur = sizeof(*phdr);
++					while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
++					       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
++						struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
++						if (e->canary != 0xa5a5) {
++							break;
++						}
++						if (sec == 1) {
++							printf("SWEET SMEM: part %u item %u size %u\n", i, e->item, e->size);
++						}
++						if (e->item == 435) { /* SMP2P modem -> apps */
++							uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
++							if ((part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
++								struct smp2p_smem_item *smp = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
++								static uint16_t last_smp_valid = 0xffff;
++								if (sec == 1 || smp->valid_entries != last_smp_valid || sec % 10 == 0) {
++									printf("SWEET SMP2P 435: mag %#x, ver %u, %u->%u, valid %u/%u, flags %#x\n",
++									    smp->magic, smp->version, smp->local_pid, smp->remote_pid,
++									    smp->valid_entries, smp->total_entries, smp->flags);
++									if (sec == 1 || smp->valid_entries != last_smp_valid) {
++										note("[smp435: %u->%u v%u valid %u/%u]",
++										    smp->local_pid, smp->remote_pid, smp->version, smp->valid_entries, smp->total_entries);
++									}
++									last_smp_valid = smp->valid_entries;
++								}
++								for (uint32_t v = 0; v < 16; v++) {
++									char ename[17] = {0};
++									memcpy(ename, smp->entries[v].name, 16);
++									static uint32_t last_vals[16];
++									if (sec == 1 || smp->entries[v].value != last_vals[v] || (v < smp->valid_entries && sec % 30 == 0)) {
++										if (ename[0] || smp->entries[v].value || v < smp->valid_entries) {
++											printf("SWEET SMP2P: entry %u '%s' = %#x (valid %u)\n",
++											    v, ename, smp->entries[v].value, v < smp->valid_entries);
++											last_vals[v] = smp->entries[v].value;
++											note("[SMP2P '%s'=%#x]", ename, smp->entries[v].value);
++										}
++									}
++								}
++							}
++						} else if (e->item == 421) { /* Crash reason */
++							uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
++							if ((part_phys - part_base) + item_off + 64 <= map_sz) {
++								char *cmsg = (char *)((uint8_t *)phdr + item_off);
++								static char last_crash[64];
++								if (cmsg[0] && strncmp(last_crash, cmsg, sizeof(last_crash)) != 0) {
++									strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
++									printf("SWEET MPSS CRASH: %s\n", cmsg);
++									note("[CRASH: %.50s]", cmsg);
++								}
++							}
++						}
++						cur += sizeof(*e) + e->padding_hdr + e->size;
++					}
++				} else {
++					if (sec == 1) {
++						printf("SWEET SMEM: part %u bad $PRT magic %02x%02x%02x%02x\n",
++						    i, phdr->magic[0], phdr->magic[1], phdr->magic[2], phdr->magic[3]);
++						note("[part %u bad $PRT]", i);
++					}
++				}
++				ml_io_unmap((vm_offset_t)part_win, map_sz);
++			}
++		}
++	}
++}
++
+ static void
+ mpss_thread(void *arg, wait_result_t result)
+ {
+ #pragma unused(arg, result)
+ 	bool ok = mpss_start();
+ 
+-	for (int s = 1; s <= 30; s++) {
++	for (int s = 1; s <= 600; s++) {
+ 		sleep_ms(1000);
+-		printf("SWEET MPSS: alive %d s after %s: %s\n", s, ok ? "the start" : "the failure", report);
++		if (ok) {
++			sweet_smem_poll(s);
++		}
++		if (s <= 30 || s % 10 == 0) {
++			printf("SWEET MPSS: alive %d s after %s: %s\n", s, ok ? "the start" : "the failure", report);
++		}
+ 	}
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++static int
++sysctl_mpss_report SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	static char live_buf[2048];
++	sweet_mpss_status(live_buf, sizeof(live_buf));
++	return SYSCTL_OUT(req, live_buf, strlen(live_buf) + 1);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mpss, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    sysctl_mpss_report, "A", "MPSS boot and SMEM report");
++
+ void
+ sweet_mpss_init(void)
+ {
+@@ -386,3 +814,4 @@
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
