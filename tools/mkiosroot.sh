@@ -16,6 +16,9 @@
 # cryptex shared cache (ignition_level=1 looks there), and
 # /private/var/keybags/systembag.kb is the plain-plist system keybag that
 # keybagd reads with /defaults/no-effaceable-storage (tools/mkadt.py).
+#
+# Next: mount it read-write and run tools/sweet-root-tweaks.py ROOT --gpu MESA_OUT
+# (the bring-up changes, and the GPU stack from the mesa CI artifact's out/).
 set -euo pipefail
 
 [[ $# -ge 4 ]] || { sed -n '2,12p' "$0"; exit 2; }

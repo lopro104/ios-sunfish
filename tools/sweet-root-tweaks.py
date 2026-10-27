@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py MOUNTED_ROOT [--gpu MESA_OUT]
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -30,6 +30,13 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+  --gpu MESA_OUT  the GPU drawing stack, from the mesa CI artifact's out/
+                  (.github/workflows/mesa.yml, mesa/build.sh): libOSMesa.8.dylib,
+                  libsunfish-gl.dylib and libsunfish-inject.dylib into /usr/lib, and
+                  bbd_wrap as /usr/libexec/backboardd (it adds the loader to
+                  DYLD_INSERT_LIBRARIES, which launchd drops from a system daemon's
+                  job, and execs the original, kept as /usr/libexec/real/backboardd).
+                  Without it CoreAnimation draws on the CPU.
 """
 import glob, os, plistlib, shutil, sys
 
@@ -139,10 +146,37 @@ def staged_apps(root):
     print(f'staged apps: {moved} moved into /Applications')
 
 
+def gpu(root, mesa):
+    for name in ('libOSMesa.8.dylib', 'libsunfish-gl.dylib', 'libsunfish-inject.dylib'):
+        dest = os.path.join(root, 'usr/lib', name)
+        shutil.copyfile(os.path.join(mesa, name), dest)
+        os.chown(dest, 0, 0)
+        os.chmod(dest, 0o755)
+    real = os.path.join(root, 'usr/libexec/real')
+    if not os.path.exists(os.path.join(real, 'backboardd')):
+        os.makedirs(real, exist_ok=True)
+        os.chmod(real, 0o755)
+        os.rename(os.path.join(root, 'usr/libexec/backboardd'), os.path.join(real, 'backboardd'))
+    dest = os.path.join(root, 'usr/libexec/backboardd')
+    shutil.copyfile(os.path.join(mesa, 'bbd_wrap'), dest)
+    os.chown(dest, 0, 0)
+    os.chmod(dest, 0o755)
+    print('gpu: Mesa, the GL layer and its loader in /usr/lib; backboardd wrapped')
+
+
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = sys.argv[1:]
+    mesa = None
+    if len(args) == 3 and args[1] == '--gpu':
+        mesa = args.pop()
+        args.pop()
+        if not all(os.path.isfile(os.path.join(mesa, f)) for f in
+                   ('libOSMesa.8.dylib', 'libsunfish-gl.dylib', 'libsunfish-inject.dylib', 'bbd_wrap')):
+            sys.exit(f'{mesa}: not the mesa artifact\'s out/ (libOSMesa.8.dylib, libsunfish-gl.dylib, '
+                     'libsunfish-inject.dylib, bbd_wrap)')
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
     launchd(root)
     containers(root)
     activation(root)
@@ -165,6 +199,8 @@ def main():
                            'SilentICDPUpgrade')})
     merge_pref(root, 'com.apple.managedconfiguration.notbackedup', {
         'LockdownActivationIndicatesCloudConfigurationAvailable': False})
+    if mesa is not None:
+        gpu(root, mesa)
 
 
 if __name__ == '__main__':
