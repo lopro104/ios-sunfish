@@ -716,3 +716,24 @@ NEXT: (1) a persistent WLAN service thread (no blocking one-shot, keep modem ser
 crash recovery); (2) an iOS interface: bsd ifnet (en1) with if_output -> jn_tx_eth and RX -> ifnet_input, a configd/IPConfiguration-
 friendly Ethernet-type interface, so iOS does DHCP and its own stack; (3) selecting the network from user space (sysctl/ioctl) instead of
 /fw/wlan/net.conf; (4) HT/VHT rates, group rekey path (coded, untested), power save, real MAC (/chosen/cdt/cdb2/wlan_mac1).
+
+## 2026-10-27 ~19:30 Wi-Fi as a service: ew0 (iOS sees a network interface), rejoin, crash handling (wlanprobe=8; patches 0138, 0139, 0147)
+Observed:
+- `wlanprobe=8` runs the whole chain as a persistent kernel thread (bsd/dev/sweet_mpss.c wlan_thread -> wlfw_wmi_bringup -> wlan_station_loop):
+  WCN3990 rails voted (RPMh LDOs ldoc1 1.8 V, ldoc2 1.304 V, ldoc10/11 3.312 V and the RF clock "rfclka2": patch 0147 adds
+  sweet_rpmh_vreg_set/rfclk_enable), AOSS QMP "{class: clock, res: qdss, val: 1}" (before the modem boots and again), SMMU bank, rings
+  CE0/3 src, CE1/2 dst, CE4 src (HTT), CE8-11 dst, HTC/WMI, HTT setup, scan, join, DHCP, then **ew0** (bsd ifnet, Ethernet type, like ue0):
+  address from the DHCP lease, link events, if_output queues frames to the service thread (jn_tx_eth), RX frames go through ifnet_input.
+  `sysctl kern.sweet_wlan_info` = "ip mask router dns ssid". iOS pings the router through it: `ping -b ew0 192.168.1.1` 2.6-3.3 ms, 100/100.
+- Rejoin: `sysctl kern.sweet_wlan_kick=1` (or a real kick/deauth) -> VDEV_DOWN, PEER_DELETE, VDEV_STOP, rescan, join, DHCP: back in ~2 s.
+- The WLAN firmware (modem PD) still sometimes dies 30-150 s after the join: SMEM crash text "wlan_process ... dog_hb Task starvation: WLAN BE,
+  ping: 4" (earlier: wlan_ps_sta_health_monitor_timeout after a failed join). NOT fixed. Other runs stay up for 10+ minutes. Facts: it never
+  happens without a join (250 s idle run), loop jitter is 2 ms, a repeating SMMU fault (write, garbage 49-bit address, present from the
+  moment the firmware starts, also in stable runs) is NOT the cause; QDSS clock, rails/RF clock, CE8-11 rings, ath10k's PS poke (peer param 0xff)
+  and peer_stats_info did not change it. After the crash the modem does not bring the WLAN domain back by itself (no new WLFW service, no TFTP
+  request): the SERVREG_LOC PFR_REQ (0x24) is now acknowledged. Recovery (restart the modem or the PD) is unsolved; g_wlan_crashed makes the
+  service thread bring ew0 down and stop. The thread dumps the last 40 WMI/HTT messages (HIST lines) when that happens.
+- Kernel panic found and fixed: after a modem crash sweet_glink_send_vec touched dead SMEM (data abort). g_modem_crashed gates the GLINK poll loop;
+  only a root-domain crash sets it ("wlan_process" crashes set g_wlan_crashed instead). The first crash text of a boot is a leftover of the
+  previous one (SMEM survives a warm reboot) and is ignored.
+- Event log is now 16 KB (a 32 KB one once left the phone at the Apple logo; unrelated or not, unknown).

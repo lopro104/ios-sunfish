@@ -1,16 +1,88 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -29,6 +29,8 @@
+@@ -29,9 +29,27 @@
  #include <pexpert/pexpert.h>
  #include <vm/vm_kern.h>
  #include <sys/sysctl.h>
 +#include <sys/random.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
 +#include "sweet_wlan_util.h"
  
  extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
  extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
-@@ -2301,6 +2303,2242 @@
++extern int sweet_rpmh_vreg_set(const char *res, unsigned mv);
++extern int sweet_rpmh_rfclk_enable(const char *res);
+ extern int sweet_rpmh_crypto_vote(uint32_t vote);
+ extern int sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
+ extern int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
+@@ -85,7 +103,9 @@
+ }
+ 
+ /* Events with the second of the modem's life they happened at (read with sysctl kern.sweet_mpss_events). */
+-static char g_events[8192];
++static char g_events[16384];
++static volatile bool g_modem_crashed;      /* the modem reported a crash: do not touch its memory any more */
++static volatile bool g_wlan_crashed;       /* only the WLAN protection domain crashed (the modem restarts it): the service restarts */
+ static size_t g_events_length;
+ static uint32_t g_events_second;
+ 
+@@ -642,10 +662,23 @@
+ 	char *cmsg = (char *)sweet_smem_get_entry(phdr, part_size, 421, &csz);
+ 	if (cmsg && cmsg[0]) {
+ 		static char last_crash[128];
+-		if (strncmp(last_crash, cmsg, sizeof(last_crash)) != 0) {
++		static bool crash_seen;
++		if (strncmp(last_crash, cmsg, sizeof(last_crash) - 1) != 0) {
+ 			strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
++			static unsigned ncrash;
++
+ 			printf("SWEET MPSS CRASH: %s\n", cmsg);
+-			ev("CRASH %s", cmsg);
++			if (ncrash++ < 3) {
++				ev("CRASH %.150s", cmsg);
++			}
++			if (crash_seen) {                       /* the first message may be left over from the previous boot */
++				if (strnstr(cmsg, "wlan_process", 160) != NULL) {
++					g_wlan_crashed = true;          /* the modem's other protection domains keep running */
++				} else {
++					g_modem_crashed = true;
++				}
++			}
++			crash_seen = true;
+ 			note("[CRASH: %.50s]", cmsg);
+ 		}
+ 	}
+@@ -2103,6 +2136,15 @@
+ 	txn = (uint16_t)(p[1] | p[2] << 8);
+ 	msg = (uint16_t)(p[3] | p[4] << 8);
+ 	msg_len = (uint16_t)(p[5] | p[6] << 8);
++	if (msg == 0x24) {
++		/* PFR_REQ: "a protection domain failed, because ...": pd-mapper just acknowledges it */
++		out[0] = 2; out[1] = (uint8_t)txn; out[2] = (uint8_t)(txn >> 8); out[3] = (uint8_t)msg; out[4] = (uint8_t)(msg >> 8);
++		out[5] = 7; out[6] = 0;
++		out[7] = 0x02; out[8] = 4; out[9] = 0; out[10] = 0; out[11] = 0; out[12] = 0; out[13] = 0;
++		ev("SERVREG_LOC pfr acknowledged");
++		(void)tftp_send_to(qh->src_node_id, qh->src_port_id, SERVREG_LOC_PORT, out, 14);
++		return;
++	}
+ 	if (msg != SERVREG_LOC_GET_DOMAINS) {
+ 		printf("SWEET SERVREG_LOC: unhandled message %#x from %u:%u\n", msg, qh->src_node_id, qh->src_port_id);
+ 		ev("SERVREG_LOC unhandled msg %#x", msg);
+@@ -2301,12 +2343,3020 @@
  	}
  }
  
@@ -79,6 +151,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +
 +static volatile uint32_t *g_smmu;
 +static int g_smmu_bank = -1;
++static volatile uint64_t *g_smmu_tab;           /* the bank's four 4 KiB tables: +0 identity L1, +0x1000 L0, +0x2000 sink L1, +0x3000 sink L2 */
++static uint64_t g_smmu_tab_pa;
++static uint8_t *g_sink;                         /* 2 MiB of host memory standing in for whatever the firmware writes to */
++static uint64_t g_sink_pa, g_sink_far;
 +
 +static uint64_t
 +smmu_rd64(uint32_t off)
@@ -108,7 +184,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	smmu_wr(cbo + CB_TTBR0 + 4, (uint32_t)(ttbr0 >> 32));
 +	smmu_wr(cbo + CB_TTBR1, 0);
 +	smmu_wr(cbo + CB_TTBR1 + 4, 0);
-+	smmu_wr(cbo + CB_TCR, 25u | (1u << 23));                                        /* T0SZ 25, 4K, non-cacheable walks, EPD1 */
++	smmu_wr(cbo + CB_TCR, 16u | (1u << 23));                                        /* T0SZ 16 (48 bits), 4K, non-cacheable walks, EPD1 */
 +	smmu_wr(cbo + CB_MAIR0, 0x44u);                                                 /* attr 0: normal non-cacheable */
 +	smmu_wr(cbo + CB_MAIR1, 0);
 +	smmu_wr(cbo + CB_FSR, g_smmu[(cbo + CB_FSR) / 4]);
@@ -118,7 +194,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		sleep_ms(1);
 +	}
 +	smmu_wr(cbo + CB_SCTLR, sctlr);
-+	ok = smmu_rd64(cbo + CB_TTBR0) == ttbr0 && (g_smmu[(cbo + CB_SCTLR) / 4] & 1u) && (g_smmu[(cbo + CB_TCR) / 4] & 0x3fu) == 25u;
++	ok = smmu_rd64(cbo + CB_TTBR0) == ttbr0 && (g_smmu[(cbo + CB_SCTLR) / 4] & 1u) && (g_smmu[(cbo + CB_TCR) / 4] & 0x3fu) == 16u;
 +	ev("WLAN SMMU: bank %u CBAR %#x TCR %#x TTBR0 %#llx SCTLR %#x: %s", cb, g_smmu[(page + 4 * cb) / 4], g_smmu[(cbo + CB_TCR) / 4],
 +	    smmu_rd64(cbo + CB_TTBR0), g_smmu[(cbo + CB_SCTLR) / 4], ok ? "taken" : "NOT taken");
 +	if (!ok) {
@@ -179,11 +255,14 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		if (kmem_alloc(kernel_map, &pt, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +			return false;
 +		}
++		g_smmu_tab = (volatile uint64_t *)pt;
++		g_smmu_tab_pa = kvtophys(pt);
 +		l1 = (volatile uint64_t *)pt;
++		g_smmu_tab[0x1000 / 8] = g_smmu_tab_pa | 3;      /* L0[0] -> the identity L1 */
 +		for (unsigned i = 2; i < 16; i++) {      /* 1 GiB blocks, 0x80000000..0x3ffffffff: PA | AF | SH outer | AP RW | attr 0 | block */
 +			l1[i] = ((uint64_t)i << 30) | (1u << 10) | (2u << 8) | (1u << 6) | 1u;
 +		}
-+		for (int o = 0; o < 512; o += 64) {
++		for (int o = 0; o < 0x4000; o += 64) {
 +			__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)pt + o) : "memory");
 +		}
 +		__asm__ volatile ("dsb sy" ::: "memory");
@@ -199,7 +278,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +				continue;
 +			}
 +			tries++;
-+			if (wlfw_smmu_bank_setup(page, cbo, (uint32_t)n, pasize, kvtophys(pt))) {
++			if (wlfw_smmu_bank_setup(page, cbo, (uint32_t)n, pasize, g_smmu_tab_pa + 0x1000)) {
 +				cb = n;
 +				break;
 +			}
@@ -217,6 +296,159 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +}
 +
 +#define CE_RX_BUF       2048
++
++/*
++ * AOSS QMP (drivers/soc/qcom/qcom_aoss.c): the always-on processor's mailbox in message RAM at 0xc300000, doorbell
++ * apss_shared 0x17c00000 + 12 (bit 0). The SM8150 forks found the WCN3990 firmware needs AOSS's "qdss" clock; its
++ * WCSS QDSS (CoreSight) block is read by the firmware's tasks and a gated clock starves them (our "Task starvation:
++ * WLAN RT/BE" crashes and a repeating write fault at a garbage address).
++ */
++#define AOP_MSGRAM      0x0c300000ull
++#define AOP_UP          0xffffu
++
++static volatile uint32_t *g_aop, *g_apcs;
++
++static bool
++aop_wait(uint32_t off, uint32_t value)
++{
++	for (unsigned t = 0; t < 1000; t++) {
++		if (g_aop[off / 4] == value) {
++			return true;
++		}
++		sleep_ms(1);
++	}
++	return false;
++}
++
++static void
++aop_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	g_apcs[12 / 4] = 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++aop_send(const char *msg)
++{
++	uint32_t offset, size;
++	char buf[64];
++
++	if (g_aop == NULL) {
++		g_aop = (volatile uint32_t *)ml_io_map_unmappable(AOP_MSGRAM, 0x1000, WIMG_IO);
++		g_apcs = (volatile uint32_t *)ml_io_map_unmappable(0x17c00000, 0x1000, WIMG_IO);
++		if (g_aop == NULL || g_apcs == NULL) {
++			g_aop = NULL;
++			return false;
++		}
++	}
++	if (g_aop[0] != 0x4d41494c || g_aop[1] != 1) {
++		ev("AOP: bad magic %#x version %u", g_aop[0], g_aop[1]);
++		return false;
++	}
++	offset = g_aop[0x38 / 4];
++	size = g_aop[0x34 / 4];
++	if (size == 0 || offset + 68 > 0x1000) {
++		ev("AOP: mailbox size %u offset %#x", size, offset);
++		return false;
++	}
++	if (g_aop[0x28 / 4] != AOP_UP || g_aop[0x30 / 4] != AOP_UP) {
++		g_aop[0x10 / 4] = g_aop[0xc / 4];                       /* ack the remote's link state */
++		g_aop[0x24 / 4] = AOP_UP;
++		aop_kick();
++		if (!aop_wait(0x28, AOP_UP)) {
++			ev("AOP: ucore did not ack the link");
++			return false;
++		}
++		g_aop[0x2c / 4] = AOP_UP;
++		aop_kick();
++		if (!aop_wait(0x14, AOP_UP)) {
++			ev("AOP: ucore did not open the channel");
++			return false;
++		}
++		g_aop[0x18 / 4] = AOP_UP;
++		aop_kick();
++		if (!aop_wait(0x30, AOP_UP)) {
++			ev("AOP: ucore did not ack the channel");
++			return false;
++		}
++	}
++	memset(buf, 0, sizeof(buf));
++	strlcpy(buf, msg, sizeof(buf));
++	for (unsigned i = 0; i < 16; i++) {
++		g_aop[(offset + 4) / 4 + i] = ((const uint32_t *)buf)[i];
++	}
++	g_aop[offset / 4] = 64;
++	(void)g_aop[offset / 4];
++	aop_kick();
++	if (!aop_wait(offset, 0)) {
++		g_aop[offset / 4] = 0;
++		ev("AOP: no ack for \"%s\"", msg);
++		return false;
++	}
++	ev("AOP: sent \"%s\"", msg);
++	return true;
++}
++
++/* map the 2 MiB around a faulting address to a host buffer, to see what the firmware writes there */
++static void
++wp_sink_map(uint64_t far)
++{
++	uint32_t cbo = 0x80000u + (uint32_t)g_smmu_bank * 0x1000u;
++	unsigned i0 = (unsigned)((far >> 39) & 0x1ff), i1 = (unsigned)((far >> 30) & 0x1ff), i2 = (unsigned)((far >> 21) & 0x1ff);
++	vm_offset_t m = 0;
++
++	if (g_smmu_tab == NULL || far < (1ull << 39) || g_sink_far) {
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &m, 0x200000, PAGE_MASK, 0, (0x200000 >> PAGE_SHIFT) - 1, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		ev("SINK: no memory");
++		return;
++	}
++	g_sink = (uint8_t *)m;
++	g_sink_pa = kvtophys(m);
++	if (g_sink_pa & 0x1fffff) {
++		ev("SINK: block at %#llx is not 2 MiB aligned", g_sink_pa);
++		return;
++	}
++	g_smmu_tab[0x1000 / 8 + i0] = (g_smmu_tab_pa + 0x2000) | 3;
++	g_smmu_tab[0x2000 / 8 + i1] = (g_smmu_tab_pa + 0x3000) | 3;
++	g_smmu_tab[0x3000 / 8 + i2] = g_sink_pa | (1u << 10) | (2u << 8) | (1u << 6) | 1u;
++	for (int o = 0; o < 0x4000; o += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" ((uint8_t *)g_smmu_tab + o) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	smmu_wr(cbo + CB_TLBIALL, 0);
++	smmu_wr(cbo + CB_TLBSYNC, 0);
++	for (int i = 0; i < 1000 && (g_smmu[(cbo + CB_TLBSTATUS) / 4] & 1u); i++) {
++		sleep_ms(1);
++	}
++	g_sink_far = far;
++	ev("SINK: %#llx (L0 %u L1 %u L2 %u) now maps host memory at %#llx", far & ~0x1fffffull, i0, i1, i2, g_sink_pa);
++}
++
++/* diagnostic: a pending translation fault in our SMMU bank, with where we were when we noticed */
++static void
++wp_fault_check(const char *where)
++{
++	uint32_t cbo = 0x80000u + (uint32_t)g_smmu_bank * 0x1000u, fsr;
++
++	if (g_smmu == NULL || g_smmu_bank < 0) {
++		return;
++	}
++	fsr = g_smmu[(cbo + 0x58) / 4];
++	if (fsr) {
++		uint64_t far = ((uint64_t)g_smmu[(cbo + 0x64) / 4] << 32) | g_smmu[(cbo + 0x60) / 4];
++
++		static unsigned nfaults;
++
++		if (nfaults++ < 2 || far != g_sink_far) {
++			ev("FAULT at %s: fsr %#x far %#llx fsynr0 %#x (%u so far)", where, fsr, far, g_smmu[(cbo + 0x68) / 4], nfaults);
++		}
++		wp_sink_map(far);
++		g_smmu[(cbo + 0x58) / 4] = fsr;
++	}
++}
 +
 +static void
 +wlfw_ce_rx_test(volatile uint32_t *regs)
@@ -308,7 +540,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +#define WP_POOL         0xc00000u
 +#define WP_HOSTMEM      0x100000u
 +#define WP_BUF          2048u
-+#define WP_NR           5
++#define WP_NR           9
 +#define WP_HTT_FRAG     0x400000u
 +#define WP_HTT_RXRING   0x420000u
 +#define WP_HTT_ALLOCIDX 0x424000u
@@ -327,6 +559,12 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	{ 1, 32, 0x800, 0x30000, false, 0 },
 +	{ 2, 64, 0xc00, 0x40000, false, 0 },
 +	{ 4, 64, 0x1000, 0x60000, true, 0x100 },        /* HTT host to target: control messages and TX_FRM gather pairs */
++	/* CE8..CE11 are target-to-host pipes in the configuration we send (pktlog, dbglog ...): the firmware writes to them on its own
++	 * schedule, and without a destination ring they went to an uninitialised address (the repeating SMMU fault, then the crash) */
++	{ 8, 32, 0x1400, 0x80000, false, 0 },
++	{ 9, 32, 0x1600, 0x90000, false, 0 },
++	{ 10, 32, 0x1800, 0xa0000, false, 0 },
++	{ 11, 32, 0x1a00, 0xb0000, false, 0 },
 +};
 +
 +static struct {
@@ -339,7 +577,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	uint8_t conn_st, conn_eid;
 +	uint16_t conn_svc, conn_max, credits, credit_size;
 +	uint32_t wmi_credits, nchunks, svc[32], svc_bytes, msgs;
-+	bool htt_conf, scan_started, scan_done;
++	bool htt_conf, scan_started, scan_done, scan_setup;
++	uint32_t rx_idx;                                /* the HTT RX ring: next slot to post */
++	uint32_t echo_sent, echo_ok;
 +	uint8_t htt_major, htt_minor;
 +	unsigned beacons, nbss, foreign;
 +	struct {
@@ -415,13 +655,22 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +{
 +	vm_offset_t mem = 0;
 +
-+	if (kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	if (wp.pool != NULL) {                          /* a restart: the pool is kept, cleaned */
++		memset(wp.pool, 0, WP_POOL);
++		wp_sync(wp.pool, WP_POOL);
++		goto have_pool;
++	}
++	/* below 4 GiB if possible: some of the firmware's structures may have 32-bit address fields (an unexplained write fault at a
++	 * garbage address repeated every few seconds with the pool at 0x10b5...) */
++	if (kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, (0x100000000ull >> PAGE_SHIFT) - 1, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS &&
++	    kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
 +		ev("WMI: no contiguous pool");
 +		return false;
 +	}
 +	wp.pool = (uint8_t *)mem;
 +	wp.pa = kvtophys(mem);
 +	ev("WMI: pool pa %#llx", wp.pa);
++have_pool:
 +	for (unsigned r = 0; r < WP_NR; r++) {
 +		volatile uint32_t *ce = wp_ce(wp_cfg[r].ce);
 +		uint64_t rpa = wp.pa + wp_cfg[r].ring;
@@ -446,11 +695,15 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			}
 +		}
 +		__asm__ volatile ("dsb sy" ::: "memory");
-+		ev("WMI: CE%u %s ring %u at %#llx sw %u wr %u ctrl1 %#x", wp_cfg[r].ce, wp_cfg[r].src ? "src" : "dst", n, rpa, wp.sw[r], wp.wr[r],
-+		    ce[0x18 / 4]);
++		if (r < 5) {
++			ev("WMI: CE%u %s ring %u at %#llx sw %u wr %u ctrl1 %#x", wp_cfg[r].ce, wp_cfg[r].src ? "src" : "dst", n, rpa, wp.sw[r], wp.wr[r],
++			    ce[0x18 / 4]);
++		}
 +	}
 +	return true;
 +}
++
++static void wp_hist(uint32_t key);
 +
 +/* HTC send on source ring r (0 = CE0, 1 = CE3): 8-byte header + payload; the write index goes through the shadow registers */
 +static bool
@@ -471,6 +724,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		}
 +		wp.wmi_credits--;
 +	}
++	wp_hist(0x30000000u | ((uint32_t)eid << 20) | (plen >= 4 ? (*(const uint32_t *)payload & 0xfffff) : 0));
 +	buf[0] = eid;
 +	buf[1] = (eid != 0 && eid == wp.wmi_eid) ? 1 : 0;      /* NEED_CREDIT_UPDATE on the credit-flow endpoint */
 +	memcpy(buf + 2, &l, 2);
@@ -684,7 +938,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	uint8_t ssid[32], ssid_len, pmk[32], bssid[6], dtim, mgmt_rate, group_type, ptk[16], gtk[16], sta_rsn[32];
 +	int bss, mgmt_status, eapol_msdu;
 +	uint16_t mhz, aid, peer_id, auth_status, seq;
-+	uint32_t start_status, gtk_idx, rx_idx, mgmt_slot, tx_inflight, sta_rsn_len;
++	uint32_t start_status, gtk_idx, mgmt_slot, tx_inflight, sta_rsn_len;
 +	uint64_t tx_frames, tx_eapol, tx_fail, rx_drop, rx_eapol, rx_frames, rx_logged;
 +	uint8_t txfree[256];
 +	struct swu_assoc_resp ar;
@@ -741,6 +995,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	const uint8_t *h = NULL, *fr = NULL;
 +	uint32_t frl = 0, hd[6];
 +	unsigned k;
++	uint16_t rxmhz, bssmhz;
 +
 +	for (uint32_t o = 0; o + 4 <= len;) {
 +		uint16_t l, tag;
@@ -773,8 +1028,18 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		return;
 +	}
 +	wp.beacons++;
++	/* 2.4 GHz frames are heard on neighbouring channels too: the DS Parameter Set element has the real one */
++	rxmhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] : 5000 + 5 * hd[0]);
++	{
++		const uint8_t *ds = swu_ie_find(fr + 36, frl - 36, 3);
++
++		bssmhz = (ds && ds[1] == 1 && ds[2] >= 1 && ds[2] <= 13 && rxmhz < 2500) ? (uint16_t)(2407 + 5 * ds[2]) : rxmhz;
++	}
 +	for (k = 0; k < wp.nbss; k++) {
 +		if (memcmp(wp.bss[k].bssid, fr + 16, 6) == 0) {
++			if (rxmhz == bssmhz) {
++				wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
++			}
 +			return;
 +		}
 +	}
@@ -783,7 +1048,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	k = wp.nbss++;
 +	memcpy(wp.bss[k].bssid, fr + 16, 6);
-+	wp.bss[k].mhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] : 5000 + 5 * hd[0]);
++	wp.bss[k].mhz = bssmhz;
 +	wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
 +	wp.bss[k].ssid[0] = 0;
 +	wp.bss[k].cap = (uint16_t)(fr[34] | (fr[35] << 8));
@@ -886,19 +1151,20 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (!wp_send(4, wp.htt_eid, m, 48) || !wp_send(4, wp.htt_eid, ag, 4)) {
 +		return false;
 +	}
++	wp.rx_idx = WP_HTT_RINGSZ - 1;
 +	ev("WMI: HTT setup sent: frag bank %u x 72, RX ring %u", WP_HTT_FRAGS, WP_HTT_RINGSZ);
 +	return true;
 +}
 +
-+static void
-+wp_scan(void)
++static bool
++wp_scan_setup(void)
 +{
 +	uint8_t c[1024], vm[4] = { 0, 0, 0, 0 };
 +	uint32_t n, num = WP_NCHAN;
 +
 +	if (!wp_send(4, wp.htt_eid, vm, 4)) {
 +		ev("WMI: HTT version request not sent");
-+		return;
++		return false;
 +	}
 +	for (unsigned t = 0; t < 3000 && !wp.htt_conf; t += 10) {
 +		wp_poll();
@@ -906,14 +1172,14 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	if (!wp.htt_conf || !wp_htt_setup()) {
 +		ev("WMI: no HTT version / setup: stopping");
-+		return;
++		return false;
 +	}
 +	for (unsigned k = 0; k < 2; k++) {              /* PDEV_SET_PARAM tx (1) / rx (2) chain mask = 3 */
 +		uint32_t p[3] = { 0, k ? 2u : 1u, 3 };
 +
 +		n = wp_cmd(c, 0x4003, 82, p, 12);
 +		if (!wp_wmi("chain mask", c, n)) {
-+			return;
++			return false;
 +		}
 +	}
 +	n = wp_cmd(c, 0x3003, 79, &num, 4);             /* SCAN_CHAN_LIST, every channel passive */
@@ -937,14 +1203,14 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wp_tlv(c, &n, 80, ch, 24);
 +	}
 +	if (!wp_wmi("channel list", c, n)) {
-+		return;
++		return false;
 +	}
 +	{
 +		uint32_t r[6] = { 0, 0x52, 0x52, 0x52, 0x30, 0x10 };      /* PDEV_SET_REGDOMAIN */
 +
 +		n = wp_cmd(c, 0x4001, 81, r, 24);
 +		if (!wp_wmi("regdomain", c, n)) {
-+			return;
++			return false;
 +		}
 +	}
 +	{
@@ -953,7 +1219,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		memcpy(&v[3], wp_mac, 6);
 +		n = wp_cmd(c, 0x5001, 86, v, 20);
 +		if (!wp_wmi("vdev create", c, n)) {
-+			return;
++			return false;
 +		}
 +	}
 +	{
@@ -961,9 +1227,26 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +
 +		n = wp_cmd(c, 0x5008, 95, v, 12);
 +		if (!wp_wmi("vdev encap", c, n)) {
-+			return;
++			return false;
 +		}
 +	}
++	return true;
++}
++
++static void
++wp_scan(void)
++{
++	uint8_t c[1024];
++	uint32_t n;
++
++	if (!wp.scan_setup) {
++		if (!wp_scan_setup()) {
++			return;
++		}
++		wp.scan_setup = true;
++	}
++	wp.scan_started = wp.scan_done = false;
++	wp.foreign = 0;
 +	{
 +		uint32_t s[25];
 +		uint32_t f[WP_NCHAN];
@@ -1193,6 +1476,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wp_sync(ext, 72);
 +		frags = wp.pa + WP_HTT_FRAG + (uint64_t)id * 72;
 +	}
++	wp_hist(0x40000000u | ((mgmt ? 1u : 0u) << 16) | len);
 +	memset(tb, 0, 28);
 +	tb[0] = wp.htt_eid;
 +	memcpy(tb + 2, &hl, 2);
@@ -1530,9 +1814,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +
 +	*(volatile uint32_t *)(wp.pool + (pa - wp.pa) + 4) = 0;                 /* rx_attention */
 +	wp_sync(wp.pool + (pa - wp.pa), 64);
-+	ring[jn.rx_idx] = pa;
-+	wp_sync(&ring[jn.rx_idx], 8);
-+	jn.rx_idx = (jn.rx_idx + 1) & (WP_HTT_RINGSZ - 1);
++	ring[wp.rx_idx] = pa;
++	wp_sync(&ring[wp.rx_idx], 8);
++	wp.rx_idx = (wp.rx_idx + 1) & (WP_HTT_RINGSZ - 1);
 +}
 +
 +static void
@@ -1582,7 +1866,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			ev("JOIN: peer mapped id %u", jn.peer_id);
 +		}
 +		return true;
-+	case 0x04:
++	case 0x04:                                              /* PEER_UNMAP */
++		jn.peer_mapped = false;
 +		return true;
 +	case 0x0b:                                              /* SEC_IND */
 +		jn.sec_ind = true;
@@ -1651,7 +1936,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			jn_rx_repost(pa);
 +		}
 +		__asm__ volatile ("dsb sy" ::: "memory");
-+		*(volatile uint32_t *)(wp.pool + WP_HTT_ALLOCIDX) = jn.rx_idx;
++		*(volatile uint32_t *)(wp.pool + WP_HTT_ALLOCIDX) = wp.rx_idx;
 +		wp_sync(wp.pool + WP_HTT_ALLOCIDX, 64);
 +		return true;
 +	}
@@ -1690,7 +1975,6 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	jn.active = true;
 +	memset(jn.txfree, 1, sizeof(jn.txfree));
-+	jn.rx_idx = WP_HTT_RINGSZ - 1;
 +	jn.svc_mgmt_wmi = wp_svc_on(76);
 +	ev("JOIN: management TX via %s, rx reorder offload %u", jn.svc_mgmt_wmi ? "WMI" : "HTT", wp_svc_on(65));
 +	jn.eapol_msdu = -1;
@@ -1698,6 +1982,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (!jn_vdev_start() || !jn_wait(&jn.start_resp, 3000, "VDEV_START_RESP") || jn.start_status) {
 +		return false;
 +	}
++	wp_fault_check("vdev start");
 +	v[0] = 0; v[1] = 0;
 +	if (!wp_wmi("power save off", c, wp_cmd(c, 0x9001, 108, v, 8)) || !jn_vdev_param(0x03, wp.bss[jn.bss].bint, "beacon interval") ||
 +	    !jn_vdev_param(0x19, jn.mgmt_rate, "management rate")) {
@@ -1753,10 +2038,16 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (!jn.assoc_resp || jn.ar.status) {
 +		return false;
 +	}
++	wp_fault_check("assoc");
 +	jn.aid = jn.ar.aid;
 +	swu_wpa_start(&jn.wpa, &jn_ops, NULL, jn.pmk, jn.bssid, wp_mac, jn.sta_rsn, jn.sta_rsn_len);
 +	if (!jn_vdev_param(0x0d, jn.dtim, "dtim period") || !jn_peer_assoc()) {
 +		return false;
++	}
++	{
++		uint32_t pp[3] = { 0, 0x8b, 1 };                        /* ath10k_bss_assoc: pdev peer_stats_info_enable = 1 before VDEV_UP */
++
++		(void)wp_wmi("peer stats info", c, wp_cmd(c, 0x4003, 82, pp, 12));
 +	}
 +	v[0] = 0; v[1] = jn.aid; v[2] = 0; v[3] = 0;
 +	memcpy(&v[2], jn.bssid, 6);
@@ -1764,6 +2055,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		return false;
 +	}
 +	jn.vdev_up = true;
++	/* ath10k: "some firmware revisions have a buggy powersave state machine and must be poked with a peer param command" */
++	(void)jn_peer_param(0xff, 1, "ps workaround poke");
 +	ev("JOIN: vdev up, waiting for the 4-way handshake");
 +	if (!jn_wait(&jn.hs_done, 6000, "the 4-way handshake")) {
 +		return false;
@@ -1785,10 +2078,258 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			return false;
 +		}
 +	}
++	wp_fault_check("keys");
 +	jn.connected = true;
 +	ev("JOIN: CONNECTED to %02x%02x%02x%02x%02x%02x aid %u", jn.bssid[0], jn.bssid[1], jn.bssid[2], jn.bssid[3], jn.bssid[4], jn.bssid[5], jn.aid);
 +	return true;
 +}
++
++
++/* ---- ew0: the network interface iOS sees (the Wi-Fi equivalent of ue0 in sweet_usb.c) ---- */
++#define EW_TXQ          32u
++#define EW_FRAME_MAX    1600u
++
++static struct {
++	ifnet_t ifp;
++	lck_mtx_t *lock;
++	uint8_t *txq;
++	uint16_t txq_len[EW_TXQ];
++	unsigned head, n;
++	bool up;
++	uint64_t rx_frames, tx_frames, tx_drop, rx_drop;
++	char info[160];
++	bool have_ip;
++	uint8_t cur_ip[4];
++} ew;
++
++static errno_t
++ew_if_output(ifnet_t ifp, mbuf_t m)
++{
++	size_t len = mbuf_pkthdr_len(m);
++
++	lck_mtx_lock(ew.lock);
++	if (!ew.up || ew.n >= EW_TXQ || len > EW_FRAME_MAX || len < 14) {
++		lck_mtx_unlock(ew.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		ew.tx_drop++;
++		return 0;
++	}
++	mbuf_copydata(m, 0, len, ew.txq + (size_t)((ew.head + ew.n) % EW_TXQ) * EW_FRAME_MAX);
++	ew.txq_len[(ew.head + ew.n) % EW_TXQ] = (uint16_t)len;
++	ew.n++;
++	lck_mtx_unlock(ew.lock);
++	ifnet_stat_increment_out(ifp, 1, (u_int32_t)len, 0);
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++ew_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = ew.up ? (IFM_ETHER | IFM_100_TX | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (ew.up ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ew_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++ew_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	if (ew.ifp != NULL) {
++		return;
++	}
++	grp = lck_grp_alloc_init("sweet_wlan_if", LCK_GRP_ATTR_NULL);
++	ew.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	ew.txq = kalloc_data(EW_TXQ * EW_FRAME_MAX, Z_WAITOK | Z_ZERO);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-wlan";
++	init.uniqueid_len = sizeof("sweet-wlan") - 1;
++	init.name = "ew";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ew_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ew_if_ioctl;
++	init.detach = ew_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ew.txq == NULL || ifnet_allocate_extended(&init, &ew.ifp) != 0) {
++		ev("EW: ifnet_allocate failed");
++		ew.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ew.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ew.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ew.ifp, ETHERMTU);
++	ifnet_set_baudrate(ew.ifp, 54000000);
++	ifnet_set_flags(ew.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ew.ifp, NULL) != 0) {
++		ev("EW: ifnet_attach failed");
++		ew.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
++	ev("EW: interface ew0 created");
++}
++
++static void
++ew_link_event(bool up)
++{
++	if (ew.ifp != NULL) {
++		dlil_post_msg(ew.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++}
++
++/* give ew0 the leased address and mark the link up (sweet_usb.c's ue0 does it the same way) */
++static void
++ew_configure(const uint8_t ip[4], const uint8_t mask[4])
++{
++	errno_t err = proto_plumb(PF_INET, ew.ifp);
++	socket_t so = NULL;
++
++	if (ew.ifp == NULL) {
++		return;
++	}
++	if (err == 0 || err == EEXIST) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		struct sockaddr_in *a;
++		uint32_t addr = ((uint32_t)ip[0] << 24) | ((uint32_t)ip[1] << 16) | ((uint32_t)ip[2] << 8) | ip[3];
++		uint32_t m = ((uint32_t)mask[0] << 24) | ((uint32_t)mask[1] << 16) | ((uint32_t)mask[2] << 8) | mask[3];
++
++		if (ew.have_ip && memcmp(ew.cur_ip, ip, 4) != 0) {        /* a different lease after a rejoin: drop the old address first */
++			struct ifreq ifr;
++			struct sockaddr_in *o = (struct sockaddr_in *)&ifr.ifr_addr;
++
++			bzero(&ifr, sizeof(ifr));
++			snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "ew0");
++			o->sin_len = sizeof(*o);
++			o->sin_family = AF_INET;
++			memcpy(&o->sin_addr.s_addr, ew.cur_ip, 4);
++			(void)sock_ioctl(so, SIOCDIFADDR, &ifr);
++		}
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ew0");
++		a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(addr);
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(m);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(addr | ~m);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	memcpy(ew.cur_ip, ip, 4);
++	ew.have_ip = true;
++	ew.up = true;
++	ifnet_set_flags(ew.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	ew_link_event(true);
++	ev("EW: ew0 %u.%u.%u.%u %s (err %d)", ip[0], ip[1], ip[2], ip[3], err ? "NOT configured" : "up", err);
++}
++
++/* a decrypted Ethernet frame from the AP to the stack */
++static void
++ew_rx(const uint8_t *eth, size_t len)
++{
++	mbuf_t m = NULL;
++
++	if (!ew.up || ew.ifp == NULL || len < ETHER_HDR_LEN || len > ETHER_MAX_LEN) {
++		return;
++	}
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 && mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		struct ifnet_stat_increment_param stats = {};
++		void *frame_header;
++
++		memcpy(mbuf_data(m), eth, len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, ew.ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		stats.packets_in = 1;
++		stats.bytes_in = (u_int32_t)len;
++		ew.rx_frames++;
++		ifnet_input(ew.ifp, m, &stats);
++	} else {
++		ew.rx_drop++;
++		if (m != NULL) {
++			mbuf_freem(m);
++		}
++	}
++}
++
++static int
++sysctl_wlan_info SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, ew.info, strlen(ew.info) + 1);
++}
++
++/* kern.sweet_wlan_kick=1: behave as if the AP had kicked us (tests the rejoin path) */
++static int
++sysctl_wlan_kick SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, err = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (err == 0 && req->newptr != USER_ADDR_NULL && v == 1) {
++		jn.kicked = true;
++	}
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_kick, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_wlan_kick, "I", "force a Wi-Fi rejoin");
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_info, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_wlan_info, "A",
++    "Wi-Fi state: ip mask router dns ssid");
 +
 +/* ---- a minimal IPv4 test client: DHCP, ARP the router, ping it (proves data TX and RX) ---- */
 +static struct {
@@ -1929,6 +2470,11 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +{
 +	uint16_t type = (uint16_t)((eth[12] << 8) | eth[13]);
 +
++	if (ew.up) {
++		ew_rx(eth, n);
++		return;
++	}
++
 +	if (type == 0x0806 && n >= 42 && eth[21] == 2 && nt.state == 4 && memcmp(eth + 28, nt.router, 4) == 0) {
 +		memcpy(nt.router_mac, eth + 22, 6);
 +		nt.have_mac = true;
@@ -2023,6 +2569,13 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	ev("NET: bound %u.%u.%u.%u mask %u.%u.%u.%u router %u.%u.%u.%u dns %u.%u.%u.%u", nt.yiaddr[0], nt.yiaddr[1], nt.yiaddr[2], nt.yiaddr[3],
 +	    nt.mask[0], nt.mask[1], nt.mask[2], nt.mask[3], nt.router[0], nt.router[1], nt.router[2], nt.router[3], nt.dns[0], nt.dns[1], nt.dns[2], nt.dns[3]);
++	if (g_wlan_probe >= 8) {
++		snprintf(ew.info, sizeof(ew.info), "%u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u %u.%u.%u.%u %.*s", nt.yiaddr[0], nt.yiaddr[1], nt.yiaddr[2], nt.yiaddr[3],
++		    nt.mask[0], nt.mask[1], nt.mask[2], nt.mask[3], nt.router[0], nt.router[1], nt.router[2], nt.router[3], nt.dns[0], nt.dns[1], nt.dns[2],
++		    nt.dns[3], jn.ssid_len, jn.ssid);
++		ew_configure(nt.yiaddr, nt.mask);
++		return;
++	}
 +	for (tries = 0; tries < 5 && !nt.have_mac; tries++) {
 +		nt_arp_router();
 +		t0 = nt_us();
@@ -2049,6 +2602,59 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +}
 +
 +/* one received message (HTC header: eid, flags, len, ctrl[2], seq?, ...) */
++/* the last few things the firmware sent and we sent it, dumped when it crashes (to see what it was doing) */
++static struct {
++	uint32_t t_ms, key;
++} g_hist[40];
++static unsigned g_hist_n;
++
++static void
++wp_hist(uint32_t key)
++{
++	uint64_t abs, ns;
++
++	clock_get_uptime(&abs);
++	absolutetime_to_nanoseconds(abs, &ns);
++	g_hist[g_hist_n++ % 40].t_ms = (uint32_t)(ns / 1000000);
++	g_hist[(g_hist_n - 1) % 40].key = key;
++}
++
++static void
++wp_hist_dump(void)
++{
++	char line[200];
++	unsigned n = MIN(g_hist_n, 40u), lp = 0;
++
++	for (unsigned i = 0; i < n; i++) {
++		unsigned k = (g_hist_n - n + i) % 40;
++
++		lp += (unsigned)snprintf(line + lp, sizeof(line) - lp, " %u:%x", g_hist[k].t_ms % 100000, g_hist[k].key);
++		if (lp > 170 || i == n - 1) {
++			ev("HIST%s", line);
++			lp = 0;
++			line[0] = 0;
++		}
++	}
++}
++
++/* a distinct unhandled message class, noted once with its length (to see what the firmware says before it dies) */
++static void
++wp_note_event(uint32_t key, uint32_t len)
++{
++	static uint32_t seen[32];
++	static unsigned n;
++
++	for (unsigned i = 0; i < n; i++) {
++		if (seen[i] == key) {
++			return;
++		}
++	}
++	if (n < 32) {
++		seen[n++] = key;
++		ev("MSG: %s %#x (%u bytes) first seen", (key >> 28) == 1 ? "wmi event" : "htt/other", key & 0xfffffff, len);
++	}
++}
++
 +static void
 +wp_rx(unsigned ce, const uint8_t *p, uint32_t len)
 +{
@@ -2106,6 +2712,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +
 +		memcpy(&evid, pl, 4);
 +		evid &= 0xffffff;
++		wp_hist(0x10000000u | evid);
 +		if (evid == 0x1) {
 +			wp_service_ready(pl + 4, plen - 4);
 +		} else if (evid == 0x3) {
@@ -2141,18 +2748,27 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			ev("WMI: READY, MAC %02x:%02x:%02x:%02x:%02x:%02x", wp.mac[0], wp.mac[1], wp.mac[2], wp.mac[3], wp.mac[4], wp.mac[5]);
 +		} else if (jn.active && jn_wmi_event(evid, pl + 4, plen - 4)) {
 +			wp.msgs--;
++		} else if (evid == 0x1d001) {
++			wp.echo_ok++;
 +		} else if (evid == 0x3001) {
 +			wp_scan_event(pl + 4, plen - 4);
 +		} else if (evid == 0x7001) {
 +			wp_mgmt_rx(pl + 4, plen - 4);
 +		} else {
 +			wp.msgs--;
++			wp_note_event(0x10000000u | evid, plen);
 +		}
 +		return;
++	}
++	if (wp.htt_eid && p[0] == wp.htt_eid) {
++		wp_hist(0x20000000u | pl[0]);
 +	}
 +	if (jn.active && wp.htt_eid && p[0] == wp.htt_eid && jn_htt(pl, plen)) {
 +		wp.msgs--;
 +		return;
++	}
++	if (p[0] != 0 && p[0] != wp.wmi_eid) {
++		wp_note_event(0x20000000u | (ce << 8) | pl[0], plen);
 +	}
 +	if (wp.htt_eid && p[0] == wp.htt_eid && plen >= 4 && pl[0] == 0 && !wp.htt_conf) {
 +		wp.htt_conf = true;
@@ -2203,19 +2819,211 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	return false;
 +}
 +
++/* frames ew0 queued: out through the data path (service thread only) */
++static void
++wlan_tx_pump(void)
++{
++	for (;;) {
++		unsigned k;
++		int e;
++
++		lck_mtx_lock(ew.lock);
++		if (ew.n == 0) {
++			lck_mtx_unlock(ew.lock);
++			return;
++		}
++		k = ew.head;
++		lck_mtx_unlock(ew.lock);
++		e = jn_tx_eth(ew.txq + (size_t)k * EW_FRAME_MAX, ew.txq_len[k], false);
++		if (e == 28) {
++			return;                                 /* ring or ids full: try again next loop */
++		}
++		lck_mtx_lock(ew.lock);
++		ew.head = (ew.head + 1) % EW_TXQ;
++		ew.n--;
++		lck_mtx_unlock(ew.lock);
++		if (e == 0) {
++			ew.tx_frames++;
++		} else {
++			ew.tx_drop++;
++		}
++	}
++}
++
++/* tear the station down (VDEV_DOWN, PEER_DELETE, VDEV_STOP as ath10k does) so that the next join starts clean */
++static void
++jn_cleanup(void)
++{
++	uint8_t c[32];
++	uint32_t v[3] = { 0, 0, 0 };
++
++	if (g_wlan_crashed || g_modem_crashed) {
++		return;
++	}
++	if (jn.vdev_up) {
++		(void)wp_wmi("vdev down", c, wp_cmd(c, 0x5007, 94, v, 4));
++	}
++	if (jn.peer) {
++		v[0] = 0;
++		memcpy(&v[1], jn.bssid, 6);
++		jn.peer_mapped = true;                  /* cleared by HTT PEER_UNMAP */
++		(void)wp_wmi("peer delete", c, wp_cmd(c, 0x6002, 98, v, 12));
++		for (unsigned t = 0; t < 1000 && jn.peer_mapped; t += 5) {
++			wp_poll();
++			sleep_ms(5);
++		}
++	}
++	if (jn.vdev_started) {
++		v[0] = 0;
++		jn.stopped = false;
++		(void)wp_wmi("vdev stop", c, wp_cmd(c, 0x5006, 93, v, 4));
++		for (unsigned t = 0; t < 2000 && !jn.stopped; t += 5) {
++			wp_poll();
++			sleep_ms(5);
++		}
++	}
++	ev("EW: station torn down%s", jn.stopped ? "" : " (no VDEV_STOPPED)");
++}
++
++/* join, run, and join again when the link is lost: until the WLAN domain or the modem crashes */
++static void
++wlan_station_loop(void)
++{
++	uint64_t started = nt_us();
++	unsigned lines = 0;
++
++	for (;;) {
++		bool found = false;
++		uint64_t next_mon;
++
++		if (g_wlan_crashed || g_modem_crashed) {
++			return;
++		}
++		for (unsigned att = 0; att < 4 && !found && !g_wlan_crashed; att++) {
++			wp_scan();
++			wp_fault_check("scan");
++			if (!wp.scan_done) {
++				break;
++			}
++			found = jn_read_conf() && jn_pick();
++		}
++		if (!found || !jn_join()) {
++			ev("EW: no connection (found %u): trying again in 5 s", found);
++			if (jn.active) {
++				jn_cleanup();
++			}
++			for (unsigned t = 0; t < 5000 && !g_wlan_crashed; t += 10) {
++				wp_poll();
++				sleep_ms(10);
++			}
++			memset(&nt, 0, sizeof(nt));
++			{
++				uint32_t keep_rx = wp.rx_idx;       /* the HTT RX ring goes on where it was */
++
++				memset(&jn, 0, sizeof(jn));
++				wp.rx_idx = keep_rx;
++			}
++			continue;
++		}
++		wp_fault_check("join done");
++		jn_net_test();                                  /* DHCP, then ew0 gets the address (service mode) */
++		ev("EW: service running");
++		next_mon = nt_us() + 5000000;
++		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
++			wp_poll();
++			wlan_tx_pump();
++			sleep_ms(2);
++			if (nt_us() >= next_mon) {
++				uint8_t c[16];
++				uint32_t id = 0x1d001, v = ++wp.echo_sent, sg = g_smmu[0x48 / 4];
++				uint16_t l4 = 4, tg = 149;
++
++				next_mon += 5000000;
++				lines++;
++				memcpy(c, &id, 4); memcpy(c + 4, &l4, 2); memcpy(c + 6, &tg, 2); memcpy(c + 8, &v, 4);
++				(void)wp_send(1, wp.wmi_eid, c, 12);
++				wp_fault_check("monitor");
++				if (sg) {
++					ev("EW: global fault sgfsr %#x", sg);
++					g_smmu[0x48 / 4] = sg;
++				}
++				if (lines % 6 == 0) {
++					ev("EW: %llu s: tx %llu rx %llu drop %llu/%llu echo %u/%u credits %u inflight %u", (nt_us() - started) / 1000000, ew.tx_frames, ew.rx_frames,
++					    ew.tx_drop, ew.rx_drop, wp.echo_ok, wp.echo_sent, wp.wmi_credits, jn.tx_inflight);
++				}
++			}
++		}
++		if (ew.up) {
++			ew.up = false;
++			ifnet_set_flags(ew.ifp, 0, IFF_RUNNING);
++			ew_link_event(false);
++		}
++		if (g_wlan_crashed || g_modem_crashed) {
++			wp_hist_dump();
++			ev("EW: the %s crashed: link down", g_modem_crashed ? "modem" : "WLAN domain");
++			return;
++		}
++		ev("EW: link lost (kicked by the AP or the firmware): joining again");
++		jn_cleanup();
++		memset(&nt, 0, sizeof(nt));
++		{
++			uint32_t keep_rx = wp.rx_idx;
++
++			memset(&jn, 0, sizeof(jn));
++			wp.rx_idx = keep_rx;
++		}
++	}
++}
++
 +static void
 +wlfw_wmi_bringup(volatile uint32_t *regs)
 +{
 +	uint8_t sc[12] = { 5 };
 +
++	if (g_wlan_probe >= 8 && wp.pool != NULL) {
++		/* restarted after a crash of the WLAN domain: forget the old station, keep the pool, the SMMU bank and ew0 */
++		uint8_t *pool = wp.pool;
++		uint64_t pa = wp.pa;
++
++		ev("EW: restarting the WLAN service");
++		memset(&wp, 0, sizeof(wp));
++		wp.pool = pool;
++		wp.pa = pa;
++		memset(&jn, 0, sizeof(jn));
++		memset(&nt, 0, sizeof(nt));
++		ew.up = false;
++		ew.n = 0;
++		ew.head = 0;
++	}
++	g_wlan_crashed = false;
++	if (g_wlan_probe >= 8 && ew.ifp == NULL) {
++		static const struct { const char *res; unsigned mv; } rails[] = {
++			{ "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 }, { "ldoc11", 3312 },
++		};
++		char log[96];
++		unsigned lp = 0;
++
++		for (unsigned k = 0; k < sizeof(rails) / sizeof(rails[0]); k++) {
++			int err = sweet_rpmh_vreg_set(rails[k].res, rails[k].mv);
++
++			lp += (unsigned)snprintf(log + lp, sizeof(log) - lp, " %s=%d", rails[k].res, err);
++			lp = MIN(lp, (unsigned)sizeof(log) - 1);
++			sleep_ms(2);
++		}
++		ev("EW: WCN3990 rails voted:%s, rfclka2=%d", log, sweet_rpmh_rfclk_enable("rfclka2"));
++		(void)aop_send("{class: clock, res: qdss, val: 1}");
++		ew_if_create();
++	}
 +	if (!wlfw_smmu_identity(0x240) || !wlfw_smmu_identity(0x241)) {
 +		ev("WMI: SMMU not set up");
 +		return;
 +	}
 +	wp.regs = regs;
++	wp_fault_check("smmu setup");
 +	if (!wp_rings() || !wp_wait(&wp.htc_ready, 3000, "HTC ready")) {
 +		return;
 +	}
++	wp_fault_check("htc ready");
 +	wp.wmi_credits = 0;
 +	if (!wp_connect(0x0300) || !wp_wait(&wp.got_conn, 2000, "HTT connect") || wp.conn_st != 0) {
 +		return;
@@ -2224,6 +3032,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (!wp_connect(0x0100) || !wp_wait(&wp.got_conn, 2000, "WMI connect") || wp.conn_st != 0) {
 +		return;
 +	}
++	wp_fault_check("htc connect");
 +	wp.wmi_eid = wp.conn_eid;
 +	wp.wmi_credits = 1;
 +	if (!wp_send(0, 0, sc, sizeof(sc))) {
@@ -2234,11 +3043,17 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (!wp_wait(&wp.svc_ready, 5000, "WMI service ready")) {
 +		return;
 +	}
++	wp_fault_check("service ready");
 +	wp_wait(&wp.svc_avail, 300, "service available");
 +	wp_send_init();
 +	if (wp_wait(&wp.wmi_ready, 5000, "WMI ready")) {
++		wp_fault_check("wmi ready");
++		if (g_wlan_probe >= 8) {
++			wlan_station_loop();
++			return;
++		}
 +		wp_scan();
-+		if (g_wlan_probe >= 7 && wp.scan_done && jn_join()) {
++		if (g_wlan_probe >= 7 && wp.scan_done && jn_read_conf() && jn_pick() && jn_join()) {
 +			jn_net_test();
 +			for (unsigned t = 0; t < 5000; t += 10) {
 +				wp_poll();
@@ -2250,10 +3065,46 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +}
 +
++static volatile uint32_t *g_wlan_regs;
++
++static void
++wlan_thread(void *arg, wait_result_t wr)
++{
++#pragma unused(arg, wr)
++	wlfw_wmi_bringup(g_wlan_regs);
++	ev("EW: service thread ended");
++	thread_terminate(current_thread());
++}
++
++static void
++wlan_start_thread(volatile uint32_t *regs)
++{
++	thread_t th;
++
++	g_wlan_regs = regs;
++	if (kernel_thread_start(wlan_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		ev("EW: cannot start the service thread");
++	}
++}
++
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2316,14 +4554,23 @@
+ {
+-	volatile uint32_t *regs = (volatile uint32_t *)ml_io_map_unmappable(WCN_MMIO, WCN_MMIO_SIZE, WIMG_IO);
++	volatile uint32_t *regs;
+ 
++	if (g_wlan_probe >= 8 && g_wlan_regs != NULL) {
++		wlan_start_thread(g_wlan_regs);                 /* the service restarts after a crash of the WLAN domain */
++		return;
++	}
++	regs = (volatile uint32_t *)ml_io_map_unmappable(WCN_MMIO, WCN_MMIO_SIZE, WIMG_IO);
+ 	if (regs == NULL) {
+ 		ev("WLAN probe: cannot map the chip's registers");
+ 		return;
+@@ -2316,14 +5366,25 @@
  		g_events[0] = 0;
  	}
  	ev("WLAN probe: registers mapped at %p", regs);
@@ -2270,6 +3121,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wlfw_dma_test(regs);
 +	} else if (g_wlan_probe == 3) {
 +		wlfw_smmu_dump(false);
++	} else if (g_wlan_probe == 8) {
++		wlan_start_thread(regs);
 +	} else if (g_wlan_probe == 6 || g_wlan_probe == 7) {
 +		wlfw_wmi_bringup(regs);
 +	} else if (g_wlan_probe == 5) {
@@ -2279,3 +3132,83 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		wlfw_dma_test(regs);
  	}
  }
+@@ -2379,6 +5440,8 @@
+ static bool
+ wlfw_assign(uint64_t addr, uint64_t size, bool secure)
+ {
++	static uint64_t done[4];
++	static unsigned ndone;
+ 	vm_offset_t page = 0;
+ 	uint8_t *p;
+ 	uint64_t answer = ~0ull, phys;
+@@ -2386,6 +5449,12 @@
+ 	unsigned n = secure ? 2 : 3;
+ 	int32_t result;
+ 
++	for (unsigned i = 0; i < ndone; i++) {
++		if (done[i] == addr) {
++			ev("WLFW assign_mem %#llx +%#llx: already shared with the WLAN (restart)", addr, size);
++			return true;
++		}
++	}
+ 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		return false;
+ 	}
+@@ -2409,6 +5478,9 @@
+ 	scm_fifth = phys + 256;
+ 	result = scm("to share the WLAN memory", SCM_64 | SCM_SIP | SCM_MP_ASSIGN, SCM_ARGS_ASSIGN, phys + 64, 16, phys, &answer);
+ 	ev("WLFW assign_mem %#llx +%#llx (%s): %d", addr, size, secure ? "secure" : "shared", result);
++	if (result == 0 && ndone < 4) {
++		done[ndone++] = addr;
++	}
+ 	return result == 0;
+ }
+ 
+@@ -2711,7 +5783,12 @@
+ 	uint32_t client = WLFW_CLIENT_ID;
+ 
+ 	if (g_wlfw.state != WL_IDLE) {
+-		return;
++		if (g_wlfw.state != WL_DONE || g_wlan_probe < 8) {
++			return;
++		}
++		/* the WLAN protection domain restarted (crash recovery): the whole sequence again, on the new port */
++		memset(&g_wlfw, 0, offsetof(typeof(g_wlfw), out));
++		ev("WLFW service %u is back: starting over", WLFW_SERVICE);
+ 	}
+ 	g_tftp_ch = ch;
+ 	g_wlfw.known = true;
+@@ -3092,7 +6169,13 @@
+ mpss_thread(void *arg, wait_result_t result)
+ {
+ #pragma unused(arg, result)
+-	bool ok = mpss_start();
++	bool ok;
++
++	if (g_wlan_probe >= 8) {
++		/* before the modem boots, as ath10k_snoc enables its "qdss" clock before the firmware runs */
++		(void)aop_send("{class: clock, res: qdss, val: 1}");
++	}
++	ok = mpss_start();
+ 	if (!ok) {
+ 		printf("SWEET MPSS: failed to start\n");
+ 		(void)thread_terminate(current_thread());
+@@ -3160,12 +6243,17 @@
+ 				g_events_second = (uint32_t)(tick / 20);
+ 				for (int sub = 0; sub < 10; sub++) {
+ 					sleep_ms(5);
+-					if (g_glink.ready) {
++					if (g_glink.ready && !g_modem_crashed) {
+ 						sweet_glink_poll();
+ 						sweet_tftp_pump();
+ 					}
+ 				}
+ 
++				if (g_modem_crashed) {
++					/* the modem's SMEM state is not ours to poke while it restarts (a GLINK send aborted the kernel) */
++					continue;
++				}
++
+ 				/* 1. Outbound SMP2P setup */
+ 				if (tick <= 100 || tick % 200 == 0) {
+ 					sweet_smp2p_setup_outbound(phdr, part_size);
