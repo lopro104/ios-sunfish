@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -2301,6 +2301,820 @@
+@@ -2301,6 +2301,1157 @@
  	}
  }
  
@@ -296,19 +296,28 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 + * rings (source CE0 = HTC control tx, CE3 = WMI tx; destination CE1 = HTT rx, CE2 = control/WMI rx), HTC ready,
 + * connect HTT and WMI, setup complete, WMI service ready -> init -> ready (the MAC address).
 + */
-+#define WP_POOL         0x400000u
++#define WP_POOL         0xc00000u
 +#define WP_HOSTMEM      0x100000u
 +#define WP_BUF          2048u
-+#define WP_NR           4
++#define WP_NR           5
++#define WP_HTT_FRAG     0x400000u
++#define WP_HTT_RXRING   0x420000u
++#define WP_HTT_ALLOCIDX 0x424000u
++#define WP_HTT_RXBUF    0x800000u
++#define WP_HTT_RINGSZ   2048u
++#define WP_HTT_BUFSZ    2048u
++#define WP_HTT_FRAGS    1056u
 +
 +static const struct wp_ring_cfg {
 +	unsigned ce, n, ring, bufs;
 +	bool src;
++	uint32_t dmax;
 +} wp_cfg[WP_NR] = {
-+	{ 0, 32, 0x000, 0x10000, true },
-+	{ 3, 32, 0x400, 0x20000, true },
-+	{ 1, 32, 0x800, 0x30000, false },
-+	{ 2, 64, 0xc00, 0x40000, false },
++	{ 0, 32, 0x000, 0x10000, true, 0x800 },
++	{ 3, 32, 0x400, 0x20000, true, 0x800 },
++	{ 1, 32, 0x800, 0x30000, false, 0 },
++	{ 2, 64, 0xc00, 0x40000, false, 0 },
++	{ 4, 16, 0x1000, 0x60000, true, 0x100 },        /* HTT host to target */
 +};
 +
 +static struct {
@@ -321,6 +330,15 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	uint8_t conn_st, conn_eid;
 +	uint16_t conn_svc, conn_max, credits, credit_size;
 +	uint32_t wmi_credits, nchunks, svc[32], svc_bytes, msgs;
++	bool htt_conf, scan_started, scan_done;
++	uint8_t htt_major, htt_minor;
++	unsigned beacons, nbss, foreign;
++	struct {
++		uint8_t bssid[6];
++		uint16_t mhz;
++		int8_t rssi;
++		char ssid[33];
++	} bss[48];
 +	struct {
 +		uint32_t req_id, len;
 +		uint64_t pa;
@@ -404,7 +422,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			ce[0] = (uint32_t)rpa;
 +			ce[1] = (ce[1] & ~0x1fu) | ((uint32_t)(rpa >> 32) & 0x1f);
 +			ce[2] = n;
-+			ce[0x18 / 4] = (ce[0x18 / 4] & ~(0xffffu | (1u << 17))) | 0x800;  /* dmax 2048, no byte swap */
++			ce[0x18 / 4] = (ce[0x18 / 4] & ~(0xffffu | (1u << 17))) | wp_cfg[r].dmax;     /* dmax, no byte swap */
 +		} else {
 +			wp.sw[r] = ce[0x48 / 4] & (n - 1);
 +			wp.wr[r] = ce[0x40 / 4] & (n - 1);
@@ -436,6 +454,12 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (8 + plen > WP_BUF || ((srri - 1 - wr) & mask) == 0) {
 +		return false;
 +	}
++	if (eid != 0 && eid == wp.wmi_eid) {
++		if (wp.wmi_credits == 0) {
++			return false;
++		}
++		wp.wmi_credits--;
++	}
 +	buf[0] = eid;
 +	buf[1] = (eid != 0 && eid == wp.wmi_eid) ? 1 : 0;      /* NEED_CREDIT_UPDATE on the credit-flow endpoint */
 +	memcpy(buf + 2, &l, 2);
@@ -451,7 +475,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	wp_sync(d, sizeof(*d));
 +	wr = (wr + 1) & mask;
 +	wp.wr[r] = wr;
-+	wp.regs[(wp_cfg[r].ce == 0 ? 0x32000u : 0x3200cu) / 4] = wr;
++	wp.regs[(wp_cfg[r].ce == 0 ? 0x32000u : (wp_cfg[r].ce == 3 ? 0x3200cu : 0x32010u)) / 4] = wr;
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +	return true;
 +}
@@ -562,7 +586,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	uint32_t abi[7];
 +
 +	for (unsigned k = 0; k < wp.nreq; k++) {
-+		if ((uint64_t)off + wp.req_len[k] > WP_POOL) {
++		if ((uint64_t)off + wp.req_len[k] > WP_HTT_FRAG) {
 +			ev("WMI: memory request %u does not fit the pool", k);
 +			return;
 +		}
@@ -641,6 +665,310 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +}
 +
++
++/* ---- passive scan (the fork's 1120/1123): HTT version + setup, WMI chain masks, channels, regdomain, vdev, start scan ---- */
++static const uint8_t wp_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
++static const uint16_t wp_chans[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5745, 5765, 5785, 5805, 5825,
++};
++#define WP_NCHAN        ((unsigned)(sizeof(wp_chans) / sizeof(wp_chans[0])))
++
++static void
++wp_scan_event(const uint8_t *t, uint32_t len)
++{
++	uint16_t tl, tag;
++	uint32_t e[6];
++
++	if (len < 4 + 24) {
++		return;
++	}
++	memcpy(&tl, t, 2);
++	memcpy(&tag, t + 2, 2);
++	if (tag != 36 || tl < 24) {
++		return;
++	}
++	memcpy(e, t + 4, 24);
++	if (e[0] & 0x8) {
++		wp.foreign++;
++	}
++	if (e[0] & 0x1) {
++		wp.scan_started = true;
++		ev("WMI: scan STARTED id %#x", e[4]);
++	}
++	if (e[0] & 0x40) {
++		ev("WMI: scan START FAILED reason %u", e[1]);
++		wp.scan_done = true;
++	}
++	if (e[0] & 0x2) {
++		ev("WMI: scan COMPLETED reason %u, %u channel visits, %u beacons, %u BSS", e[1], wp.foreign, wp.beacons, wp.nbss);
++		wp.scan_done = true;
++	}
++}
++
++static void
++wp_mgmt_rx(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *h = NULL, *fr = NULL;
++	uint32_t frl = 0, hd[6];
++	unsigned k;
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == 44 && l >= 40) {
++			h = t + o + 4;
++		} else if (tag == 17) {
++			fr = t + o + 4;
++			frl = l;
++		}
++		o += 4u + l;
++	}
++	if (!h || !fr) {
++		return;
++	}
++	memcpy(hd, h, 24);
++	frl = MIN(frl, hd[4]);
++	if ((hd[5] & 0x29) || frl < 36 || (fr[0] != 0x80 && fr[0] != 0x50)) {
++		return;
++	}
++	wp.beacons++;
++	for (k = 0; k < wp.nbss; k++) {
++		if (memcmp(wp.bss[k].bssid, fr + 16, 6) == 0) {
++			return;
++		}
++	}
++	if (wp.nbss >= 48) {
++		return;
++	}
++	k = wp.nbss++;
++	memcpy(wp.bss[k].bssid, fr + 16, 6);
++	wp.bss[k].mhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] : 5000 + 5 * hd[0]);
++	wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
++	wp.bss[k].ssid[0] = 0;
++	for (uint32_t o = 36; o + 2 <= frl;) {
++		uint8_t id = fr[o], l = fr[o + 1];
++
++		if (o + 2 + l > frl) {
++			break;
++		}
++		if (id == 0) {
++			unsigned n = MIN(l, 32u);
++
++			for (unsigned i = 0; i < n; i++) {
++				uint8_t ch = fr[o + 2 + i];
++
++				wp.bss[k].ssid[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
++			}
++			wp.bss[k].ssid[n] = 0;
++			break;
++		}
++		o += 2u + l;
++	}
++}
++
++static uint32_t
++wp_cmd(uint8_t *c, uint32_t id, uint16_t tag, const void *v, uint16_t len)
++{
++	memcpy(c, &id, 4);
++	memcpy(c + 4, &len, 2);
++	memcpy(c + 6, &tag, 2);
++	memcpy(c + 8, v, len);
++	return 8u + len;
++}
++
++static void
++wp_tlv(uint8_t *c, uint32_t *n, uint16_t tag, const void *v, uint16_t len)
++{
++	memcpy(c + *n, &len, 2);
++	memcpy(c + *n + 2, &tag, 2);
++	if (len) {
++		memcpy(c + *n + 4, v, len);
++	}
++	*n += 4u + len;
++}
++
++static void wp_poll(void);
++
++/* send one WMI command once the single credit is back (HTC trailers return it) */
++static bool
++wp_wmi(const char *what, const uint8_t *c, uint32_t n)
++{
++	for (unsigned t = 0; t < 3000; t += 5) {
++		wp_poll();
++		if (wp.wmi_credits && wp_send(1, wp.wmi_eid, c, n)) {
++			return true;
++		}
++		sleep_ms(5);
++	}
++	ev("WMI: %s: no credit", what);
++	return false;
++}
++
++static bool
++wp_htt_setup(void)
++{
++	uint8_t m[64];
++	uint64_t bank = wp.pa + WP_HTT_FRAG, idxpa = wp.pa + WP_HTT_ALLOCIDX, ringpa = wp.pa + WP_HTT_RXRING;
++	uint64_t *ring = (uint64_t *)(wp.pool + WP_HTT_RXRING);
++	uint16_t maxid = WP_HTT_FRAGS - 1, r16[4] = { WP_HTT_RINGSZ, WP_HTT_BUFSZ, 0xffff, WP_HTT_RINGSZ - 1 };
++	static const uint16_t offs[10] = { 74, 90, 27, 37, 4, 26, 7, 12, 1, 2 };
++	uint8_t ag[4] = { 5, 64, 3, 0 };
++
++	memset(m, 0, sizeof(m));                        /* FRAG_DESC_BANK_CFG */
++	m[0] = 6;
++	m[2] = 1;
++	m[3] = 72;
++	memcpy(m + 4, &bank, 8);
++	memcpy(m + 36 + 2, &maxid, 2);
++	m[60] = 1;
++	if (!wp_send(4, wp.htt_eid, m, 64)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < WP_HTT_RINGSZ; i++) {  /* the RX ring: buffer i at pool + RXBUF + i * 2 KiB, 2047 posted */
++		ring[i] = i < WP_HTT_RINGSZ - 1 ? wp.pa + WP_HTT_RXBUF + (uint64_t)i * WP_HTT_BUFSZ : 0;
++	}
++	*(volatile uint32_t *)(wp.pool + WP_HTT_ALLOCIDX) = WP_HTT_RINGSZ - 1;
++	wp_sync(wp.pool + WP_HTT_FRAG, WP_HTT_FRAGS * 72);
++	wp_sync(wp.pool + WP_HTT_RXRING, 0x5000);
++	wp_sync(wp.pool + WP_HTT_RXBUF, WP_HTT_RINGSZ * WP_HTT_BUFSZ);
++	memset(m, 0, sizeof(m));                        /* RX_RING_CFG */
++	m[0] = 2;
++	m[1] = 1;
++	memcpy(m + 4, &idxpa, 8);
++	memcpy(m + 12, &ringpa, 8);
++	memcpy(m + 20, r16, 8);
++	memcpy(m + 28, offs, 20);
++	if (!wp_send(4, wp.htt_eid, m, 48) || !wp_send(4, wp.htt_eid, ag, 4)) {
++		return false;
++	}
++	ev("WMI: HTT setup sent: frag bank %u x 72, RX ring %u", WP_HTT_FRAGS, WP_HTT_RINGSZ);
++	return true;
++}
++
++static void
++wp_scan(void)
++{
++	uint8_t c[1024], vm[4] = { 0, 0, 0, 0 };
++	uint32_t n, num = WP_NCHAN;
++
++	if (!wp_send(4, wp.htt_eid, vm, 4)) {
++		ev("WMI: HTT version request not sent");
++		return;
++	}
++	for (unsigned t = 0; t < 3000 && !wp.htt_conf; t += 10) {
++		wp_poll();
++		sleep_ms(10);
++	}
++	if (!wp.htt_conf || !wp_htt_setup()) {
++		ev("WMI: no HTT version / setup: stopping");
++		return;
++	}
++	for (unsigned k = 0; k < 2; k++) {              /* PDEV_SET_PARAM tx (1) / rx (2) chain mask = 3 */
++		uint32_t p[3] = { 0, k ? 2u : 1u, 3 };
++
++		n = wp_cmd(c, 0x4003, 82, p, 12);
++		if (!wp_wmi("chain mask", c, n)) {
++			return;
++		}
++	}
++	n = wp_cmd(c, 0x3003, 79, &num, 4);             /* SCAN_CHAN_LIST, every channel passive */
++	{
++		uint16_t al = (uint16_t)(WP_NCHAN * 28), tg = 18;
++
++		memcpy(c + n, &al, 2);
++		memcpy(c + n + 2, &tg, 2);
++		n += 4;
++	}
++	for (unsigned k = 0; k < WP_NCHAN; k++) {
++		uint32_t ch[6];
++		bool g5 = wp_chans[k] > 5000, dfs = wp_chans[k] >= 5260 && wp_chans[k] <= 5320;
++
++		memset(ch, 0, sizeof(ch));
++		ch[0] = wp_chans[k];
++		ch[1] = wp_chans[k];
++		ch[3] = (g5 ? 0u : 1u) | (1u << 7) | (1u << 11) | (1u << 12) | (dfs ? (1u << 10) : 0);
++		ch[4] = 0u | (40u << 8) | (40u << 16);
++		ch[5] = 0u | (40u << 8);
++		wp_tlv(c, &n, 80, ch, 24);
++	}
++	if (!wp_wmi("channel list", c, n)) {
++		return;
++	}
++	{
++		uint32_t r[6] = { 0, 0x52, 0x52, 0x52, 0x30, 0x10 };      /* PDEV_SET_REGDOMAIN */
++
++		n = wp_cmd(c, 0x4001, 81, r, 24);
++		if (!wp_wmi("regdomain", c, n)) {
++			return;
++		}
++	}
++	{
++		uint32_t v[5] = { 0, 2, 0, 0, 0 };                        /* VDEV_CREATE: vdev 0, station */
++
++		memcpy(&v[3], wp_mac, 6);
++		n = wp_cmd(c, 0x5001, 86, v, 20);
++		if (!wp_wmi("vdev create", c, n)) {
++			return;
++		}
++	}
++	{
++		uint32_t v[3] = { 0, 0x30, 1 };                           /* VDEV_SET_PARAM tx_encap native wifi */
++
++		n = wp_cmd(c, 0x5008, 95, v, 12);
++		if (!wp_wmi("vdev encap", c, n)) {
++			return;
++		}
++	}
++	{
++		uint32_t s[25];
++		uint32_t f[WP_NCHAN];
++		uint8_t bc[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0 };
++
++		memset(s, 0, sizeof(s));
++		s[0] = 0xa000;
++		s[1] = 0xa001;
++		s[3] = 1;
++		s[4] = 0x11f;
++		s[5] = 50;
++		s[6] = 150;
++		s[7] = 50;
++		s[8] = 500;
++		s[12] = 20000;
++		s[13] = 5;
++		s[14] = 0x31;                                             /* CHAN_STAT_EVENT | PASSIVE (inverted probe filter) */
++		s[16] = WP_NCHAN;
++		s[17] = 1;
++		s[20] = 3;
++		n = wp_cmd(c, 0x3001, 77, s, 100);
++		for (unsigned k = 0; k < WP_NCHAN; k++) {
++			f[k] = wp_chans[k];
++		}
++		wp_tlv(c, &n, 16, f, (uint16_t)sizeof(f));
++		wp_tlv(c, &n, 19, NULL, 0);
++		wp_tlv(c, &n, 19, bc, 8);
++		wp_tlv(c, &n, 17, NULL, 0);
++		if (!wp_wmi("start scan", c, n)) {
++			return;
++		}
++	}
++	ev("WMI: scan started (passive)");
++	for (unsigned t = 0; t < 25000 && !wp.scan_done; t += 10) {
++		wp_poll();
++		sleep_ms(10);
++	}
++	for (unsigned k = 0; k < wp.nbss; k++) {
++		ev("BSS %02x%02x%02x%02x%02x%02x %u %d \"%s\"", wp.bss[k].bssid[0], wp.bss[k].bssid[1], wp.bss[k].bssid[2], wp.bss[k].bssid[3],
++		    wp.bss[k].bssid[4], wp.bss[k].bssid[5], wp.bss[k].mhz, wp.bss[k].rssi, wp.bss[k].ssid);
++	}
++	ev("WMI: scan %s: %u BSS", wp.scan_done ? "done" : "TIMEOUT", wp.nbss);
++}
++
 +/* one received message (HTC header: eid, flags, len, ctrl[2], seq?, ...) */
 +static void
 +wp_rx(unsigned ce, const uint8_t *p, uint32_t len)
@@ -650,7 +978,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	const uint8_t *pl;
 +
 +	wp.msgs++;
-+	if (wp.msgs <= 12) {
++	if (wp.msgs <= 5) {
 +		ev("WMI: CE%u msg %u bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", ce, len, p[0], p[1], p[2], p[3], p[4],
 +		    p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
 +	}
@@ -672,7 +1000,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		}
 +		for (uint32_t k = 0; rid == 1 && k + 4 <= rl; k += 4) {
 +			if (wp.wmi_eid && pl[o + 4 + k] == wp.wmi_eid) {
-+				wp.wmi_credits += pl[o + 4 + k + 1];
++				wp.wmi_credits = MIN(wp.wmi_credits + pl[o + 4 + k + 1], 1u);
 +			}
 +		}
 +		o += 4u + rl;
@@ -732,13 +1060,20 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +				o += 4u + l;
 +			}
 +			ev("WMI: READY, MAC %02x:%02x:%02x:%02x:%02x:%02x", wp.mac[0], wp.mac[1], wp.mac[2], wp.mac[3], wp.mac[4], wp.mac[5]);
++		} else if (evid == 0x3001) {
++			wp_scan_event(pl + 4, plen - 4);
++		} else if (evid == 0x7001) {
++			wp_mgmt_rx(pl + 4, plen - 4);
 +		} else {
-+			ev("WMI: event %#x (%u bytes)", evid, plen);
++			wp.msgs--;
 +		}
 +		return;
 +	}
-+	if (wp.htt_eid && p[0] == wp.htt_eid) {
-+		ev("WMI: HTT message type %u (%u bytes)", pl[0], plen);
++	if (wp.htt_eid && p[0] == wp.htt_eid && plen >= 4 && pl[0] == 0 && !wp.htt_conf) {
++		wp.htt_conf = true;
++		wp.htt_minor = pl[1];
++		wp.htt_major = pl[2];
++		ev("WMI: HTT version %u.%u", wp.htt_major, wp.htt_minor);
 +	}
 +}
 +
@@ -816,13 +1151,23 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	wp_wait(&wp.svc_avail, 300, "service available");
 +	wp_send_init();
-+	wp_wait(&wp.wmi_ready, 5000, "WMI ready");
++	if (wp_wait(&wp.wmi_ready, 5000, "WMI ready")) {
++		wp_scan();
++	}
 +}
 +
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2323,7 +3137,16 @@
+@@ -2316,14 +3467,23 @@
+ 		g_events[0] = 0;
+ 	}
+ 	ev("WLAN probe: registers mapped at %p", regs);
+-	for (unsigned ce = 0; ce < 7; ce++) {
++	for (unsigned ce = 0; ce < (g_wlan_probe >= 6 ? 0u : 7u); ce++) {
+ 		uint32_t base = (WCN_CE_BASE + 0x1000 * ce) / 4;
+ 
+ 		/* sr_size 0x8, dr_size 0x14, current_srri 0x44, current_drri 0x48 */
  		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
  		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
  	}

@@ -679,3 +679,16 @@ HTC CONNECT_SERVICE HTT 0x300 -> endpoint 1 (max 2000), WMI 0x100 -> endpoint 2 
 Source ring write indexes go through the shadow registers 0x32000 (CE0) / 0x3200c (CE3), as in the forks.
 NEXT: WMI commands for a passive scan: pdev params, vdev create (station), scan start; read WMI mgmt-rx events (beacons) -> list SSIDs.
 Then a supplicant/auth/assoc, then an iOS network interface. Reference: Bergamota docs/WIFI_IOS26_PHASE2.md, patches-12377/1119+.
+
+## 2026-10-27 ~17:10 MILESTONE: FIRST WI-FI SCAN ON THE PIXEL 4a: 19 BSS (passive, nothing transmitted) (wlanprobe=6, shim/out/shim-local-0138s-ce.img)
+After WMI READY, wlfw_wmi_bringup -> wp_scan() (ported from the Beryllium fork's 1120/1123): HTT VERSION_REQ on CE4 (src ring 16, dmax
+256, shadow write index 0x32010) -> VERSION_CONF 3.96; HTT setup (frag desc bank 1056 x 72, RX ring 2048 x 2 KiB with 2047 posted,
+RX_RING_CFG, AGGR_CFG 64/3) - without it no frames reach the host; WMI one command per credit (credits come back in HTC trailers, capped
+at 1): pdev tx/rx chain mask 3, SCAN_CHAN_LIST (26 channels, all passive), PDEV_SET_REGDOMAIN 0x52, VDEV_CREATE station vdev 0 (MAC
+02:00:5e:77:e0:01, locally administered placeholder), VDEV_SET_PARAM encap native wifi, START_SCAN (passive, flags 0x31). Result:
+STARTED, COMPLETED reason 0 after 26 channel visits, 26 beacons/probe responses, 19 BSS (2.4 and 5 GHz, -54..-92 dBm) through WMI MGMT_RX
+(event 0x7001), scan events 0x3001. Pool is now 12 MiB contiguous (kmem_alloc_contig). No RF clock vote was needed. (SSIDs of
+neighbours stay out of git.)
+NEXT (needs a network to join; every step from here TRANSMITS): VDEV_START on the AP channel, PEER_CREATE, auth/assoc frames via WMI
+mgmt TX, PEER_ASSOC, VDEV_UP, WPA2 4-way handshake in the kernel (or a helper), key install, HTT TX/RX data path, then an iOS network
+interface (en1 / IONetworkInterface; the forks' en0 Apple80211 stand-in is the longer path). Real MAC: /chosen/cdt/cdb2/wlan_mac1.
