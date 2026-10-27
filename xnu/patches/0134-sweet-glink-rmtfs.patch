@@ -1,0 +1,1659 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -431,83 +431,1307 @@
+ 
+ 
+ static void
+-sweet_smp2p_setup_outbound(struct smem_partition_header *phdr, uint64_t part_phys, uint64_t part_base, uint64_t map_sz)
++sweet_apcs_kick(uint32_t bit)
++{
++	volatile uint32_t *apcs = (volatile uint32_t *)ml_io_map_unmappable(0x17c00000, PAGE_SIZE, WIMG_WCOMB);
++	if (apcs) {
++		apcs[3] = (1u << bit);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ml_io_unmap((vm_offset_t)apcs, PAGE_SIZE);
++	}
++}
++
++static void *
++sweet_smem_get_entry(struct smem_partition_header *phdr, uint32_t part_size, uint16_t item, uint32_t *out_size)
+ {
+ 	uint32_t cur = sizeof(*phdr);
+-	struct smem_private_entry *existing = NULL;
+ 	while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
+-	       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
++	       cur + sizeof(struct smem_private_entry) <= part_size) {
+ 		struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
+ 		if (e->canary != 0xa5a5) break;
+-		if (e->item == 428) {
+-			existing = e;
++		if (e->item == item) {
++			if (out_size) *out_size = e->size - e->padding_data;
++			return (void *)((uint8_t *)phdr + cur + sizeof(*e) + e->padding_hdr);
++		}
++		cur += sizeof(*e) + e->padding_hdr + e->size;
++	}
++	return NULL;
++}
++
++static void *
++sweet_smem_alloc_entry(struct smem_partition_header *phdr, uint32_t part_size, uint16_t item, uint32_t size)
++{
++	uint32_t existing_sz = 0;
++	void *existing = sweet_smem_get_entry(phdr, part_size, item, &existing_sz);
++	if (existing) return existing;
++
++	uint32_t alloc_off = phdr->offset_free_uncached;
++	size_t aligned_sz = (size + 7) & ~7;
++	size_t total_alloc = sizeof(struct smem_private_entry) + aligned_sz;
++
++	if (alloc_off + total_alloc > phdr->offset_free_cached ||
++	    alloc_off + total_alloc > part_size) {
++		printf("SWEET SMEM: out of space in partition for item %u (sz %u)\n", item, size);
++		return NULL;
++	}
++
++	struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + alloc_off);
++	e->canary = 0xa5a5;
++	e->item = item;
++	e->size = (uint32_t)aligned_sz;
++	e->padding_data = (uint16_t)(aligned_sz - size);
++	e->padding_hdr = 0;
++	e->reserved = 0;
++
++	void *ptr = (void *)(e + 1);
++	memset(ptr, 0, aligned_sz);
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	phdr->offset_free_uncached += (uint32_t)total_alloc;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	printf("SWEET SMEM: allocated item %u (size %u) at off %#x\n", item, size, alloc_off);
++	note("[alloc item %u @ %#x]", item, alloc_off);
++	return ptr;
++}
++
++static void
++sweet_smp2p_setup_outbound(struct smem_partition_header *phdr, uint32_t part_size)
++{
++	struct smp2p_smem_item *out = (struct smp2p_smem_item *)sweet_smem_alloc_entry(phdr, part_size, 428, sizeof(struct smp2p_smem_item));
++	if (out) {
++		out->magic = 0x504d5324; /* "$SMP" */
++		out->local_pid = 0;      /* APPS */
++		out->remote_pid = 1;     /* MODEM */
++		out->total_entries = 16;
++		out->valid_entries = 2;
++		out->features = 1;       /* SMP2P_FEATURE_SSR_ACK */
++		memcpy(out->entries[0].name, "master-kernel", 14);
++		out->entries[0].value = 0;
++		memcpy(out->entries[1].name, "ipa", 4);
++		out->entries[1].value = 0;
++
++		__asm__ volatile ("dsb sy" ::: "memory");
++		out->version = 1;
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++
++	/* Kick modem via APCS bit 14 */
++	sweet_apcs_kick(14);
++}
++
++static void
++sweet_smp2p_poll_inbound(struct smem_partition_header *phdr, uint32_t part_size, int tick)
++{
++	uint32_t ssz = 0;
++	struct smp2p_smem_item *smp = (struct smp2p_smem_item *)sweet_smem_get_entry(phdr, part_size, 435, &ssz);
++	if (!smp) return;
++
++	static uint16_t last_smp_valid = 0xffff;
++	if (tick == 1 || smp->valid_entries != last_smp_valid || tick % 200 == 0) {
++		printf("SWEET SMP2P 435: mag %#x, ver %u, %u->%u, valid %u/%u, flags %#x\n",
++		    smp->magic, smp->version, smp->local_pid, smp->remote_pid,
++		    smp->valid_entries, smp->total_entries, smp->flags);
++		if (tick == 1 || smp->valid_entries != last_smp_valid) {
++			note("[smp435: %u->%u v%u valid %u/%u]",
++			    smp->local_pid, smp->remote_pid, smp->version, smp->valid_entries, smp->total_entries);
++		}
++		last_smp_valid = smp->valid_entries;
++	}
++	static uint32_t last_vals[16];
++	for (uint32_t v = 0; v < smp->valid_entries && v < 16; v++) {
++		char ename[17] = {0};
++		memcpy(ename, smp->entries[v].name, 16);
++		if (tick == 1 || smp->entries[v].value != last_vals[v] || tick % 600 == 0) {
++			if (ename[0] || smp->entries[v].value) {
++				printf("SWEET SMP2P: entry %u '%s' = %#x (valid %u)\n",
++				    v, ename, smp->entries[v].value, v < smp->valid_entries);
++				last_vals[v] = smp->entries[v].value;
++				note("[SMP2P '%s'=%#x]", ename, smp->entries[v].value);
++			}
++		}
++	}
++}
++
++static void
++sweet_smem_check_crash(struct smem_partition_header *phdr, uint32_t part_size)
++{
++	uint32_t csz = 0;
++	char *cmsg = (char *)sweet_smem_get_entry(phdr, part_size, 421, &csz);
++	if (cmsg && cmsg[0]) {
++		static char last_crash[128];
++		if (strncmp(last_crash, cmsg, sizeof(last_crash)) != 0) {
++			strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
++			printf("SWEET MPSS CRASH: %s\n", cmsg);
++			note("[CRASH: %.50s]", cmsg);
++		}
++	}
++}
++
++/* =========================================================================
++ * GLINK Native Transport over SMEM & QRTR
++ * ========================================================================= */
++#define SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR   478
++#define SMEM_GLINK_NATIVE_XPRT_FIFO_0       479
++#define SMEM_GLINK_NATIVE_XPRT_FIFO_1       480
++
++#define GLINK_CMD_VERSION           0
++#define GLINK_CMD_VERSION_ACK       1
++#define GLINK_CMD_OPEN              2
++#define GLINK_CMD_CLOSE             3
++#define GLINK_CMD_OPEN_ACK          4
++#define GLINK_CMD_INTENT            5
++#define GLINK_CMD_RX_DONE           6
++#define GLINK_CMD_RX_INTENT_REQ     7
++#define GLINK_CMD_RX_INTENT_REQ_ACK 8
++#define GLINK_CMD_TX_DATA           9
++#define GLINK_CMD_CLOSE_ACK         11
++#define GLINK_CMD_TX_DATA_CONT      12
++#define GLINK_CMD_READ_NOTIF        13
++#define GLINK_CMD_RX_DONE_W_REUSE   14
++#define GLINK_CMD_SIGNALS           15
++
++#define GLINK_VERSION_1             1
++#define GLINK_FEATURE_INTENT_REUSE  (1u << 0)
++
++#define QRTR_TYPE_DATA              1
++#define QRTR_TYPE_HELLO             2
++#define QRTR_TYPE_BYE               3
++#define QRTR_TYPE_NEW_SERVER        4
++#define QRTR_TYPE_DEL_SERVER        5
++#define QRTR_TYPE_DEL_CLIENT        6
++#define QRTR_TYPE_RESUME_TX         7
++#define QRTR_TYPE_EXIT              8
++#define QRTR_TYPE_PING              9
++#define QRTR_TYPE_NEW_LOOKUP        10
++#define QRTR_TYPE_DEL_LOOKUP        11
++
++#define QRTR_PORT_CTRL              0xfffffffeu
++
++struct glink_msg {
++	uint16_t cmd;
++	uint16_t param1;
++	uint32_t param2;
++} __attribute__((packed));
++
++struct glink_msg_intent {
++	uint16_t cmd;
++	uint16_t lcid;
++	uint32_t count;
++	uint32_t size;
++	uint32_t liid;
++} __attribute__((packed));
++
++struct glink_msg_rx_done {
++	uint16_t cmd;
++	uint16_t lcid;
++	uint32_t liid;
++} __attribute__((packed));
++
++struct glink_msg_tx_data {
++	uint16_t cmd;
++	uint16_t lcid;
++	uint32_t riid;
++	uint32_t chunk_size;
++	uint32_t left_size;
++} __attribute__((packed));
++
++struct qrtr_hdr_v1 {
++	uint32_t version;
++	uint32_t type;
++	uint32_t src_node_id;
++	uint32_t src_port_id;
++	uint32_t confirm_rx;
++	uint32_t size;
++	uint32_t dst_node_id;
++	uint32_t dst_port_id;
++} __attribute__((packed));
++
++struct qrtr_ctrl_pkt {
++	uint32_t cmd;
++	union {
++		struct {
++			uint32_t service;
++			uint32_t instance;
++			uint32_t node;
++			uint32_t port;
++		} server;
++		struct {
++			uint32_t node;
++			uint32_t port;
++		} client;
++	};
++} __attribute__((packed));
++
++struct sweet_glink_remote_intent {
++	uint32_t size;
++	uint32_t iid;
++	bool in_use;
++};
++
++struct sweet_glink_channel {
++	char name[32];
++	uint16_t lcid;
++	uint16_t rcid;
++	bool open;
++	bool remote_open;
++	uint32_t rx_count;
++	uint32_t tx_count;
++	struct sweet_glink_remote_intent intents[32];
++	uint32_t num_intents;
++};
++
++struct sweet_glink_state {
++	bool ready;
++	bool version_sent;
++	bool version_ack_received;
++	bool version_ack_sent;
++	uint32_t features;
++	volatile uint32_t *descs;   /* item 478: [0]=tx_tail, [1]=tx_head, [2]=rx_tail, [3]=rx_head */
++	volatile uint8_t *tx_fifo;  /* item 479: 16384 bytes */
++	volatile uint8_t *rx_fifo;  /* item 480: 16384 bytes */
++	uint32_t tx_size;
++	uint32_t rx_size;
++	struct sweet_glink_channel channels[8];
++	uint32_t num_channels;
++};
++
++static struct sweet_glink_state g_glink;
++
++static void
++sweet_glink_rx_peek(struct sweet_glink_state *gl, uint32_t tail, void *dst, size_t count)
++{
++	size_t len = MIN(count, (size_t)(gl->rx_size - tail));
++	memcpy(dst, (const void *)(gl->rx_fifo + tail), len);
++	if (len < count) {
++		memcpy((uint8_t *)dst + len, (const void *)gl->rx_fifo, count - len);
++	}
++}
++
++static void
++sweet_glink_rx_advance(struct sweet_glink_state *gl, size_t count)
++{
++	uint32_t tail = gl->descs[2];
++	tail = (tail + (uint32_t)count) % gl->rx_size;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gl->descs[2] = tail;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++sweet_glink_tx_cmd(struct sweet_glink_state *gl, const void *data, size_t len)
++{
++	uint32_t head = gl->descs[1];
++	uint32_t tail = gl->descs[0];
++	uint32_t avail;
++	if (tail <= head)
++		avail = gl->tx_size - head + tail;
++	else
++		avail = tail - head;
++
++	size_t aligned_len = (len + 7) & ~7;
++	if (avail < aligned_len + 16) {
++		printf("SWEET GLINK TX: FIFO full (avail %u, need %zu)\n", avail, aligned_len);
++		return false;
++	}
++
++	size_t first = MIN(len, (size_t)(gl->tx_size - head));
++	memcpy((void *)(gl->tx_fifo + head), data, first);
++	if (first < len) {
++		memcpy((void *)gl->tx_fifo, (const uint8_t *)data + first, len - first);
++	}
++
++	/* Zero padding */
++	if (aligned_len > len) {
++		uint32_t pad_off = (head + (uint32_t)len) % gl->tx_size;
++		size_t pad_len = aligned_len - len;
++		size_t pfirst = MIN(pad_len, (size_t)(gl->tx_size - pad_off));
++		memset((void *)(gl->tx_fifo + pad_off), 0, pfirst);
++		if (pfirst < pad_len) {
++			memset((void *)gl->tx_fifo, 0, pad_len - pfirst);
++		}
++	}
++
++	head = (head + (uint32_t)aligned_len) % gl->tx_size;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	gl->descs[1] = head;
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/* Kick mailbox 12 */
++	sweet_apcs_kick(12);
++	return true;
++}
++
++static struct sweet_glink_channel *
++sweet_glink_get_or_add_channel(struct sweet_glink_state *gl, const char *name)
++{
++	for (uint32_t i = 0; i < gl->num_channels; i++) {
++		if (strncmp(gl->channels[i].name, name, sizeof(gl->channels[i].name)) == 0) {
++			return &gl->channels[i];
++		}
++	}
++	if (gl->num_channels < 8) {
++		struct sweet_glink_channel *ch = &gl->channels[gl->num_channels++];
++		strncpy(ch->name, name, sizeof(ch->name) - 1);
++		ch->lcid = (uint16_t)gl->num_channels; /* 1-based local id */
++		return ch;
++	}
++	return NULL;
++}
++
++static struct sweet_glink_channel *
++sweet_glink_find_by_rcid(struct sweet_glink_state *gl, uint16_t rcid)
++{
++	for (uint32_t i = 0; i < gl->num_channels; i++) {
++		if (gl->channels[i].rcid == rcid) return &gl->channels[i];
++	}
++	return NULL;
++}
++
++static struct sweet_glink_channel *
++sweet_glink_find_by_lcid(struct sweet_glink_state *gl, uint16_t lcid)
++{
++	for (uint32_t i = 0; i < gl->num_channels; i++) {
++		if (gl->channels[i].lcid == lcid) return &gl->channels[i];
++	}
++	return NULL;
++}
++
++static bool
++sweet_glink_send_data(struct sweet_glink_state *gl, struct sweet_glink_channel *ch, const void *data, size_t len)
++{
++	struct sweet_glink_remote_intent *intent = NULL;
++	for (uint32_t i = 0; i < ch->num_intents; i++) {
++		if (!ch->intents[i].in_use && ch->intents[i].size >= len) {
++			intent = &ch->intents[i];
+ 			break;
+ 		}
+-		cur += sizeof(*e) + e->padding_hdr + e->size;
+-	}
+-
+-	struct smp2p_smem_item *out = NULL;
+-
+-	if (!existing) {
+-		uint32_t alloc_off = phdr->offset_free_uncached;
+-		size_t item_sz = sizeof(struct smp2p_smem_item);
+-		size_t aligned_sz = (item_sz + 7) & ~7;
+-		size_t total_alloc = sizeof(struct smem_private_entry) + aligned_sz;
+-
+-		if ((part_phys - part_base) + alloc_off + total_alloc <= map_sz) {
+-			struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + alloc_off);
+-			e->canary = 0xa5a5;
+-			e->item = 428;
+-			e->size = (uint32_t)aligned_sz;
+-			e->padding_data = (uint16_t)(aligned_sz - item_sz);
+-			e->padding_hdr = 0;
+-			e->reserved = 0;
+-
+-			out = (struct smp2p_smem_item *)(e + 1);
+-			memset((void *)out, 0, aligned_sz);
+-			out->magic = 0x504d5324; /* "$SMP" */
+-			out->local_pid = 0;      /* APPS */
+-			out->remote_pid = 1;     /* MODEM */
+-			out->total_entries = 16;
+-			out->valid_entries = 2;
+-			out->features = 1;       /* SMP2P_FEATURE_SSR_ACK */
+-			memcpy(out->entries[0].name, "master-kernel", 14);
+-			out->entries[0].value = 0;
+-			memcpy(out->entries[1].name, "ipa", 4);
+-			out->entries[1].value = 0;
+-
++	}
++	if (!intent) {
++		printf("SWEET GLINK: no intent available for len %zu on channel '%s' (have %u intents)\n",
++		    len, ch->name, ch->num_intents);
++		return false;
++	}
++
++	intent->in_use = true;
++
++	struct {
++		struct glink_msg_tx_data hdr;
++		uint8_t payload[256];
++	} __attribute__((packed)) pkt;
++
++	pkt.hdr.cmd = GLINK_CMD_TX_DATA;
++	pkt.hdr.lcid = ch->rcid; /* destination rcid */
++	pkt.hdr.riid = intent->iid;
++	pkt.hdr.chunk_size = (uint32_t)len;
++	pkt.hdr.left_size = 0;
++
++	size_t copy_sz = MIN(len, sizeof(pkt.payload));
++	memcpy(pkt.payload, data, copy_sz);
++
++	size_t total_sz = sizeof(pkt.hdr) + copy_sz;
++	bool ok = sweet_glink_tx_cmd(gl, &pkt, total_sz);
++	if (ok) {
++		ch->tx_count++;
++	}
++	return ok;
++}
++
++
++#define RMTFS_DIRECTORY         "/fw/rmtfs/"
++#define RMTFS_PORT              14
++#define RMTFS_QMI_OPEN          1
++#define RMTFS_QMI_CLOSE         2
++#define RMTFS_QMI_RW_IOVEC      3
++#define RMTFS_QMI_ALLOC_BUFF    4
++#define RMTFS_QMI_GET_DEV_ERROR 5
++
++#define RMTFS_BUFF_PHYS         0xfde01000ull
++#define RMTFS_BUFF_SIZE         0x600000ull
++
++struct qmi_hdr {
++	uint8_t type;
++	uint16_t txn_id;
++	uint16_t msg_id;
++	uint16_t msg_len;
++} __attribute__((packed));
++
++struct rmtfs_iovec_entry {
++	uint32_t sector_addr;
++	uint32_t phys_offset;
++	uint32_t num_sector;
++} __attribute__((packed));
++
++struct rmtfs_caller {
++	char path[64];
++	char file[32];
++	bool active;
++};
++
++static struct rmtfs_caller g_rmtfs_callers[16];
++static volatile uint8_t *g_rmtfs_map = NULL;
++static volatile uint8_t *g_rmtfs_buf = NULL;
++
++static bool
++str_contains(const char *haystack, const char *needle)
++{
++	if (!haystack || !needle) return false;
++	size_t nlen = strlen(needle);
++	size_t hlen = strlen(haystack);
++	if (nlen > hlen) return false;
++	for (size_t i = 0; i <= hlen - nlen; i++) {
++		if (strncmp(haystack + i, needle, nlen) == 0) return true;
++	}
++	return false;
++}
++
++static void
++sweet_qrtr_announce_server(struct sweet_glink_channel *ch, uint32_t dst_node, uint32_t service, uint32_t instance, uint32_t port)
++{
++	struct {
++		struct qrtr_hdr_v1 hdr;
++		struct qrtr_ctrl_pkt ctrl;
++	} __attribute__((packed)) srv;
++	memset(&srv, 0, sizeof(srv));
++	srv.hdr.version = 1;
++	srv.hdr.type = QRTR_TYPE_NEW_SERVER;
++	srv.hdr.src_node_id = 1; /* APPS */
++	srv.hdr.src_port_id = port;
++	srv.hdr.size = sizeof(struct qrtr_ctrl_pkt);
++	srv.hdr.dst_node_id = dst_node;
++	srv.hdr.dst_port_id = QRTR_PORT_CTRL;
++
++	srv.ctrl.cmd = QRTR_TYPE_NEW_SERVER;
++	srv.ctrl.server.service = service;
++	srv.ctrl.server.instance = instance;
++	srv.ctrl.server.node = 1;
++	srv.ctrl.server.port = port;
++
++	sweet_glink_send_data(&g_glink, ch, &srv, sizeof(srv));
++	printf("SWEET QRTR: announced service %u (inst %#x) on port %u\n", service, instance, port);
++	note("[QRTR pub s%u p%u]", service, port);
++}
++
++static int
++rmtfs_read_partition_file(const char *name, off_t offset, void *buffer, int length)
++{
++	vfs_context_t context = vfs_context_kernel();
++	char path[64];
++	vnode_t vnode = NULLVP;
++	int resid = 0, error;
++
++	snprintf(path, sizeof(path), RMTFS_DIRECTORY "%s", name);
++	error = vnode_open(path, FREAD, 0, 0, &vnode, context);
++	if (error != 0) {
++		printf("SWEET RMTFS: cannot open '%s' (error %d)\n", path, error);
++		return error;
++	}
++	error = vn_rdwr(UIO_READ, vnode, (caddr_t)buffer, length, offset, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(context), &resid, vfs_context_proc(context));
++	vnode_close(vnode, FREAD, context);
++	return (error == 0 && resid == 0) ? 0 : (error ? error : EIO);
++}
++
++static void
++sweet_rmtfs_handle_qmi(struct sweet_glink_channel *ch, const struct qrtr_hdr_v1 *qhdr,
++    const uint8_t *payload, uint32_t len)
++{
++	if (len < sizeof(struct qmi_hdr)) return;
++	const struct qmi_hdr *req_qmi = (const struct qmi_hdr *)payload;
++	uint8_t qtype = req_qmi->type;
++	uint16_t txn_id = req_qmi->txn_id;
++	uint16_t msg_id = req_qmi->msg_id;
++	uint16_t msg_len = req_qmi->msg_len;
++
++	printf("SWEET RMTFS: QMI req type %u, txn %u, msg_id %u, len %u\n", qtype, txn_id, msg_id, msg_len);
++	note("[RMTFS req m%u t%u]", msg_id, txn_id);
++
++	switch (msg_id) {
++	case RMTFS_QMI_OPEN: {
++		/* Parse TLV 1 (path) */
++		char req_path[128] = {0};
++		uint32_t off = sizeof(struct qmi_hdr);
++		while (off + 3 <= len) {
++			uint8_t t_type = payload[off];
++			uint16_t t_len = *(uint16_t *)(payload + off + 1);
++			if (off + 3 + t_len > len) break;
++			if (t_type == 1) {
++				memcpy(req_path, payload + off + 3, MIN(t_len, sizeof(req_path) - 1));
++			}
++			off += 3 + t_len;
++		}
++
++		uint32_t caller_id = 0;
++		const char *img_file = NULL;
++		if (str_contains(req_path, "fs1") || str_contains(req_path, "modemst1")) {
++			caller_id = 1;
++			img_file = "modemst1.img";
++		} else if (str_contains(req_path, "fs2") || str_contains(req_path, "modemst2")) {
++			caller_id = 2;
++			img_file = "modemst2.img";
++		} else if (str_contains(req_path, "fsg")) {
++			caller_id = 3;
++			img_file = "fsg.img";
++		} else if (str_contains(req_path, "fsc")) {
++			caller_id = 4;
++			img_file = "fsc.img";
++		} else {
++			static uint32_t next_cid = 5;
++			caller_id = next_cid++;
++			img_file = "unknown";
++		}
++
++		if (caller_id < 16 && img_file) {
++			strncpy(g_rmtfs_callers[caller_id].path, req_path, sizeof(g_rmtfs_callers[caller_id].path) - 1);
++			strncpy(g_rmtfs_callers[caller_id].file, img_file, sizeof(g_rmtfs_callers[caller_id].file) - 1);
++			g_rmtfs_callers[caller_id].active = true;
++		}
++
++		printf("SWEET RMTFS: OPEN path='%s' -> cid %u (%s)\n", req_path, caller_id, img_file);
++		note("[RMTFS OPEN '%s'->%u]", req_path, caller_id);
++
++		/* Send OPEN response */
++		struct {
++			struct qrtr_hdr_v1 qhdr;
++			struct qmi_hdr qmi;
++			/* TLV 2: Result (7 bytes) */
++			uint8_t res_type;
++			uint16_t res_len;
++			uint16_t result;
++			uint16_t error;
++			/* TLV 16 (0x10): Caller ID (7 bytes) */
++			uint8_t cid_type;
++			uint16_t cid_len;
++			uint32_t caller_id;
++		} __attribute__((packed)) resp;
++		memset(&resp, 0, sizeof(resp));
++		resp.qhdr.version = 1;
++		resp.qhdr.type = QRTR_TYPE_DATA;
++		resp.qhdr.src_node_id = 1;
++		resp.qhdr.src_port_id = RMTFS_PORT;
++		resp.qhdr.dst_node_id = qhdr->src_node_id;
++		resp.qhdr.dst_port_id = qhdr->src_port_id;
++		resp.qhdr.size = sizeof(resp.qmi) + 7 + 7;
++
++		resp.qmi.type = 2; /* RESPONSE */
++		resp.qmi.txn_id = txn_id;
++		resp.qmi.msg_id = RMTFS_QMI_OPEN;
++		resp.qmi.msg_len = 14;
++
++		resp.res_type = 2;
++		resp.res_len = 4;
++		resp.result = 0; /* SUCCESS */
++		resp.error = 0;
++
++		resp.cid_type = 0x10;
++		resp.cid_len = 4;
++		resp.caller_id = caller_id;
++
++		sweet_glink_send_data(&g_glink, ch, &resp, sizeof(resp));
++		note("[RMTFS ORESP c%u]", caller_id);
++		break;
++	}
++	case RMTFS_QMI_ALLOC_BUFF: {
++		uint32_t caller_id = 0;
++		uint32_t buff_size = 0;
++		uint32_t off = sizeof(struct qmi_hdr);
++		while (off + 3 <= len) {
++			uint8_t t_type = payload[off];
++			uint16_t t_len = *(uint16_t *)(payload + off + 1);
++			if (off + 3 + t_len > len) break;
++			if (t_type == 1 && t_len >= 4) {
++				caller_id = *(uint32_t *)(payload + off + 3);
++			} else if (t_type == 2 && t_len >= 4) {
++				buff_size = *(uint32_t *)(payload + off + 3);
++			}
++			off += 3 + t_len;
++		}
++
++		printf("SWEET RMTFS: ALLOC_BUFF caller=%u size=%u (mapped buf at %p)\n",
++		    caller_id, buff_size, g_rmtfs_buf);
++		note("[RMTFS ALLOC c%u sz %u]", caller_id, buff_size);
++
++		struct {
++			struct qrtr_hdr_v1 qhdr;
++			struct qmi_hdr qmi;
++			/* TLV 2: Result (7 bytes) */
++			uint8_t res_type;
++			uint16_t res_len;
++			uint16_t result;
++			uint16_t error;
++			/* TLV 16 (0x10): Buffer Address (11 bytes) */
++			uint8_t addr_type;
++			uint16_t addr_len;
++			uint64_t buff_address;
++		} __attribute__((packed)) resp;
++		memset(&resp, 0, sizeof(resp));
++		resp.qhdr.version = 1;
++		resp.qhdr.type = QRTR_TYPE_DATA;
++		resp.qhdr.src_node_id = 1;
++		resp.qhdr.src_port_id = RMTFS_PORT;
++		resp.qhdr.dst_node_id = qhdr->src_node_id;
++		resp.qhdr.dst_port_id = qhdr->src_port_id;
++		resp.qhdr.size = sizeof(resp.qmi) + 7 + 11;
++
++		resp.qmi.type = 2; /* RESPONSE */
++		resp.qmi.txn_id = txn_id;
++		resp.qmi.msg_id = RMTFS_QMI_ALLOC_BUFF;
++		resp.qmi.msg_len = 18;
++
++		resp.res_type = 2;
++		resp.res_len = 4;
++		resp.result = 0; /* SUCCESS */
++		resp.error = 0;
++
++		resp.addr_type = 0x10;
++		resp.addr_len = 8;
++		resp.buff_address = RMTFS_BUFF_PHYS;
++
++		sweet_glink_send_data(&g_glink, ch, &resp, sizeof(resp));
++		note("[RMTFS ARESP %#llx]", RMTFS_BUFF_PHYS);
++		break;
++	}
++	case RMTFS_QMI_RW_IOVEC: {
++		uint32_t caller_id = 0;
++		uint8_t direction = 0;
++		uint8_t num_entries = 0;
++		const struct rmtfs_iovec_entry *entries = NULL;
++		uint32_t off = sizeof(struct qmi_hdr);
++		while (off + 3 <= len) {
++			uint8_t t_type = payload[off];
++			uint16_t t_len = *(uint16_t *)(payload + off + 1);
++			if (off + 3 + t_len > len) break;
++			if (t_type == 1 && t_len >= 4) {
++				caller_id = *(uint32_t *)(payload + off + 3);
++			} else if (t_type == 2 && t_len >= 1) {
++				direction = payload[off + 3];
++			} else if (t_type == 3 && t_len >= 1) {
++				num_entries = payload[off + 3];
++				entries = (const struct rmtfs_iovec_entry *)(payload + off + 4);
++			}
++			off += 3 + t_len;
++		}
++
++		const char *fname = (caller_id < 16 && g_rmtfs_callers[caller_id].active) ?
++		    g_rmtfs_callers[caller_id].file : NULL;
++
++		printf("SWEET RMTFS: RW_IOVEC caller=%u dir=%u num_entries=%u file=%s\n",
++		    caller_id, direction, num_entries, fname ? fname : "none");
++		note("[RMTFS IOVEC c%u d%u n%u]", caller_id, direction, num_entries);
++
++		if (direction == 0 && entries && fname && g_rmtfs_buf) {
++			/* READ from disk into buffer */
++			for (uint8_t i = 0; i < num_entries; i++) {
++				uint32_t sec_addr = entries[i].sector_addr;
++				uint32_t phys_addr = entries[i].phys_offset;
++				uint32_t nsec = entries[i].num_sector;
++				uint32_t nbytes = nsec * 512;
++				off_t foff = (off_t)sec_addr * 512;
++
++				/* Calculate offset relative to RMTFS_BUFF_PHYS */
++				uint32_t buf_off = (phys_addr >= (uint32_t)RMTFS_BUFF_PHYS) ?
++				    (phys_addr - (uint32_t)RMTFS_BUFF_PHYS) : phys_addr;
++
++				printf("SWEET RMTFS: READ sec %u (foff %#llx) -> phys %#x (boff %#x), sz %u\n",
++				    sec_addr, foff, phys_addr, buf_off, nbytes);
++				note("[RMTFS RD s%u b%#x sz%u]", sec_addr, buf_off, nbytes);
++
++				/* Read in 4K chunks into shared buffer */
++				uint8_t temp[4096];
++				uint32_t left = nbytes;
++				uint32_t cur_boff = buf_off;
++				off_t cur_foff = foff;
++				while (left > 0 && cur_boff < RMTFS_BUFF_SIZE) {
++					uint32_t chunk = MIN(left, (uint32_t)sizeof(temp));
++					chunk = MIN(chunk, (uint32_t)(RMTFS_BUFF_SIZE - cur_boff));
++					int r = rmtfs_read_partition_file(fname, cur_foff, temp, chunk);
++					if (r != 0) {
++						printf("SWEET RMTFS: ERROR reading %s at foff %#llx (err %d)\n", fname, cur_foff, r);
++						note("[RMTFS ERR %s r%d]", fname, r);
++						memset(temp, 0, chunk);
++					} else if (cur_foff == 0) {
++						uint32_t w0 = *(uint32_t *)temp;
++						printf("SWEET RMTFS: %s first word: %#x\n", fname, w0);
++						note("[RMTFS %s w0 %#x]", fname, w0);
++					}
++					for (uint32_t b = 0; b < chunk; b++) {
++						g_rmtfs_buf[cur_boff + b] = temp[b];
++					}
++					left -= chunk;
++					cur_foff += chunk;
++					cur_boff += chunk;
++				}
++			}
+ 			__asm__ volatile ("dsb sy" ::: "memory");
+-			out->version = 1;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-
+-			phdr->offset_free_uncached += (uint32_t)total_alloc;
+-			__asm__ volatile ("dsb sy" ::: "memory");
+-
+-			printf("SWEET SMP2P: allocated outbound item 428 at off %#x\n", alloc_off);
+-			note("[alloc 428 @ %#x]", alloc_off);
+-		}
++		} else if (direction == 1) {
++			printf("SWEET RMTFS: WRITE ignored (read-only safe mode)\n");
++			note("[RMTFS WR ign]");
++		}
++
++		/* Send RW_IOVEC response */
++		struct {
++			struct qrtr_hdr_v1 qhdr;
++			struct qmi_hdr qmi;
++			/* TLV 2: Result (7 bytes) */
++			uint8_t res_type;
++			uint16_t res_len;
++			uint16_t result;
++			uint16_t error;
++		} __attribute__((packed)) resp;
++		memset(&resp, 0, sizeof(resp));
++		resp.qhdr.version = 1;
++		resp.qhdr.type = QRTR_TYPE_DATA;
++		resp.qhdr.src_node_id = 1;
++		resp.qhdr.src_port_id = RMTFS_PORT;
++		resp.qhdr.dst_node_id = qhdr->src_node_id;
++		resp.qhdr.dst_port_id = qhdr->src_port_id;
++		resp.qhdr.size = sizeof(resp.qmi) + 7;
++
++		resp.qmi.type = 2; /* RESPONSE */
++		resp.qmi.txn_id = txn_id;
++		resp.qmi.msg_id = RMTFS_QMI_RW_IOVEC;
++		resp.qmi.msg_len = 7;
++
++		resp.res_type = 2;
++		resp.res_len = 4;
++		resp.result = 0; /* SUCCESS */
++		resp.error = 0;
++
++		sweet_glink_send_data(&g_glink, ch, &resp, sizeof(resp));
++		note("[RMTFS IRESP ok]");
++		break;
++	}
++	case RMTFS_QMI_CLOSE: {
++		uint32_t caller_id = 0;
++		uint32_t off = sizeof(struct qmi_hdr);
++		while (off + 3 <= len) {
++			uint8_t t_type = payload[off];
++			uint16_t t_len = *(uint16_t *)(payload + off + 1);
++			if (off + 3 + t_len > len) break;
++			if (t_type == 1 && t_len >= 4) {
++				caller_id = *(uint32_t *)(payload + off + 3);
++			}
++			off += 3 + t_len;
++		}
++		if (caller_id < 16) g_rmtfs_callers[caller_id].active = false;
++		printf("SWEET RMTFS: CLOSE caller=%u\n", caller_id);
++		note("[RMTFS CLOSE c%u]", caller_id);
++
++		struct {
++			struct qrtr_hdr_v1 qhdr;
++			struct qmi_hdr qmi;
++			uint8_t res_type;
++			uint16_t res_len;
++			uint16_t result;
++			uint16_t error;
++		} __attribute__((packed)) resp;
++		memset(&resp, 0, sizeof(resp));
++		resp.qhdr.version = 1;
++		resp.qhdr.type = QRTR_TYPE_DATA;
++		resp.qhdr.src_node_id = 1;
++		resp.qhdr.src_port_id = RMTFS_PORT;
++		resp.qhdr.dst_node_id = qhdr->src_node_id;
++		resp.qhdr.dst_port_id = qhdr->src_port_id;
++		resp.qhdr.size = sizeof(resp.qmi) + 7;
++
++		resp.qmi.type = 2;
++		resp.qmi.txn_id = txn_id;
++		resp.qmi.msg_id = RMTFS_QMI_CLOSE;
++		resp.qmi.msg_len = 7;
++
++		resp.res_type = 2;
++		resp.res_len = 4;
++		resp.result = 0;
++		resp.error = 0;
++
++		sweet_glink_send_data(&g_glink, ch, &resp, sizeof(resp));
++		note("[RMTFS CRESP ok]");
++		break;
++	}
++	case RMTFS_QMI_GET_DEV_ERROR: {
++		printf("SWEET RMTFS: GET_DEV_ERROR\n");
++		struct {
++			struct qrtr_hdr_v1 qhdr;
++			struct qmi_hdr qmi;
++			uint8_t res_type;
++			uint16_t res_len;
++			uint16_t result;
++			uint16_t error;
++			uint8_t st_type;
++			uint16_t st_len;
++			uint8_t status;
++		} __attribute__((packed)) resp;
++		memset(&resp, 0, sizeof(resp));
++		resp.qhdr.version = 1;
++		resp.qhdr.type = QRTR_TYPE_DATA;
++		resp.qhdr.src_node_id = 1;
++		resp.qhdr.src_port_id = RMTFS_PORT;
++		resp.qhdr.dst_node_id = qhdr->src_node_id;
++		resp.qhdr.dst_port_id = qhdr->src_port_id;
++		resp.qhdr.size = sizeof(resp.qmi) + 7 + 4;
++
++		resp.qmi.type = 2;
++		resp.qmi.txn_id = txn_id;
++		resp.qmi.msg_id = RMTFS_QMI_GET_DEV_ERROR;
++		resp.qmi.msg_len = 11;
++
++		resp.res_type = 2;
++		resp.res_len = 4;
++		resp.result = 0;
++		resp.error = 0;
++
++		resp.st_type = 0x10;
++		resp.st_len = 1;
++		resp.status = 0;
++
++		sweet_glink_send_data(&g_glink, ch, &resp, sizeof(resp));
++		note("[RMTFS ERESP ok]");
++		break;
++	}
++	default:
++		printf("SWEET RMTFS: unhandled QMI msg_id %u\n", msg_id);
++		note("[RMTFS unh msg %u]", msg_id);
++		break;
++	}
++}
++
++static void
++sweet_glink_setup(struct smem_partition_header *phdr, uint32_t part_size)
++{
++	if (g_glink.ready) return;
++
++	uint32_t desc_sz = 0;
++	void *dptr = sweet_smem_get_entry(phdr, part_size, SMEM_GLINK_NATIVE_XPRT_DESCRIPTOR, &desc_sz);
++	if (!dptr || desc_sz < 16) {
++		return;
++	}
++
++	void *tx_ptr = sweet_smem_alloc_entry(phdr, part_size, SMEM_GLINK_NATIVE_XPRT_FIFO_0, 16384);
++	if (!tx_ptr) {
++		printf("SWEET GLINK: cannot allocate item 479 (TX FIFO)\n");
++		return;
++	}
++
++	uint32_t rx_sz = 0;
++	void *rx_ptr = sweet_smem_get_entry(phdr, part_size, SMEM_GLINK_NATIVE_XPRT_FIFO_1, &rx_sz);
++	if (!rx_ptr || rx_sz < 16384) {
++		return;
++	}
++
++	g_glink.descs = (volatile uint32_t *)dptr;
++	g_glink.tx_fifo = (volatile uint8_t *)tx_ptr;
++	g_glink.rx_fifo = (volatile uint8_t *)rx_ptr;
++	g_glink.tx_size = 16384;
++	g_glink.rx_size = 16384;
++	g_glink.ready = true;
++
++	printf("SWEET GLINK: mapped descs=%p [tx_tail=%u tx_head=%u rx_tail=%u rx_head=%u]\n",
++	    g_glink.descs, g_glink.descs[0], g_glink.descs[1], g_glink.descs[2], g_glink.descs[3]);
++	note("[GLINK init d0=%u d1=%u d2=%u d3=%u]",
++	    g_glink.descs[0], g_glink.descs[1], g_glink.descs[2], g_glink.descs[3]);
++
++	/* Initialize TX head and RX tail to 0 */
++	g_glink.descs[1] = 0; /* tx_head */
++	g_glink.descs[2] = 0; /* rx_tail */
++	__asm__ volatile ("dsb sy" ::: "memory");
++
++	/* Send GLINK_CMD_VERSION */
++	struct glink_msg vmsg = {
++		.cmd = GLINK_CMD_VERSION,
++		.param1 = GLINK_VERSION_1,
++		.param2 = GLINK_FEATURE_INTENT_REUSE,
++	};
++	sweet_glink_tx_cmd(&g_glink, &vmsg, sizeof(vmsg));
++	g_glink.version_sent = true;
++	printf("SWEET GLINK: sent GLINK_CMD_VERSION (v1, feat %#x)\n", GLINK_FEATURE_INTENT_REUSE);
++	note("[GLINK sent v1]");
++}
++
++static void
++sweet_glink_poll(void)
++{
++	if (!g_glink.ready) return;
++
++	for (int iter = 0; iter < 32; iter++) {
++		uint32_t rx_head = g_glink.descs[3];
++		uint32_t rx_tail = g_glink.descs[2];
++		uint32_t avail = (rx_head >= rx_tail) ? (rx_head - rx_tail) : (g_glink.rx_size - rx_tail + rx_head);
++
++		if (avail < sizeof(struct glink_msg)) break;
++
++		struct glink_msg msg;
++		sweet_glink_rx_peek(&g_glink, rx_tail, &msg, sizeof(msg));
++
++		switch (msg.cmd) {
++		case GLINK_CMD_VERSION: {
++			uint16_t rem_ver = msg.param1;
++			uint32_t rem_feat = msg.param2;
++			printf("SWEET GLINK RX: CMD_VERSION v%u feat %#x\n", rem_ver, rem_feat);
++			note("[GLINK RX v%u f%#x]", rem_ver, rem_feat);
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++
++			struct glink_msg ack = {
++				.cmd = GLINK_CMD_VERSION_ACK,
++				.param1 = GLINK_VERSION_1,
++				.param2 = rem_feat & GLINK_FEATURE_INTENT_REUSE,
++			};
++			sweet_glink_tx_cmd(&g_glink, &ack, sizeof(ack));
++			g_glink.version_ack_sent = true;
++			printf("SWEET GLINK: sent VERSION_ACK\n");
++			note("[GLINK sent vack]");
++			break;
++		}
++		case GLINK_CMD_VERSION_ACK: {
++			printf("SWEET GLINK RX: CMD_VERSION_ACK v%u feat %#x\n", msg.param1, msg.param2);
++			note("[GLINK RX vack]");
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++			g_glink.version_ack_received = true;
++			break;
++		}
++		case GLINK_CMD_OPEN: {
++			uint16_t rcid = msg.param1;
++			uint32_t name_len = msg.param2 & 0xffff;
++			uint32_t pkt_len = (sizeof(msg) + name_len + 7) & ~7;
++			if (avail < pkt_len) return; /* wait for full message */
++
++			char chname[32] = {0};
++			uint32_t name_off = (rx_tail + (uint32_t)sizeof(msg)) % g_glink.rx_size;
++			sweet_glink_rx_peek(&g_glink, name_off, chname, MIN(name_len, 31));
++
++			printf("SWEET GLINK RX: OPEN channel '%s' (rcid %u, name_len %u)\n", chname, rcid, name_len);
++			note("[GLINK OPEN '%s' r%u]", chname, rcid);
++			sweet_glink_rx_advance(&g_glink, pkt_len);
++
++			struct sweet_glink_channel *ch = sweet_glink_get_or_add_channel(&g_glink, chname);
++			if (ch) {
++				ch->rcid = rcid;
++				ch->remote_open = true;
++
++				/* 1. Reply OPEN_ACK */
++				struct glink_msg oack = {
++					.cmd = GLINK_CMD_OPEN_ACK,
++					.param1 = rcid,
++					.param2 = 0,
++				};
++				sweet_glink_tx_cmd(&g_glink, &oack, sizeof(oack));
++
++				/* 2. Open our side if not already open */
++				if (!ch->open) {
++					ch->open = true;
++					struct {
++						struct glink_msg hdr;
++						char name[32];
++					} ch_open;
++					memset(&ch_open, 0, sizeof(ch_open));
++					ch_open.hdr.cmd = GLINK_CMD_OPEN;
++					ch_open.hdr.param1 = ch->lcid;
++					ch_open.hdr.param2 = (uint32_t)strlen(chname) + 1;
++					strncpy(ch_open.name, chname, sizeof(ch_open.name) - 1);
++					uint32_t tx_sz = (sizeof(ch_open.hdr) + ch_open.hdr.param2 + 7) & ~7;
++					sweet_glink_tx_cmd(&g_glink, &ch_open, tx_sz);
++				}
++
++				/* 3. Send RX INTENT (advertise 4096 buffer) */
++				struct glink_msg_intent intent = {
++					.cmd = GLINK_CMD_INTENT,
++					.lcid = ch->lcid,
++					.count = 1,
++					.size = 4096,
++					.liid = 1,
++				};
++				sweet_glink_tx_cmd(&g_glink, &intent, sizeof(intent));
++				printf("SWEET GLINK: channel '%s' connected (lcid %u, rcid %u, intent 4096)\n",
++				    chname, ch->lcid, ch->rcid);
++				note("[GLINK conn '%s' l%u:r%u]", chname, ch->lcid, ch->rcid);
++			}
++			break;
++		}
++		case GLINK_CMD_OPEN_ACK: {
++			uint16_t lcid = msg.param1;
++			printf("SWEET GLINK RX: OPEN_ACK for lcid %u\n", lcid);
++			note("[GLINK OACK l%u]", lcid);
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++			break;
++		}
++		case GLINK_CMD_INTENT: {
++			uint16_t rcid = msg.param1;
++			uint32_t count = msg.param2;
++			uint32_t pkt_len = (sizeof(msg) + count * 8 + 7) & ~7;
++			if (avail < pkt_len) return; /* wait for full message */
++
++			struct sweet_glink_channel *ch = sweet_glink_find_by_rcid(&g_glink, rcid);
++			for (uint32_t i = 0; i < count; i++) {
++				struct {
++					uint32_t size;
++					uint32_t iid;
++				} pair;
++				uint32_t pair_off = (rx_tail + (uint32_t)sizeof(msg) + i * 8) % g_glink.rx_size;
++				sweet_glink_rx_peek(&g_glink, pair_off, &pair, sizeof(pair));
++				if (ch && ch->num_intents < 32) {
++					ch->intents[ch->num_intents].size = pair.size;
++					ch->intents[ch->num_intents].iid = pair.iid;
++					ch->intents[ch->num_intents].in_use = false;
++					ch->num_intents++;
++				}
++			}
++			sweet_glink_rx_advance(&g_glink, pkt_len);
++			break;
++		}
++		case GLINK_CMD_RX_DONE:
++		case GLINK_CMD_RX_DONE_W_REUSE: {
++			uint16_t lcid = msg.param1;
++			uint32_t liid = msg.param2;
++			struct sweet_glink_channel *ch = sweet_glink_find_by_lcid(&g_glink, lcid);
++			if (ch) {
++				for (uint32_t i = 0; i < ch->num_intents; i++) {
++					if (ch->intents[i].iid == liid) {
++						ch->intents[i].in_use = false;
++						break;
++					}
++				}
++			}
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++			break;
++		}
++		case GLINK_CMD_TX_DATA: {
++			struct glink_msg_tx_data tdata;
++			if (avail < sizeof(tdata)) return;
++			sweet_glink_rx_peek(&g_glink, rx_tail, &tdata, sizeof(tdata));
++
++			uint32_t data_pkt_sz = (sizeof(tdata) + tdata.chunk_size + 7) & ~7;
++			if (avail < data_pkt_sz) return;
++
++			uint8_t payload[256] = {0};
++			uint32_t data_off = (rx_tail + (uint32_t)sizeof(tdata)) % g_glink.rx_size;
++			sweet_glink_rx_peek(&g_glink, data_off, payload, MIN(tdata.chunk_size, sizeof(payload)));
++
++			struct sweet_glink_channel *ch = sweet_glink_find_by_lcid(&g_glink, tdata.lcid);
++			if (ch) ch->rx_count++;
++
++			printf("SWEET GLINK RX DATA: lcid %u, riid %u, chunk %u, left %u\n",
++			    tdata.lcid, tdata.riid, tdata.chunk_size, tdata.left_size);
++			note("[GLINK DATA l%u sz %u]", tdata.lcid, tdata.chunk_size);
++			sweet_glink_rx_advance(&g_glink, data_pkt_sz);
++
++			/* Send RX_DONE_W_REUSE */
++			struct glink_msg_rx_done rxdone = {
++				.cmd = GLINK_CMD_RX_DONE_W_REUSE,
++				.lcid = tdata.lcid,
++				.liid = tdata.riid,
++			};
++			sweet_glink_tx_cmd(&g_glink, &rxdone, sizeof(rxdone));
++
++			/* Check if channel is IPCRTR: handle QRTR packets! */
++			if (ch && strncmp(ch->name, "IPCRTR", 6) == 0 && tdata.chunk_size >= sizeof(struct qrtr_hdr_v1)) {
++				struct qrtr_hdr_v1 *qhdr = (struct qrtr_hdr_v1 *)payload;
++				uint32_t qtype = qhdr->type;
++				uint32_t *w = (uint32_t *)payload;
++				uint32_t nw = MIN(tdata.chunk_size / 4, 13);
++				printf("SWEET QRTR: type %u (sz %u) words:", qtype, tdata.chunk_size);
++				for (uint32_t wi = 0; wi < nw; wi++) printf(" %#x", w[wi]);
++				printf("\n");
++
++				if (qtype == QRTR_TYPE_HELLO) {
++					printf("SWEET QRTR: received HELLO from node %u! Replying with HELLO (src 1)\n", qhdr->src_node_id);
++					note("[QRTR HELLO from %u]", qhdr->src_node_id);
++
++					struct {
++						struct qrtr_hdr_v1 hdr;
++						struct qrtr_ctrl_pkt ctrl;
++					} __attribute__((packed)) reply;
++					memset(&reply, 0, sizeof(reply));
++					reply.hdr.version = 1;
++					reply.hdr.type = QRTR_TYPE_HELLO;
++					reply.hdr.src_node_id = 1; /* APPS node is 1 */
++					reply.hdr.src_port_id = QRTR_PORT_CTRL;
++					reply.hdr.size = sizeof(struct qrtr_ctrl_pkt);
++					reply.hdr.dst_node_id = qhdr->src_node_id;
++					reply.hdr.dst_port_id = QRTR_PORT_CTRL;
++					reply.ctrl.cmd = QRTR_TYPE_HELLO;
++
++					sweet_glink_send_data(&g_glink, ch, &reply, sizeof(reply));
++					printf("SWEET QRTR: sent HELLO to node %u\n", qhdr->src_node_id);
++					note("[QRTR sent HELLO]");
++
++					/* Announce local services */
++					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 14, 1, 14);     /* RMTFS */
++					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 64, 1, 64);     /* SERVREG_LOC */
++					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 4096, 1, 4096); /* TFTP */
++				} else if (qtype == QRTR_TYPE_NEW_SERVER) {
++					struct qrtr_ctrl_pkt *cp = (struct qrtr_ctrl_pkt *)(payload + sizeof(*qhdr));
++					printf("SWEET QRTR NEW_SERVER: service %u, instance %#x, node %u, port %u\n",
++					    cp->server.service, cp->server.instance, cp->server.node, cp->server.port);
++					note("[QRTR svc %u inst %#x port %u]",
++					    cp->server.service, cp->server.instance, cp->server.port);
++				} else if (qtype == QRTR_TYPE_DATA) {
++					if (qhdr->dst_port_id == RMTFS_PORT) {
++						sweet_rmtfs_handle_qmi(ch, qhdr, payload + sizeof(*qhdr), tdata.chunk_size - (uint32_t)sizeof(*qhdr));
++					} else {
++						printf("SWEET QRTR DATA: p%u -> p%u sz %u\n",
++						    qhdr->src_port_id, qhdr->dst_port_id, qhdr->size);
++						note("[QRTR DATA p%u->p%u sz %u]",
++						    qhdr->src_port_id, qhdr->dst_port_id, qhdr->size);
++					}
++				}
++			}
++			break;
++		}
++		case GLINK_CMD_SIGNALS: {
++			printf("SWEET GLINK RX: SIGNALS rcid %u sigs %#x\n", msg.param1, msg.param2);
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++			break;
++		}
++		default: {
++			printf("SWEET GLINK RX: unhandled cmd %u (p1 %u, p2 %#x)\n", msg.cmd, msg.param1, msg.param2);
++			sweet_glink_rx_advance(&g_glink, sizeof(msg));
++			break;
++		}
++		}
++	}
++}
++
++static bool
++sweet_smem_find_part(uint16_t host0, uint16_t host1, uint64_t *out_phys, uint32_t *out_size)
++{
++	volatile uint8_t *pt_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY + SMEM_SIZE - PAGE_SIZE, PAGE_SIZE, WIMG_WCOMB);
++	if (!pt_win) return false;
++
++	struct smem_ptable *ptable = NULL;
++	if (memcmp((const void *)(pt_win + (PAGE_SIZE - 4096)), "$TOC", 4) == 0) {
++		ptable = (struct smem_ptable *)(pt_win + (PAGE_SIZE - 4096));
++	} else if (memcmp((const void *)pt_win, "$TOC", 4) == 0) {
++		ptable = (struct smem_ptable *)pt_win;
++	}
++
++	if (!ptable) {
++		ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++		return false;
++	}
++
++	bool found = false;
++	for (uint32_t i = 0; i < ptable->num_entries; i++) {
++		if (ptable->entry[i].size == 0) continue;
++		if ((ptable->entry[i].host0 == host0 && ptable->entry[i].host1 == host1) ||
++		    (ptable->entry[i].host0 == host1 && ptable->entry[i].host1 == host0)) {
++			if (out_phys) *out_phys = SMEM_MEMORY + ptable->entry[i].offset;
++			if (out_size) *out_size = ptable->entry[i].size;
++			found = true;
++			break;
++		}
++	}
++	ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
++	return found;
++}
++
++static void
++mpss_thread(void *arg, wait_result_t result)
++{
++#pragma unused(arg, result)
++	bool ok = mpss_start();
++	if (!ok) {
++		printf("SWEET MPSS: failed to start\n");
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++		return;
++	}
++
++	/* Map SMEM header once to log status */
++	volatile uint8_t *hdr_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY, PAGE_SIZE, WIMG_WCOMB);
++	if (hdr_win) {
++		struct smem_header *hdr = (struct smem_header *)hdr_win;
++		printf("SWEET SMEM: header init %u, SBL ver %#x, free %#x, avail %#x\n",
++		    hdr->initialized, hdr->version[7], hdr->free_offset, hdr->available);
++		note("[smem init %u SBL %#x]", hdr->initialized, hdr->version[7]);
++		ml_io_unmap((vm_offset_t)hdr_win, PAGE_SIZE);
++	}
++
++	/* Map Partition 7 (APPS <-> MODEM) and Partition 9 (GLOBAL) permanently */
++	uint64_t part_phys = 0;
++	uint32_t part_size = 0;
++	sweet_smem_find_part(0, 1, &part_phys, &part_size);
++
++	uint64_t p9_phys = 0;
++	uint32_t p9_size = 0;
++	sweet_smem_find_part(0xfffe, 0xfffe, &p9_phys, &p9_size);
++
++	/* Map RMTFS shared memory buffer at 0xfde01000 (phys 0xfde00000 aligned) */
++	uint64_t rmtfs_base = RMTFS_BUFF_PHYS & ~(uint64_t)PAGE_MASK;
++	uint64_t rmtfs_mapsz = (RMTFS_BUFF_SIZE + 2 * PAGE_SIZE) & ~(uint64_t)PAGE_MASK;
++	g_rmtfs_map = (volatile uint8_t *)ml_io_map_unmappable(rmtfs_base, rmtfs_mapsz, WIMG_WCOMB);
++	if (g_rmtfs_map) {
++		g_rmtfs_buf = g_rmtfs_map + (RMTFS_BUFF_PHYS - rmtfs_base);
++		printf("SWEET RMTFS: mapped shared buffer at %p (phys %#llx, sz %#llx)\n",
++		    g_rmtfs_buf, RMTFS_BUFF_PHYS, RMTFS_BUFF_SIZE);
++		note("[RMTFS buf mapped]");
+ 	} else {
+-		uint32_t off = (uint8_t *)existing - (uint8_t *)phdr + sizeof(*existing) + existing->padding_hdr;
+-		out = (struct smp2p_smem_item *)((uint8_t *)phdr + off);
+-	}
+-
+-	if (out) {
+-		out->version = 1;
+-		out->features = 1;
+-		out->valid_entries = 2;
+-		memcpy(out->entries[0].name, "master-kernel", 14);
+-		memcpy(out->entries[1].name, "ipa", 4);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-	}
+-
+-	/* Kick modem via APCS: 1 << 14 at 0x17c0000c */
+-	volatile uint32_t *apcs = (volatile uint32_t *)ml_io_map_unmappable(0x17c00000, PAGE_SIZE, WIMG_WCOMB);
+-	if (apcs) {
+-		apcs[3] = (1u << 14);
+-		__asm__ volatile ("dsb sy" ::: "memory");
+-		ml_io_unmap((vm_offset_t)apcs, PAGE_SIZE);
+-		printf("SWEET SMP2P: kicked modem via APCS bit 14\n");
+-	}
++		printf("SWEET RMTFS: failed to map shared buffer!\n");
++		note("[RMTFS buf map FAILED]");
++	}
++
++	if (part_phys && part_size) {
++		uint64_t part_base = part_phys & ~(uint64_t)PAGE_MASK;
++		uint64_t map_sz = (part_phys - part_base + part_size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++		map_sz = MIN(map_sz, (uint64_t)CHUNK);
++
++		volatile uint8_t *part_win = (volatile uint8_t *)ml_io_map_unmappable(part_base, map_sz, WIMG_WCOMB);
++		volatile uint8_t *p9_win = NULL;
++		struct smem_partition_header *phdr9 = NULL;
++		uint64_t p9_mapsz = 0;
++		if (p9_phys && p9_size) {
++			uint64_t p9_base = p9_phys & ~(uint64_t)PAGE_MASK;
++			p9_mapsz = (p9_phys - p9_base + p9_size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
++			p9_mapsz = MIN(p9_mapsz, (uint64_t)CHUNK);
++			p9_win = (volatile uint8_t *)ml_io_map_unmappable(p9_base, p9_mapsz, WIMG_WCOMB);
++			if (p9_win) phdr9 = (struct smem_partition_header *)(p9_win + (p9_phys - p9_base));
++		}
++
++		if (part_win) {
++			struct smem_partition_header *phdr = (struct smem_partition_header *)(part_win + (part_phys - part_base));
++			printf("SWEET SMEM: mapped Partition 7 at %p (phys %#llx, sz %#x), Part 9 at %p (phys %#llx, sz %#x)\n",
++			    phdr, part_phys, part_size, phdr9, p9_phys, p9_size);
++
++			/* Fast poll loop: 50 ms ticks = 20 Hz */
++			for (int tick = 1; tick <= 12000; tick++) {
++				sleep_ms(50);
++
++				/* 1. Outbound SMP2P setup */
++				if (tick <= 100 || tick % 200 == 0) {
++					sweet_smp2p_setup_outbound(phdr, part_size);
++				}
++
++				/* 2. Inbound SMP2P status (item 435) */
++				sweet_smp2p_poll_inbound(phdr, part_size, tick);
++
++				/* 3. GLINK setup and poll */
++				if (!g_glink.ready) {
++					sweet_glink_setup(phdr, part_size);
++				} else {
++					sweet_glink_poll();
++				}
++
++				/* 4. Check crash log (item 421 in Part 9) */
++				if (phdr9) {
++					sweet_smem_check_crash(phdr9, p9_size);
++				}
++
++				/* 5. 1 Hz alive banner */
++				if (tick % 20 == 0) {
++					int sec = tick / 20;
++					if (sec <= 30 || sec % 10 == 0) {
++						printf("SWEET MPSS: alive %d s: %s\n", sec, report);
++					}
++				}
++			}
++			ml_io_unmap((vm_offset_t)part_win, map_sz);
++			if (p9_win) ml_io_unmap((vm_offset_t)p9_win, p9_mapsz);
++			if (g_rmtfs_map) ml_io_unmap((vm_offset_t)g_rmtfs_map, rmtfs_mapsz);
++		}
++	} else {
++		printf("SWEET SMEM: Partition 7 (hosts 0:1) not found!\n");
++	}
++
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ static void
+@@ -521,267 +1745,20 @@
+ 	} while (0)
+ 
+ 	BPRINTF("SWEET MPSS: %s\n", report);
+-
+-	volatile uint8_t *pt_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY + SMEM_SIZE - PAGE_SIZE, PAGE_SIZE, WIMG_WCOMB);
+-	if (!pt_win) {
+-		BPRINTF("cannot map ptable\n");
+-		return;
+-	}
+-	struct smem_ptable *ptable = (struct smem_ptable *)(pt_win + (PAGE_SIZE - 4096));
+-	if (memcmp(ptable->magic, "$TOC", 4) != 0) {
+-		BPRINTF("bad ptable magic\n");
+-		ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
+-		return;
+-	}
+-
+-	uint32_t num = ptable->num_entries;
+-	struct smem_ptable_entry p7 = {0};
+-	bool found_p7 = false;
+-	for (uint32_t i = 0; i < num; i++) {
+-		if (ptable->entry[i].size == 0) continue;
+-		if (ptable->entry[i].host0 == 0 && ptable->entry[i].host1 == 1) {
+-			p7 = ptable->entry[i];
+-			found_p7 = true;
+-			break;
+-		}
+-	}
+-	ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
+-
+-	if (!found_p7) {
+-		BPRINTF("no part 0:1 found\n");
+-		return;
+-	}
+-
+-	uint64_t part_phys = SMEM_MEMORY + p7.offset;
+-	uint64_t part_base = part_phys & ~(uint64_t)PAGE_MASK;
+-	uint64_t map_sz = (part_phys - part_base + p7.size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+-	map_sz = MIN(map_sz, (uint64_t)CHUNK);
+-
+-	volatile uint8_t *part_win = (volatile uint8_t *)ml_io_map_unmappable(part_base, map_sz, WIMG_WCOMB);
+-	if (!part_win) {
+-		BPRINTF("cannot map part 0:1\n");
+-		return;
+-	}
+-
+-	struct smem_partition_header *phdr = (struct smem_partition_header *)(part_win + (part_phys - part_base));
+-	BPRINTF("Part 0:1 ($PRT) free_uncached: %#x / size %#x\n", phdr->offset_free_uncached, phdr->size);
+-
+-	uint32_t cur = sizeof(*phdr);
+-	while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
+-	       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
+-		struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
+-		if (e->canary != 0xa5a5) break;
+-		BPRINTF("  Item %u: size %u\n", e->item, e->size);
+-		uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
+-		if (e->item == 435 && (part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
+-			struct smp2p_smem_item *s = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
+-			BPRINTF("    [435 INBOUND] magic %#x ver %u pids %u->%u valid %u/%u flags %#x\n",
+-			    s->magic, s->version, s->local_pid, s->remote_pid, s->valid_entries, s->total_entries, s->flags);
+-			for (uint32_t v = 0; v < 16; v++) {
+-				char name[17] = {0};
+-				memcpy(name, s->entries[v].name, 16);
+-				if (name[0] || s->entries[v].value || v < s->valid_entries) {
+-					BPRINTF("      entry %u: '%s' = %#x%s\n", v, name, s->entries[v].value,
+-					    v < s->valid_entries ? " [VALID]" : "");
+-				}
+-			}
+-		}
+-		if (e->item == 428 && (part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
+-			struct smp2p_smem_item *s = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
+-			BPRINTF("    [428 OUTBOUND] magic %#x ver %u pids %u->%u valid %u/%u flags %#x\n",
+-			    s->magic, s->version, s->local_pid, s->remote_pid, s->valid_entries, s->total_entries, s->flags);
+-			for (uint32_t v = 0; v < s->valid_entries && v < 16; v++) {
+-				char name[17] = {0};
+-				memcpy(name, s->entries[v].name, 16);
+-				BPRINTF("      entry %u: '%s' = %#x\n", v, name, s->entries[v].value);
+-			}
+-		}
+-		cur += sizeof(*e) + e->padding_hdr + e->size;
+-	}
+-
+-	ml_io_unmap((vm_offset_t)part_win, map_sz);
++	if (g_glink.ready) {
++		BPRINTF("GLINK: v_sent=%d v_ack_rx=%d v_ack_tx=%d | tx_head=%u tx_tail=%u rx_head=%u rx_tail=%u\n",
++		    g_glink.version_sent, g_glink.version_ack_received, g_glink.version_ack_sent,
++		    g_glink.descs[1], g_glink.descs[0], g_glink.descs[3], g_glink.descs[2]);
++		BPRINTF("GLINK channels (%u):\n", g_glink.num_channels);
++		for (uint32_t i = 0; i < g_glink.num_channels; i++) {
++			struct sweet_glink_channel *ch = &g_glink.channels[i];
++			BPRINTF("  [%u] '%s': lcid=%u rcid=%u open=%d ropen=%d rx=%u tx=%u\n",
++			    i, ch->name, ch->lcid, ch->rcid, ch->open, ch->remote_open, ch->rx_count, ch->tx_count);
++		}
++	} else {
++		BPRINTF("GLINK: not ready\n");
++	}
+ 	#undef BPRINTF
+-}
+-
+-static void
+-sweet_smem_poll(int sec)
+-{
+-	/* Map first 16K of SMEM (header) */
+-	volatile uint8_t *hdr_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY, PAGE_SIZE, WIMG_WCOMB);
+-	if (hdr_win) {
+-		struct smem_header *hdr = (struct smem_header *)hdr_win;
+-		if (sec == 1) {
+-			printf("SWEET SMEM: header init %u, SBL ver %#x, free %#x, avail %#x\n",
+-			    hdr->initialized, hdr->version[7], hdr->free_offset, hdr->available);
+-			note("[smem init %u SBL %#x]", hdr->initialized, hdr->version[7]);
+-		}
+-		ml_io_unmap((vm_offset_t)hdr_win, PAGE_SIZE);
+-	}
+-
+-	/* Map last 16K of SMEM (ptable is in the last 4K, offset 0x3000 within the 16K page) */
+-	volatile uint8_t *pt_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY + SMEM_SIZE - PAGE_SIZE, PAGE_SIZE, WIMG_WCOMB);
+-	if (!pt_win) {
+-		if (sec == 1) {
+-			printf("SWEET SMEM: cannot map ptable\n");
+-			note("[cannot map ptable]");
+-		}
+-		return;
+-	}
+-
+-	struct smem_ptable *ptable = NULL;
+-	if (memcmp((const void *)(pt_win + (PAGE_SIZE - 4096)), "$TOC", 4) == 0) {
+-		ptable = (struct smem_ptable *)(pt_win + (PAGE_SIZE - 4096));
+-	} else if (memcmp((const void *)pt_win, "$TOC", 4) == 0) {
+-		ptable = (struct smem_ptable *)pt_win;
+-	} else {
+-		for (uint32_t off = 0; off + sizeof(struct smem_ptable) <= PAGE_SIZE; off += 4) {
+-			if (memcmp((const void *)(pt_win + off), "$TOC", 4) == 0) {
+-				ptable = (struct smem_ptable *)(pt_win + off);
+-				if (sec == 1) {
+-					printf("SWEET SMEM: found $TOC at offset %#x\n", off);
+-					note("[$TOC @ %#x]", off);
+-				}
+-				break;
+-			}
+-		}
+-	}
+-
+-	if (!ptable) {
+-		if (sec == 1 || sec % 30 == 0) {
+-			printf("SWEET SMEM: bad ptable magic (at +0x3000: %02x%02x%02x%02x, +0: %02x%02x%02x%02x)\n",
+-			    pt_win[PAGE_SIZE - 4096], pt_win[PAGE_SIZE - 4095], pt_win[PAGE_SIZE - 4094], pt_win[PAGE_SIZE - 4093],
+-			    pt_win[0], pt_win[1], pt_win[2], pt_win[3]);
+-			note("[no $TOC: +3k %02x%02x%02x%02x]",
+-			    pt_win[PAGE_SIZE - 4096], pt_win[PAGE_SIZE - 4095], pt_win[PAGE_SIZE - 4094], pt_win[PAGE_SIZE - 4093]);
+-		}
+-		ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
+-		return;
+-	}
+-
+-	uint32_t num = ptable->num_entries;
+-	if (sec == 1) {
+-		printf("SWEET SMEM: $TOC ver %u, %u entries\n", ptable->version, num);
+-		note("[$TOC v%u %u parts]", ptable->version, num);
+-	}
+-
+-	struct smem_ptable_entry local_entries[32];
+-	uint32_t count = MIN(num, 32);
+-	for (uint32_t i = 0; i < count; i++) {
+-		local_entries[i] = ptable->entry[i];
+-	}
+-	ml_io_unmap((vm_offset_t)pt_win, PAGE_SIZE);
+-
+-	for (uint32_t i = 0; i < count; i++) {
+-		struct smem_ptable_entry *pe = &local_entries[i];
+-		if (pe->size == 0) continue;
+-
+-		if (sec == 1) {
+-			printf("SWEET SMEM: part %u: hosts %u:%u, off %#x, size %#x\n",
+-			    i, pe->host0, pe->host1, pe->offset, pe->size);
+-		}
+-
+-		/* Check APPS <-> MODEM partition (host0=0, host1=1 or host0=1, host1=0) or GLOBAL (0xfffe) */
+-		if ((pe->host0 == 0 && pe->host1 == 1) || (pe->host0 == 1 && pe->host1 == 0) ||
+-		    (pe->host0 == 0xfffe && pe->host1 == 0xfffe)) {
+-			uint64_t part_phys = SMEM_MEMORY + pe->offset;
+-			uint64_t part_base = part_phys & ~(uint64_t)PAGE_MASK;
+-			uint64_t map_sz = (part_phys - part_base + pe->size + PAGE_MASK) & ~(uint64_t)PAGE_MASK;
+-			map_sz = MIN(map_sz, (uint64_t)CHUNK);
+-
+-			volatile uint8_t *part_win = (volatile uint8_t *)ml_io_map_unmappable(part_base, map_sz, WIMG_WCOMB);
+-			if (part_win) {
+-				struct smem_partition_header *phdr = (struct smem_partition_header *)(part_win + (part_phys - part_base));
+-				if (memcmp(phdr->magic, "$PRT", 4) == 0) {
+-					/* On APPS <-> MODEM partition, allocate item 428 and kick */
+-					if ((pe->host0 == 0 && pe->host1 == 1) || (pe->host0 == 1 && pe->host1 == 0)) {
+-						if (sec <= 5 || sec % 10 == 0) {
+-							sweet_smp2p_setup_outbound(phdr, part_phys, part_base, map_sz);
+-						}
+-					}
+-
+-					uint32_t cur = sizeof(*phdr);
+-					while (cur + sizeof(struct smem_private_entry) <= phdr->offset_free_uncached &&
+-					       (part_phys - part_base) + cur + sizeof(struct smem_private_entry) <= map_sz) {
+-						struct smem_private_entry *e = (struct smem_private_entry *)((uint8_t *)phdr + cur);
+-						if (e->canary != 0xa5a5) {
+-							break;
+-						}
+-						if (sec == 1) {
+-							printf("SWEET SMEM: part %u item %u size %u\n", i, e->item, e->size);
+-						}
+-						if (e->item == 435) { /* SMP2P modem -> apps */
+-							uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
+-							if ((part_phys - part_base) + item_off + sizeof(struct smp2p_smem_item) <= map_sz) {
+-								struct smp2p_smem_item *smp = (struct smp2p_smem_item *)((uint8_t *)phdr + item_off);
+-								static uint16_t last_smp_valid = 0xffff;
+-								if (sec == 1 || smp->valid_entries != last_smp_valid || sec % 10 == 0) {
+-									printf("SWEET SMP2P 435: mag %#x, ver %u, %u->%u, valid %u/%u, flags %#x\n",
+-									    smp->magic, smp->version, smp->local_pid, smp->remote_pid,
+-									    smp->valid_entries, smp->total_entries, smp->flags);
+-									if (sec == 1 || smp->valid_entries != last_smp_valid) {
+-										note("[smp435: %u->%u v%u valid %u/%u]",
+-										    smp->local_pid, smp->remote_pid, smp->version, smp->valid_entries, smp->total_entries);
+-									}
+-									last_smp_valid = smp->valid_entries;
+-								}
+-								for (uint32_t v = 0; v < 16; v++) {
+-									char ename[17] = {0};
+-									memcpy(ename, smp->entries[v].name, 16);
+-									static uint32_t last_vals[16];
+-									if (sec == 1 || smp->entries[v].value != last_vals[v] || (v < smp->valid_entries && sec % 30 == 0)) {
+-										if (ename[0] || smp->entries[v].value || v < smp->valid_entries) {
+-											printf("SWEET SMP2P: entry %u '%s' = %#x (valid %u)\n",
+-											    v, ename, smp->entries[v].value, v < smp->valid_entries);
+-											last_vals[v] = smp->entries[v].value;
+-											note("[SMP2P '%s'=%#x]", ename, smp->entries[v].value);
+-										}
+-									}
+-								}
+-							}
+-						} else if (e->item == 421) { /* Crash reason */
+-							uint32_t item_off = cur + sizeof(*e) + e->padding_hdr;
+-							if ((part_phys - part_base) + item_off + 64 <= map_sz) {
+-								char *cmsg = (char *)((uint8_t *)phdr + item_off);
+-								static char last_crash[64];
+-								if (cmsg[0] && strncmp(last_crash, cmsg, sizeof(last_crash)) != 0) {
+-									strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
+-									printf("SWEET MPSS CRASH: %s\n", cmsg);
+-									note("[CRASH: %.50s]", cmsg);
+-								}
+-							}
+-						}
+-						cur += sizeof(*e) + e->padding_hdr + e->size;
+-					}
+-				} else {
+-					if (sec == 1) {
+-						printf("SWEET SMEM: part %u bad $PRT magic %02x%02x%02x%02x\n",
+-						    i, phdr->magic[0], phdr->magic[1], phdr->magic[2], phdr->magic[3]);
+-						note("[part %u bad $PRT]", i);
+-					}
+-				}
+-				ml_io_unmap((vm_offset_t)part_win, map_sz);
+-			}
+-		}
+-	}
+-}
+-
+-static void
+-mpss_thread(void *arg, wait_result_t result)
+-{
+-#pragma unused(arg, result)
+-	bool ok = mpss_start();
+-
+-	for (int s = 1; s <= 600; s++) {
+-		sleep_ms(1000);
+-		if (ok) {
+-			sweet_smem_poll(s);
+-		}
+-		if (s <= 30 || s % 10 == 0) {
+-			printf("SWEET MPSS: alive %d s after %s: %s\n", s, ok ? "the start" : "the failure", report);
+-		}
+-	}
+-	(void)thread_terminate(current_thread());
+-	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ static int
