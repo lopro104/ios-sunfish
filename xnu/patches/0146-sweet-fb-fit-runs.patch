@@ -1,0 +1,92 @@
+From: sunfish-gpu
+Subject: [PATCH] SweetFramebuffer: kern.sweetfb_fit copies runs, not pixels
+
+Fit mode cost 46 -> 27 frames a second while scrolling (user test 2026-10-27): it wrote the
+panel a pixel at a time through the tables. A layer as wide as the display now goes in runs
+of 12 and 11 pixels (memcpy) with one averaged pixel between; the rows averaged with the next
+(1 in 24) and narrower layers are made up in a line buffer, then copied in one go.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 15:36:24.061742282 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 15:36:24.071316176 +0200
+@@ -164,6 +164,7 @@
+ 	 * presented row fFitRow[r] (fFitH rows); with SWEET_FB_FIT_MIX, that one and the next averaged.
+ 	 */
+ 	uint16_t     *fFitCol, *fFitRow;
++	uint32_t     *fFitLine;       /* a panel row made up before it is copied in (rows averaged, part layers) */
+ 	uint32_t      fFitTop, fFitH;
+ 	bool          fFitShown;      /* the rows above and below the shrunk picture are black */
+ 	int           fFitWas;
+@@ -320,13 +321,15 @@
+ 	 */
+ 	fFitCol = NULL;
+ 	fFitRow = NULL;
++	fFitLine = NULL;
+ 	if (fLogicalW * 24 == fWidth * 25 && fLogicalH * 24 / 25 <= fHeight) {
+ 		fFitH = fLogicalH * 24 / 25;
+ 		fFitTop = (fHeight - fFitH) / 2;
+ 		fFitCol = (uint16_t *)IOMallocData(fWidth * sizeof(uint16_t));
+ 		fFitRow = (uint16_t *)IOMallocData(fFitH * sizeof(uint16_t));
++		fFitLine = (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t));
+ 	}
+-	if (fFitCol != NULL && fFitRow != NULL) {
++	if (fFitCol != NULL && fFitRow != NULL && fFitLine != NULL) {
+ 		for (uint32_t i = 0; i < fWidth || i < fFitH; i++) {
+ 			uint32_t j = i % 24, at = i / 24 * 25 + (j <= 12 ? j : j + 1);
+ 			uint16_t v = (uint16_t)(at | (j == 12 ? SWEET_FB_FIT_MIX : 0));
+@@ -736,6 +739,9 @@
+ void
+ AppleCLCD::fitLayer(uintptr_t src, uint32_t row, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
+ {
++	/* A layer as wide as the display (the screen's): each row straight from the surface. */
++	bool whole = dx == 0 && w >= (int32_t)fLogicalW && fWidth % 24 == 0;
++
+ 	for (uint32_t r = 0; r < fFitH; r++) {
+ 		int32_t ly = (int32_t)(fFitRow[r] & ~SWEET_FB_FIT_MIX) - dy;
+ 		if (ly < 0 || ly >= h) {
+@@ -745,6 +751,23 @@
+ 		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + ly) * row) + sx;
+ 		const uint32_t *r1 = (const uint32_t *)((uintptr_t)r0 + (ymix ? row : 0));
+ 		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(fFitTop + r) * fRowBytes);
++		if (whole && !ymix) {
++			/*
++			 * 23 of 24 rows: of each 25 pixels, 12 copied, the 13th and 14th averaged, 11 copied.
++			 * (It was a pixel at a time into the panel's memory, with the tables: 46 frames a
++			 * second became 27 while scrolling.)
++			 */
++			for (uint32_t k = 0; k < fWidth / 24; k++) {
++				const uint32_t *in = r0 + 25 * k;
++				uint32_t *o = out + 24 * k;
++				memcpy(o, in, 12 * sizeof(uint32_t));
++				o[12] = sweet_fb_mix(in[12], in[13]);
++				memcpy(o + 13, in + 14, 11 * sizeof(uint32_t));
++			}
++			continue;
++		}
++		/* Rows averaged with the next, and layers narrower than the display: made up in fFitLine. */
++		int32_t first = -1, last = -1;
+ 		for (uint32_t c = 0; c < fWidth; c++) {
+ 			int32_t lx = (int32_t)(fFitCol[c] & ~SWEET_FB_FIT_MIX) - dx;
+ 			if (lx < 0 || lx >= w) {
+@@ -762,7 +785,12 @@
+ 				}
+ 				v = sweet_fb_mix(v, u);
+ 			}
+-			out[c] = v;
++			fFitLine[c] = v;
++			first = first < 0 ? (int32_t)c : first;
++			last = (int32_t)c;
++		}
++		if (first >= 0) {
++			memcpy(out + first, fFitLine + first, (size_t)(last - first + 1) * sizeof(uint32_t));
+ 		}
+ 	}
+ }
+@@ -783,7 +811,7 @@
+ 		}
+ 	}
+ 
+-	bool fit = sweet_fb_fit > 0 && fFitCol != NULL && fFitRow != NULL;
++	bool fit = sweet_fb_fit > 0 && fFitCol != NULL && fFitRow != NULL && fFitLine != NULL;
+ 	if (fit && !fFitShown) {
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+ 			if (y < fFitTop || y >= fFitTop + fFitH) {
