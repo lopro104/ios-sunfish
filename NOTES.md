@@ -622,3 +622,18 @@ CE0 dr 0x20 | CE1 sr 0x20 | CE2 sr 0x40 | CE3 dr 0x20 | CE4 dr 0x100 | CE5 none 
 CE4 host->target data, CE6 diag.) Next: host side of the rings (allocate descriptor memory, program base lo/hi, write idx,
 HTC ready message on CE2/CE1). Open question: whether the chip can DMA to host memory (SMMU stream).
 Phone is left running the probe image; boot shim-local-0136r-default.img (NOT -gpuwait) for normal use.
+
+## 2026-10-27 14:00-15:00 WCN3990 CE0 DMA test (patch 0137, wlanprobe=2; image shim/out/shim-local-0137g-dma.img)
+Observed:
+- The sysctl kern.sweet_mpss_events buffer is 8 KB and was FULL by the time the probe ran: several "hangs" were just
+  truncated logs. wlanprobe>=2 now clears the log first. (A 32 KB buffer image, 0137e, got stuck at the Apple logo with
+  ping but no sshd; 0137d booted fine. Cause unknown, not retried.)
+- The firmware has ALREADY programmed the copy-engine destination rings: CE0 dr_base 0x30_98d43540 (inside the MSA,
+  which we assigned away from HLOS: do NOT read it from the kernel), CE3 0x30_98d40a00, CE4 0x30_98d41080; CE0 dst_wr=1.
+- Host register WRITES to the CE work (no hang). I pointed CE0's dr_base at a host ring (0x1ba060000, 8 buffers filled
+  with 0xa5), wrote dst_wr=8 (accepted, reads back 8): after 3 s drri stays 0, descriptors untouched, buffers still 0xa5.
+  So no HTC ready message arrived in host memory. Not conclusive about DMA reachability: the ready message may have
+  been sent to the firmware's own ring before, or the firmware needs more host setup first (ce_rri / shadow regs / host_ie).
+- CE roles guess (ath10k snoc host config): CE0 htc ctrl rx, CE1 htc ctrl tx, CE2 data tx, CE3 wmi rx, CE4 htt rx.
+Next: read the msm-4.14 icnss / ath10k snoc init order (what the host writes before the HTC ready), try a test that
+writes our rings BEFORE wlan_mode, and look at the SMMU question (does a descriptor ever get written?).

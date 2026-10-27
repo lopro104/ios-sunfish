@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -2233,6 +2233,74 @@
+ #define WCN_CE_BASE             0x240000u               /* ce0; each next copy engine 0x1000 on */
+ #define WIMG_IO                 0x7u                    /* VM_WIMG_IO: guarded, coherent, not cacheable */
+ 
++/*
++ * wlanprobe=2 (read-only; a register WRITE to a copy engine hangs the bus): the firmware has already programmed
++ * its copy-engine rings. Dump CE0's registers and the first descriptors with the memory they point to, if that
++ * is inside the WLAN MSA region (0x98d00000...), to see whether the HTC ready message is already there.
++ */
++#define DMA_NBUF        8
++#define DMA_BUFSZ       2048
++
++/*
++ * The firmware's rings sit in the MSA (taken from HLOS: reading them hangs), so point CE0's destination ring at host
++ * memory instead and see whether the HTC ready message lands there: that answers "can the chip DMA into HLOS memory".
++ * Descriptors are ath10k's ce_desc_64: addr (u64), nbytes (u16), flags (u16), toeplitz (u32).
++ */
++static void
++wlfw_dma_test(volatile uint32_t *regs)
++{
++	vm_offset_t page = 0;
++	uint8_t *p;
++	uint64_t ring_pa, buf_pa;
++	volatile uint32_t *ce = regs + WCN_CE_BASE / 4;      /* copy engine 0 */
++	unsigned i, waited;
++
++	if (kmem_alloc(kernel_map, &page, 4 * PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		ev("WLAN DMA: no memory");
++		return;
++	}
++	p = (uint8_t *)page;
++	ring_pa = kvtophys(page);
++	buf_pa = kvtophys(page + PAGE_SIZE);
++	memset(p + PAGE_SIZE, 0xa5, DMA_NBUF * DMA_BUFSZ);
++	for (i = 0; i < DMA_NBUF; i++) {
++		((uint64_t *)(p + 16 * i))[0] = buf_pa + (uint64_t)i * DMA_BUFSZ;
++	}
++	for (vm_offset_t o = 0; o < 4 * PAGE_SIZE; o += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p + o) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ev("WLAN DMA: ring pa %#llx buffers pa %#llx; before: dr_base %#x/%#x dr_size %#x dst_wr %#x drri %#x",
++	    ring_pa, buf_pa, ce[3], ce[4], ce[5], ce[0x40 / 4], ce[0x48 / 4]);
++	ev("WLAN DMA: writing dr_base");
++	ce[3] = (uint32_t)ring_pa;
++	ce[4] = (uint32_t)(ring_pa >> 32);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ev("WLAN DMA: dr_base now %#x/%#x; writing dst_wr", ce[3], ce[4]);
++	ce[0x40 / 4] = DMA_NBUF;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (waited = 0; waited < 3000; waited += 100) {
++		sleep_ms(100);
++		if (ce[0x48 / 4] != 0) {
++			break;
++		}
++	}
++	ev("WLAN DMA: after %u ms: dst_wr %#x drri %#x", waited, ce[0x40 / 4], ce[0x48 / 4]);
++	for (vm_offset_t o = 0; o < 4 * PAGE_SIZE; o += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p + o) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (i = 0; i < 2; i++) {
++		uint64_t *d = (uint64_t *)(p + 16 * i);
++		uint8_t *bf = p + PAGE_SIZE + i * DMA_BUFSZ;
++
++		ev("WLAN DMA: desc%u addr %#llx nbytes %#x flags %#x", i, d[0] & 0x1fffffffffull, (unsigned)(d[1] & 0xffff),
++		    (unsigned)((d[1] >> 16) & 0xffff));
++		ev("WLAN DMA: buf%u %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", i,
++		    bf[0], bf[1], bf[2], bf[3], bf[4], bf[5], bf[6], bf[7], bf[8], bf[9], bf[10], bf[11], bf[12], bf[13], bf[14], bf[15]);
++	}
++}
++
+ /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
+ static void
+ wlfw_probe_hw(void)
+@@ -2243,14 +2311,21 @@
+ 		ev("WLAN probe: cannot map the chip's registers");
+ 		return;
+ 	}
++	if (g_wlan_probe >= 2) {
++		g_events_length = 0;            /* the 8 KB log is full by now: keep only the probe */
++		g_events[0] = 0;
++	}
+ 	ev("WLAN probe: registers mapped at %p", regs);
+-	for (unsigned ce = 0; ce < 12; ce++) {
++	for (unsigned ce = 0; ce < 7; ce++) {
+ 		uint32_t base = (WCN_CE_BASE + 0x1000 * ce) / 4;
+ 
+ 		/* sr_size 0x8, dr_size 0x14, current_srri 0x44, current_drri 0x48 */
+ 		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
+ 		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
+ 	}
++	if (g_wlan_probe >= 2) {
++		wlfw_dma_test(regs);
++	}
+ }
+ 
+ static void
