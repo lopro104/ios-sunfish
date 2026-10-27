@@ -1,7 +1,16 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -2301,6 +2301,1157 @@
+@@ -29,6 +29,8 @@
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
+ #include <sys/sysctl.h>
++#include <sys/random.h>
++#include "sweet_wlan_util.h"
+ 
+ extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+@@ -2301,6 +2303,1991 @@
  	}
  }
  
@@ -317,7 +326,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	{ 3, 32, 0x400, 0x20000, true, 0x800 },
 +	{ 1, 32, 0x800, 0x30000, false, 0 },
 +	{ 2, 64, 0xc00, 0x40000, false, 0 },
-+	{ 4, 16, 0x1000, 0x60000, true, 0x100 },        /* HTT host to target */
++	{ 4, 64, 0x1000, 0x60000, true, 0x100 },        /* HTT host to target: control messages and TX_FRM gather pairs */
 +};
 +
 +static struct {
@@ -338,6 +347,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		uint16_t mhz;
 +		int8_t rssi;
 +		char ssid[33];
++		uint16_t cap, bint, ie_len;
++		uint8_t ie[256];
 +	} bss[48];
 +	struct {
 +		uint32_t req_id, len;
@@ -666,6 +677,24 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +}
 +
 +
++
++static struct {
++	bool active, hs_done, auth_resp, assoc_resp, kicked, start_resp, stopped, vdev_started, vdev_up, peer, peer_mapped, sec_ind;
++	bool svc_mgmt_wmi, mgmt_busy, ptk_installed, key_pending[2], connected;
++	uint8_t ssid[32], ssid_len, pmk[32], bssid[6], dtim, mgmt_rate, group_type, ptk[16], gtk[16], sta_rsn[32];
++	int bss, mgmt_status, eapol_msdu;
++	uint16_t mhz, aid, peer_id, auth_status, seq;
++	uint32_t start_status, gtk_idx, rx_idx, mgmt_slot, tx_inflight, sta_rsn_len;
++	uint64_t tx_frames, tx_eapol, tx_fail, rx_drop, rx_eapol, rx_frames, rx_logged;
++	uint8_t txfree[256];
++	struct swu_assoc_resp ar;
++	struct swu_wpa wpa;
++} jn;
++
++static bool jn_mgmt(const uint8_t *fr, uint32_t frl);
++static bool jn_wmi_event(uint32_t evid, const uint8_t *t, uint32_t len);
++static bool jn_htt(const uint8_t *pl, uint32_t plen);
++
 +/* ---- passive scan (the fork's 1120/1123): HTT version + setup, WMI chain masks, channels, regdomain, vdev, start scan ---- */
 +static const uint8_t wp_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
 +static const uint16_t wp_chans[] = {
@@ -734,7 +763,13 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	memcpy(hd, h, 24);
 +	frl = MIN(frl, hd[4]);
-+	if ((hd[5] & 0x29) || frl < 36 || (fr[0] != 0x80 && fr[0] != 0x50)) {
++	if (hd[5] & 0x29) {
++		return;
++	}
++	if (jn.active && jn_mgmt(fr, frl)) {
++		return;
++	}
++	if (frl < 36 || (fr[0] != 0x80 && fr[0] != 0x50)) {
 +		return;
 +	}
 +	wp.beacons++;
@@ -751,6 +786,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	wp.bss[k].mhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] : 5000 + 5 * hd[0]);
 +	wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
 +	wp.bss[k].ssid[0] = 0;
++	wp.bss[k].cap = (uint16_t)(fr[34] | (fr[35] << 8));
++	wp.bss[k].bint = (uint16_t)(fr[32] | (fr[33] << 8));
++	wp.bss[k].ie_len = (uint16_t)MIN(frl - 36, (uint32_t)sizeof(wp.bss[k].ie));
++	memcpy(wp.bss[k].ie, fr + 36, wp.bss[k].ie_len);
 +	for (uint32_t o = 36; o + 2 <= frl;) {
 +		uint8_t id = fr[o], l = fr[o + 1];
 +
@@ -969,6 +1008,795 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	ev("WMI: scan %s: %u BSS", wp.scan_done ? "done" : "TIMEOUT", wp.nbss);
 +}
 +
++/* ---- joining a WPA2-PSK network (the fork's 1126/1127 order, with the handshake in sweet_wlan_util.c) ----
++ * Credentials: /fw/wlan/net.conf = SSID line, then the 32-byte PMK as 64 hex digits (PBKDF2 done on the PC).
++ */
++#define JN_MGMT_OFF     0x430000u       /* 8 management frame buffers of 1 KiB */
++#define JN_TXBUF_OFF    0x438000u       /* per msdu id: HTC header + HTT TX_FRM (64 bytes) */
++#define JN_TXFR_OFF     0x440000u       /* per msdu id: the native-wifi frame (2 KiB) */
++#define JN_NTX          256u
++#define JN_RXDESC       360u            /* sizeof(struct htt_rx_desc_v2): payload offset in an RX buffer */
++
++static const struct swu_wpa_ops jn_ops;
++static void jn_dataframe(const uint8_t *eth, size_t n);
++
++static bool
++jn_read_conf(void)
++{
++	char buf[160];
++	off_t size = 0;
++	int err = tftp_file("/fw/wlan/net.conf", 0, NULL, 0, &size);
++	unsigned i, l = 0;
++
++	if (err != 0 || size < 70 || size >= (off_t)sizeof(buf)) {
++		ev("JOIN: no usable /fw/wlan/net.conf (error %d, %lld bytes)", err, (long long)size);
++		return false;
++	}
++	if (tftp_file("/fw/wlan/net.conf", 0, buf, (int)size, NULL) != 0) {
++		return false;
++	}
++	buf[size] = 0;
++	while (l < 32 && buf[l] != '\n' && buf[l] != 0) {
++		jn.ssid[l] = (uint8_t)buf[l];
++		l++;
++	}
++	jn.ssid_len = (uint8_t)l;
++	if (buf[l] != '\n' || l == 0) {
++		return false;
++	}
++	for (i = 0; i < 32; i++) {
++		unsigned v = 0;
++
++		for (unsigned k = 0; k < 2; k++) {
++			char c = buf[l + 1 + 2 * i + k];
++
++			v = (v << 4) | (unsigned)(c >= '0' && c <= '9' ? c - '0' : (c >= 'a' && c <= 'f' ? c - 'a' + 10 : 0));
++		}
++		jn.pmk[i] = (uint8_t)v;
++	}
++	ev("JOIN: network \"%.*s\", PMK loaded", jn.ssid_len, jn.ssid);
++	return true;
++}
++
++/* the best scanned BSS with our SSID and a WPA2-PSK/CCMP element */
++static bool
++jn_pick(void)
++{
++	int best = -1, best_rssi = -1000;
++
++	for (unsigned k = 0; k < wp.nbss; k++) {
++		const uint8_t *rsn;
++
++		if (strlen(wp.bss[k].ssid) != jn.ssid_len || memcmp(wp.bss[k].ssid, jn.ssid, jn.ssid_len) != 0) {
++			continue;
++		}
++		rsn = swu_ie_find(wp.bss[k].ie, wp.bss[k].ie_len, 48);
++		if (!rsn || rsn[1] < 8) {
++			continue;
++		}
++		if (wp.bss[k].rssi > best_rssi) {
++			best = (int)k;
++			best_rssi = wp.bss[k].rssi;
++		}
++	}
++	if (best < 0) {
++		ev("JOIN: no BSS with that SSID and an RSN element in the scan");
++		return false;
++	}
++	jn.bss = best;
++	memcpy(jn.bssid, wp.bss[best].bssid, 6);
++	jn.mhz = wp.bss[best].mhz;
++	{
++		const uint8_t *rsn = swu_ie_find(wp.bss[best].ie, wp.bss[best].ie_len, 48);
++		const uint8_t *tim = swu_ie_find(wp.bss[best].ie, wp.bss[best].ie_len, 5);
++		static const uint8_t rate_val[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
++		static const uint8_t rate_hw[12] = { 0x43, 0x42, 0x41, 0x40, 0x03, 0x07, 0x02, 0x06, 0x01, 0x05, 0x00, 0x04 };
++		int lo = -1;
++
++		jn.group_type = rsn[7];                 /* version(2), group OUI(3), group type */
++		jn.dtim = (tim && tim[1] >= 2 && tim[3]) ? tim[3] : 1;
++		for (uint8_t id = 1; id != 0; id = (id == 1) ? 50 : 0) {
++			const uint8_t *e = swu_ie_find(wp.bss[best].ie, wp.bss[best].ie_len, id);
++
++			for (unsigned k = 0; e && k < e[1]; k++) {
++				for (int r = 0; r < 12; r++) {
++					if ((e[2 + k] & 0x80) && (e[2 + k] & 0x7f) == rate_val[r] && (lo < 0 || rate_val[r] < rate_val[lo])) {
++						lo = r;
++					}
++				}
++			}
++		}
++		jn.mgmt_rate = lo >= 0 ? rate_hw[lo] : (jn.mhz > 4900 ? 0x03 : 0x43);
++		ev("JOIN: BSS %02x%02x%02x%02x%02x%02x %u MHz %d dBm, beacon %u, dtim %u, group cipher type %u, mgmt rate %#x",
++		    jn.bssid[0], jn.bssid[1], jn.bssid[2], jn.bssid[3], jn.bssid[4], jn.bssid[5], jn.mhz, wp.bss[best].rssi,
++		    wp.bss[best].bint, jn.dtim, jn.group_type, jn.mgmt_rate);
++		if (jn.group_type != 4) {
++			ev("JOIN: the AP's group cipher is not CCMP: not supported yet");
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- HTT TX_FRM for data and (without WMI mgmt tx) management frames ---- */
++static bool
++jn_ce4_send2(uint64_t pa0, uint16_t len0, uint64_t pa1, uint16_t len1)
++{
++	const unsigned r = 4;
++	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
++	uint32_t srri = wp_ce(4)[0x44 / 4] & mask;
++	struct wp_desc *d;
++
++	if (((srri - 1 - wr) & mask) < 2) {
++		return false;
++	}
++	d = wp_desc(r, wr);
++	d->addr = (pa0 & 0x1fffffffffull) | (0x10000ull << 32) | (1ull << 63);     /* gather */
++	d->nbytes = len0;
++	d->flags = 1;
++	d->hash = 0;
++	wp_sync(d, sizeof(*d));
++	wr = (wr + 1) & mask;
++	d = wp_desc(r, wr);
++	d->addr = pa1 & 0x1fffffffffull;
++	d->nbytes = len1;
++	d->flags = 0;
++	d->hash = 0;
++	wp_sync(d, sizeof(*d));
++	wr = (wr + 1) & mask;
++	wp.wr[r] = wr;
++	wp.regs[0x32010 / 4] = wr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++static int
++jn_txid_alloc(void)
++{
++	for (unsigned k = 0; k < JN_NTX; k++) {
++		if (jn.txfree[k]) {
++			jn.txfree[k] = 0;
++			jn.tx_inflight++;
++			return (int)k;
++		}
++	}
++	return -1;
++}
++
++static void
++jn_txid_free(unsigned id)
++{
++	if (id < JN_NTX && !jn.txfree[id]) {
++		jn.txfree[id] = 1;
++		jn.tx_inflight--;
++	}
++}
++
++static bool
++jn_htt_tx(unsigned id, uint16_t len, bool mgmt, bool no_encrypt, unsigned tid)
++{
++	uint64_t frame_pa = wp.pa + JN_TXFR_OFF + (uint64_t)id * 2048;
++	uint64_t txbuf_pa = wp.pa + JN_TXBUF_OFF + (uint64_t)id * 64;
++	uint8_t *tb = wp.pool + JN_TXBUF_OFF + (uint64_t)id * 64;
++	uint64_t frags = frame_pa;
++	uint16_t prefetch = (uint16_t)((MIN(len, (uint16_t)50) + 3) & ~3u), hl = (uint16_t)(20 + prefetch), f1, id16 = (uint16_t)id, peer = 0xffff;
++
++	if (!mgmt) {
++		uint8_t *ext = wp.pool + WP_HTT_FRAG + (uint64_t)id * 72;
++		uint32_t lo = (uint32_t)frame_pa;
++		uint16_t hi = (uint16_t)(frame_pa >> 32);
++
++		memset(ext, 0, 72);
++		memcpy(ext + 24, &lo, 4);
++		memcpy(ext + 28, &hi, 2);
++		memcpy(ext + 30, &len, 2);
++		wp_sync(ext, 72);
++		frags = wp.pa + WP_HTT_FRAG + (uint64_t)id * 72;
++	}
++	memset(tb, 0, 28);
++	tb[0] = wp.htt_eid;
++	memcpy(tb + 2, &hl, 2);
++	tb[8] = 1;                                              /* HTT_H2T_MSG_TYPE_TX_FRM */
++	tb[9] = (uint8_t)(1u | (no_encrypt ? 4u : 0u) | ((mgmt ? 3u : 1u) << 5));
++	f1 = (uint16_t)(((tid & 0x1f) << 6) | 0x800u);
++	memcpy(tb + 10, &f1, 2);
++	memcpy(tb + 12, &len, 2);
++	memcpy(tb + 14, &id16, 2);
++	memcpy(tb + 16, &frags, 8);
++	memcpy(tb + 24, &peer, 2);
++	wp_sync(tb, 64);
++	wp_sync(wp.pool + JN_TXFR_OFF + (uint64_t)id * 2048, len);
++	return jn_ce4_send2(txbuf_pa, 28, frame_pa, prefetch);
++}
++
++/* one Ethernet II frame out as native wifi; protected once the pairwise key is in */
++static int
++jn_tx_eth(const uint8_t *eth, size_t len, bool eapol)
++{
++	int id = jn_txid_alloc();
++	uint8_t *fr;
++	size_t n;
++	uint16_t sc;
++
++	if (id < 0) {
++		return 28;
++	}
++	fr = wp.pool + JN_TXFR_OFF + (uint64_t)id * 2048;
++	n = swu_eth_to_nwifi(eth, len, jn.bssid, fr, 2048);
++	if (n == 0) {
++		jn_txid_free((unsigned)id);
++		return 22;
++	}
++	if (jn.ptk_installed) {
++		fr[1] |= 0x40;                                  /* Protected: the firmware encrypts */
++	}
++	sc = (uint16_t)(jn.seq++ << 4);
++	memcpy(fr + 22, &sc, 2);
++	if (!jn_htt_tx((unsigned)id, (uint16_t)n, false, !jn.ptk_installed, 16)) {
++		jn_txid_free((unsigned)id);
++		return 28;
++	}
++	if (eapol) {
++		jn.eapol_msdu = id;
++		jn.tx_eapol++;
++	}
++	jn.tx_frames++;
++	return 0;
++}
++
++/* ---- management frames ---- */
++static bool
++jn_mgmt_tx(const uint8_t *f, size_t len, const char *what)
++{
++	uint16_t sc = (uint16_t)(jn.seq++ << 4);
++
++	if (len > 1024) {
++		return false;
++	}
++	jn.mgmt_busy = true;
++	jn.mgmt_status = -1;
++	if (jn.svc_mgmt_wmi) {
++		unsigned slot = jn.mgmt_slot++ % 8u;
++		uint8_t *buf = wp.pool + JN_MGMT_OFF + slot * 1024u;
++		uint64_t pa = wp.pa + JN_MGMT_OFF + slot * 1024u;
++		uint32_t blen = (uint32_t)((MIN(len, (size_t)64) + 3) & ~3u);
++		uint32_t m[7] = { 0, slot, 0, (uint32_t)pa, (uint32_t)(pa >> 32), (uint32_t)len, blen };
++		uint8_t c[8 + 28 + 4 + 64];
++		uint32_t n;
++
++		memcpy(buf, f, len);
++		memcpy(buf + 22, &sc, 2);
++		wp_sync(buf, len);
++		n = wp_cmd(c, 0x7008, 422, m, 28);
++		wp_tlv(c, &n, 17, buf, (uint16_t)blen);
++		if (!wp_wmi(what, c, n)) {
++			return false;
++		}
++	} else {
++		int id = jn_txid_alloc();
++		uint8_t *fr;
++
++		if (id < 0) {
++			return false;
++		}
++		fr = wp.pool + JN_TXFR_OFF + (uint64_t)id * 2048;
++		memcpy(fr, f, len);
++		memcpy(fr + 22, &sc, 2);
++		if (!jn_htt_tx((unsigned)id, (uint16_t)len, true, true, 17)) {
++			jn_txid_free((unsigned)id);
++			return false;
++		}
++	}
++	ev("JOIN: %s sent (%zu bytes, %s)", what, len, jn.svc_mgmt_wmi ? "WMI by reference" : "HTT");
++	return true;
++}
++
++/* ---- the handshake glue ---- */
++static void
++jn_wpa_tx(void *arg, const uint8_t *frame, size_t len)
++{
++	uint8_t eth[14 + 256];
++
++	(void)arg;
++	if (len > 256) {
++		return;
++	}
++	memcpy(eth, jn.bssid, 6);
++	memcpy(eth + 6, wp_mac, 6);
++	eth[12] = 0x88;
++	eth[13] = 0x8e;
++	memcpy(eth + 14, frame, len);
++	(void)jn_tx_eth(eth, 14 + len, true);
++}
++
++static int
++jn_wpa_key(void *arg, int pairwise, unsigned idx, const uint8_t *key, size_t len)
++{
++	(void)arg;
++	if (len != 16) {
++		return 95;
++	}
++	if (pairwise) {
++		memcpy(jn.ptk, key, 16);
++		jn.key_pending[0] = true;
++	} else {
++		memcpy(jn.gtk, key, 16);
++		jn.gtk_idx = idx;
++		jn.key_pending[1] = true;
++	}
++	return 0;
++}
++
++static void
++jn_wpa_done(void *arg, int status)
++{
++	(void)arg;
++	ev("JOIN: 4-way handshake %s", status ? "FAILED" : "done");
++	jn.hs_done = status == 0;
++}
++
++static void
++jn_random(uint8_t *buf, size_t len)
++{
++	read_random(buf, (u_int)len);
++}
++
++static const struct swu_wpa_ops jn_ops = { jn_wpa_tx, jn_wpa_key, jn_wpa_done, jn_random };
++
++/* ---- WMI commands of the station ---- */
++static bool
++jn_vdev_param(uint32_t param, uint32_t value, const char *what)
++{
++	uint8_t c[32];
++	uint32_t v[3] = { 0, param, value };
++
++	return wp_wmi(what, c, wp_cmd(c, 0x5008, 95, v, 12)) ;
++}
++
++static bool
++jn_peer_param(uint32_t param, uint32_t value, const char *what)
++{
++	uint8_t c[32];
++	uint32_t v[5] = { 0, 0, 0, param, value };
++
++	memcpy(&v[1], jn.bssid, 6);
++	return wp_wmi(what, c, wp_cmd(c, 0x6004, 100, v, 20));
++}
++
++static bool
++jn_vdev_start(void)
++{
++	uint8_t c[128];
++	uint32_t v[18], n;
++	bool g5 = jn.mhz > 4900, dfs = jn.mhz >= 5260 && jn.mhz <= 5720;
++	uint32_t mode = g5 ? 0u : 1u;                           /* 11A / 11G: no HT yet */
++	uint32_t ch[6] = { jn.mhz, jn.mhz, 0, mode | (dfs ? (1u << 10) : 0), 0u | (40u << 8) | (40u << 16), 0u | (40u << 8) };
++
++	memset(v, 0, sizeof(v));
++	n = wp_cmd(c, 0x5003, 88, v, 72);
++	wp_tlv(c, &n, 80, ch, 24);
++	wp_tlv(c, &n, 18, NULL, 0);
++	jn.start_resp = false;
++	jn.vdev_started = true;
++	return wp_wmi("vdev start", c, n);
++}
++
++static bool
++jn_peer_assoc(void)
++{
++	static const uint8_t ours[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
++	uint8_t legacy[16], c[8 + 76 + 4 + 12 + 4 + 4 + 16];
++	unsigned nl = 0;
++	bool g5 = jn.mhz > 4900;
++	uint32_t a[19], n;
++	uint8_t pad[16];
++	uint32_t vht[4] = { 0, 0, 0, 0 };
++
++	for (unsigned r = 0; r < 12; r++) {
++		if (g5 && r < 4) {
++			continue;
++		}
++		for (unsigned k = 0; k < jn.ar.nrates; k++) {
++			if ((jn.ar.rates[k] & 0x7f) == ours[r]) {
++				legacy[nl++] = (uint8_t)(ours[r] | (r < 4 ? 0x80 : 0));
++				break;
++			}
++		}
++	}
++	memset(a, 0, sizeof(a));
++	memcpy(&a[0], jn.bssid, 6);
++	a[2] = 0;                                               /* vdev */
++	a[3] = 1;                                               /* new_assoc */
++	a[4] = jn.aid;
++	a[5] = 0x1 | (jn.ar.wmm ? 0x2 : 0) | 0x4;               /* auth, qos, need the 4-way */
++	a[6] = jn.ar.cap;
++	a[7] = 1;
++	a[12] = 1;                                              /* nss */
++	a[14] = g5 ? 0 : ((nl > 4 || (nl && !(legacy[0] & 0x80))) ? 1 : 2);   /* 11A / 11G / 11B */
++	a[17] = nl;
++	a[18] = 0;
++	n = wp_cmd(c, 0x6005, 101, a, 76);
++	memset(pad, 0, sizeof(pad));
++	memcpy(pad, legacy, nl);
++	wp_tlv(c, &n, 17, pad, (uint16_t)((nl + 3) & ~3u));
++	wp_tlv(c, &n, 17, NULL, 0);
++	wp_tlv(c, &n, 102, vht, 16);
++	ev("JOIN: peer assoc aid %u flags %#x caps %#x phy mode %u, %u legacy rates", jn.aid, a[5], a[6], a[14], nl);
++	return wp_wmi("peer assoc", c, n);
++}
++
++static bool
++jn_install_key(bool pairwise)
++{
++	uint8_t c[8 + 92 + 4 + 16];
++	uint32_t k[23], n;
++
++	memset(k, 0, sizeof(k));
++	memcpy(&k[1], jn.bssid, 6);
++	k[3] = pairwise ? 0 : jn.gtk_idx;
++	k[4] = pairwise ? 0 : 1;
++	k[5] = 4;                                               /* AES CCM */
++	k[20] = 16;
++	n = wp_cmd(c, 0x5009, 96, k, 92);
++	wp_tlv(c, &n, 17, pairwise ? jn.ptk : jn.gtk, 16);
++	jn.sec_ind = false;
++	ev("JOIN: installing the %s key", pairwise ? "pairwise" : "group");
++	return wp_wmi("install key", c, n);
++}
++
++/* ---- incoming: management frames, WMI events, HTT messages ---- */
++static bool
++jn_mgmt(const uint8_t *fr, uint32_t frl)
++{
++	uint16_t st = 0;
++
++	if (swu_auth_resp(fr, frl, jn.bssid, wp_mac, &st) == 0) {
++		jn.auth_resp = true;
++		jn.auth_status = st;
++		ev("JOIN: authentication response status %u", st);
++		return true;
++	}
++	if (swu_assoc_resp(fr, frl, jn.bssid, wp_mac, &jn.ar) == 0) {
++		jn.assoc_resp = true;
++		ev("JOIN: association response status %u aid %u cap %#x, %u rates, WMM %u", jn.ar.status, jn.ar.aid, jn.ar.cap, jn.ar.nrates, jn.ar.wmm);
++		return true;
++	}
++	if (swu_kicked(fr, frl, jn.bssid, wp_mac, &st) == 0) {
++		jn.kicked = true;
++		ev("JOIN: %s from the AP, reason %u", fr[0] == 0xc0 ? "deauthentication" : "disassociation", st);
++		return true;
++	}
++	return false;
++}
++
++static bool
++jn_wmi_event(uint32_t evid, const uint8_t *t, uint32_t len)
++{
++	uint32_t v[5];
++
++	memset(v, 0, sizeof(v));
++	if (len >= 4) {
++		memcpy(v, t + 4, MIN(len - 4, (uint32_t)sizeof(v)));
++	}
++	switch (evid) {
++	case 0x5001:                                            /* VDEV_START_RESP {vdev, req, type, status} */
++		jn.start_status = v[3];
++		jn.start_resp = true;
++		ev("JOIN: VDEV_START_RESP status %u", v[3]);
++		return true;
++	case 0x5002:
++		jn.stopped = true;
++		return true;
++	case 0x7006:                                            /* MGMT_TX_COMPLETION {desc, status} */
++		jn.mgmt_status = (int)v[1];
++		jn.mgmt_busy = false;
++		ev("JOIN: management TX %s (status %u)", v[1] ? "NOT acked" : "acked", v[1]);
++		return true;
++	case 0x7007: {                                          /* MGMT_TX_BUNDLE_COMPLETION */
++		uint32_t o = 8, nrep = v[0];
++		uint16_t l;
++
++		if (o + 4 <= len) {
++			memcpy(&l, t + o, 2);
++			o += 4u + l;
++			if (nrep && o + 8 <= len) {
++				uint32_t st;
++
++				memcpy(&st, t + o + 4, 4);
++				jn.mgmt_status = (int)st;
++			}
++		}
++		jn.mgmt_busy = false;
++		ev("JOIN: management TX (bundle of %u) status %d", nrep, jn.mgmt_status);
++		return true;
++	}
++	case 0x6001:
++		jn.kicked = true;
++		ev("JOIN: firmware kickout of the AP");
++		return true;
++	case 0x5003:                                            /* INSTALL_KEY_COMPLETE */
++	case 0x6006:                                            /* PEER_ASSOC_CONF */
++	case 0x4005:                                            /* TX_PAUSE */
++		return true;
++	default:
++		return false;
++	}
++}
++
++static void
++jn_rx_repost(uint64_t pa)
++{
++	uint64_t *ring = (uint64_t *)(wp.pool + WP_HTT_RXRING);
++
++	*(volatile uint32_t *)(wp.pool + (pa - wp.pa) + 4) = 0;                 /* rx_attention */
++	wp_sync(wp.pool + (pa - wp.pa), 64);
++	ring[jn.rx_idx] = pa;
++	wp_sync(&ring[jn.rx_idx], 8);
++	jn.rx_idx = (jn.rx_idx + 1) & (WP_HTT_RINGSZ - 1);
++}
++
++static void
++jn_rx_frame(const uint8_t *buf, uint16_t mlen)
++{
++	uint8_t eth[1600];
++	uint32_t att;
++	size_t n;
++
++	memcpy(&att, buf + 4, 4);
++	if (!(att & (1u << 31)) || (att & ((1u << 30) | (1u << 29) | (1u << 3) | (1u << 27) | (1u << 17) | (1u << 16))) ||
++	    mlen > WP_HTT_BUFSZ - JN_RXDESC) {
++		jn.rx_drop++;
++		return;
++	}
++	n = swu_nwifi_to_eth(buf + JN_RXDESC, mlen, eth, sizeof(eth));
++	if (n < 14 || memcmp(eth + 6, wp_mac, 6) == 0) {
++		jn.rx_drop++;
++		return;
++	}
++	if (eth[12] == 0x88 && eth[13] == 0x8e) {
++		jn.rx_eapol++;
++		int e = swu_wpa_rx(&jn.wpa, eth + 14, n - 14);
++
++		ev("JOIN: EAPOL %zu bytes -> %d (supplicant state %d)", n - 14, e, jn.wpa.state);
++		return;
++	}
++	jn.rx_frames++;
++	if (jn.rx_logged < 12) {
++		jn.rx_logged++;
++		ev("JOIN: rx %zu bytes type %02x%02x from %02x%02x%02x%02x%02x%02x", n, eth[12], eth[13], eth[6], eth[7], eth[8], eth[9], eth[10], eth[11]);
++	}
++	jn_dataframe(eth, n);
++}
++
++static bool
++jn_htt(const uint8_t *pl, uint32_t plen)
++{
++	if (plen < 4) {
++		return false;
++	}
++	switch (pl[0]) {
++	case 0x03:                                              /* PEER_MAP */
++		if (plen >= 10 && memcmp(pl + 4, jn.bssid, 6) == 0) {
++			memcpy(&jn.peer_id, pl + 2, 2);
++			jn.peer_mapped = true;
++			ev("JOIN: peer mapped id %u", jn.peer_id);
++		}
++		return true;
++	case 0x04:
++		return true;
++	case 0x0b:                                              /* SEC_IND */
++		jn.sec_ind = true;
++		ev("JOIN: SEC_IND type %u %s", pl[1] & 0x7f, (pl[1] & 0x80) ? "unicast" : "group");
++		return true;
++	case 0x07: {                                            /* TX_COMPL_IND: status, count, flags2, msdu ids */
++		unsigned st = pl[1] & 7, num = pl[2];
++
++		for (unsigned k = 0; k < num && 4 + 2 * k + 2 <= plen; k++) {
++			uint16_t id;
++
++			memcpy(&id, pl + 4 + 2 * k, 2);
++			if (id == 0xffff) {
++				continue;
++			}
++			if (st != 0) {
++				jn.tx_fail++;
++			}
++			if ((int)id == jn.eapol_msdu) {
++				jn.eapol_msdu = -1;
++			}
++			if (jn.mgmt_busy && !jn.svc_mgmt_wmi) {
++				jn.mgmt_busy = false;
++				jn.mgmt_status = (int)st;
++			}
++			jn_txid_free(id);
++		}
++		return true;
++	}
++	case 0x0e:                                              /* MGMT_TX_COMPL_IND (HTT path) */
++		if (plen >= 12) {
++			uint32_t id, st;
++
++			memcpy(&id, pl + 4, 4);
++			memcpy(&st, pl + 8, 4);
++			jn.mgmt_busy = false;
++			jn.mgmt_status = (int)st;
++			jn_txid_free(id);
++			ev("JOIN: management TX (HTT) status %u", st);
++		}
++		return true;
++	case 0x12: {                                            /* RX_IN_ORD_PADDR_IND: info, peer, vdev, rsvd, count, 12-byte descs */
++		uint16_t cnt;
++
++		memcpy(&cnt, pl + 6, 2);
++		if (8u + 12u * cnt > plen) {
++			return true;
++		}
++		for (unsigned k = 0; k < cnt; k++) {
++			uint64_t pa;
++			uint16_t ml;
++			const uint8_t *buf;
++
++			memcpy(&pa, pl + 8 + 12 * k, 8);
++			memcpy(&ml, pl + 8 + 12 * k + 8, 2);
++			pa &= 0x1fffffffffull;
++			if (pa < wp.pa + WP_HTT_RXBUF || pa >= wp.pa + WP_POOL || ((pa - wp.pa - WP_HTT_RXBUF) % WP_HTT_BUFSZ) != 0) {
++				ev("JOIN: in-order indication with an unknown buffer %#llx", pa);
++				return true;
++			}
++			buf = wp.pool + (pa - wp.pa);
++			wp_sync(buf, MIN((uint32_t)ml + JN_RXDESC, WP_HTT_BUFSZ));
++			if (!(pl[1] & 0x20)) {
++				jn_rx_frame(buf, ml);
++			}
++			jn_rx_repost(pa);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(wp.pool + WP_HTT_ALLOCIDX) = jn.rx_idx;
++		wp_sync(wp.pool + WP_HTT_ALLOCIDX, 64);
++		return true;
++	}
++	default:
++		return false;
++	}
++}
++
++static bool
++jn_wait(bool *flag, unsigned ms, const char *what)
++{
++	for (unsigned t = 0; t < ms; t += 5) {
++		wp_poll();
++		if (*flag) {
++			return true;
++		}
++		if (jn.kicked) {
++			ev("JOIN: kicked while waiting for %s", what);
++			return false;
++		}
++		sleep_ms(5);
++	}
++	ev("JOIN: timeout waiting for %s", what);
++	return false;
++}
++
++static bool
++jn_join(void)
++{
++	uint8_t f[512], rsn[32], c[32];
++	size_t n;
++	uint32_t v[4];
++
++	if (!jn_read_conf() || !jn_pick()) {
++		return false;
++	}
++	jn.active = true;
++	memset(jn.txfree, 1, sizeof(jn.txfree));
++	jn.rx_idx = WP_HTT_RINGSZ - 1;
++	jn.svc_mgmt_wmi = wp_svc_on(76);
++	ev("JOIN: management TX via %s, rx reorder offload %u", jn.svc_mgmt_wmi ? "WMI" : "HTT", wp_svc_on(65));
++	jn.eapol_msdu = -1;
++	/* VDEV_START on the AP's channel; the vdev created for the scan is reused */
++	if (!jn_vdev_start() || !jn_wait(&jn.start_resp, 3000, "VDEV_START_RESP") || jn.start_status) {
++		return false;
++	}
++	v[0] = 0; v[1] = 0;
++	if (!wp_wmi("power save off", c, wp_cmd(c, 0x9001, 108, v, 8)) || !jn_vdev_param(0x03, wp.bss[jn.bss].bint, "beacon interval") ||
++	    !jn_vdev_param(0x19, jn.mgmt_rate, "management rate")) {
++		return false;
++	}
++	v[0] = 0; v[1] = 0; v[2] = 0; v[3] = 0;
++	memcpy(&v[1], jn.bssid, 6);
++	if (!wp_wmi("peer create", c, wp_cmd(c, 0x6001, 97, v, 16))) {
++		return false;
++	}
++	jn.peer = true;
++	if (!jn_wait(&jn.peer_mapped, 3000, "HTT PEER_MAP")) {
++		return false;
++	}
++	n = swu_auth_req(f, sizeof(f), jn.bssid, wp_mac);
++	for (unsigned tries = 0; tries < 3 && !jn.auth_resp; tries++) {
++		if (!jn_mgmt_tx(f, n, "authentication")) {
++			return false;
++		}
++		jn_wait(&jn.auth_resp, 400, "authentication response");
++	}
++	if (!jn.auth_resp || jn.auth_status) {
++		return false;
++	}
++	{
++		struct swu_assoc as;
++		size_t rl = swu_build_rsn(rsn, jn.group_type);
++
++		memset(&as, 0, sizeof(as));
++		memcpy(as.bssid, jn.bssid, 6);
++		memcpy(as.sa, wp_mac, 6);
++		as.cap = (uint16_t)(0x0001 | (jn.mhz < 4900 ? 0x0420 : 0));
++		memcpy(as.ssid, jn.ssid, jn.ssid_len);
++		as.ssid_len = jn.ssid_len;
++		as.ap_ies = wp.bss[jn.bss].ie;
++		as.ap_ies_len = wp.bss[jn.bss].ie_len;
++		as.rsn_ie = rsn;
++		as.rsn_ie_len = rl;
++		n = swu_assoc_req(f, sizeof(f), &as);
++		if (n == 0) {
++			ev("JOIN: could not build the association request");
++			return false;
++		}
++		memcpy(jn.sta_rsn, rsn, rl);
++		jn.sta_rsn_len = rl;
++	}
++	for (unsigned tries = 0; tries < 3 && !jn.assoc_resp; tries++) {
++		if (!jn_mgmt_tx(f, n, "association request")) {
++			return false;
++		}
++		jn_wait(&jn.assoc_resp, 400, "association response");
++	}
++	if (!jn.assoc_resp || jn.ar.status) {
++		return false;
++	}
++	jn.aid = jn.ar.aid;
++	swu_wpa_start(&jn.wpa, &jn_ops, NULL, jn.pmk, jn.bssid, wp_mac, jn.sta_rsn, jn.sta_rsn_len);
++	if (!jn_vdev_param(0x0d, jn.dtim, "dtim period") || !jn_peer_assoc()) {
++		return false;
++	}
++	v[0] = 0; v[1] = jn.aid; v[2] = 0; v[3] = 0;
++	memcpy(&v[2], jn.bssid, 6);
++	if (!wp_wmi("vdev up", c, wp_cmd(c, 0x5005, 92, v, 16))) {
++		return false;
++	}
++	jn.vdev_up = true;
++	ev("JOIN: vdev up, waiting for the 4-way handshake");
++	if (!jn_wait(&jn.hs_done, 6000, "the 4-way handshake")) {
++		return false;
++	}
++	/* message 4 is out (unencrypted); then pairwise key -> authorize -> group key */
++	for (unsigned t = 0; t < 200 && jn.eapol_msdu >= 0; t += 5) {
++		wp_poll();
++		sleep_ms(5);
++	}
++	if (!jn.key_pending[0] || !jn_install_key(true) || !jn_wait(&jn.sec_ind, 3000, "pairwise SEC_IND")) {
++		return false;
++	}
++	jn.ptk_installed = true;
++	if (!jn_peer_param(3, 1, "peer authorize")) {
++		return false;
++	}
++	if (jn.key_pending[1]) {
++		if (!jn_install_key(false) || !jn_wait(&jn.sec_ind, 3000, "group SEC_IND")) {
++			return false;
++		}
++	}
++	jn.connected = true;
++	ev("JOIN: CONNECTED to %02x%02x%02x%02x%02x%02x aid %u", jn.bssid[0], jn.bssid[1], jn.bssid[2], jn.bssid[3], jn.bssid[4], jn.bssid[5], jn.aid);
++	return true;
++}
++
++static void
++jn_dataframe(const uint8_t *eth, size_t n)
++{
++	(void)eth;
++	(void)n;
++}
++
 +/* one received message (HTC header: eid, flags, len, ctrl[2], seq?, ...) */
 +static void
 +wp_rx(unsigned ce, const uint8_t *p, uint32_t len)
@@ -1060,6 +1888,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +				o += 4u + l;
 +			}
 +			ev("WMI: READY, MAC %02x:%02x:%02x:%02x:%02x:%02x", wp.mac[0], wp.mac[1], wp.mac[2], wp.mac[3], wp.mac[4], wp.mac[5]);
++		} else if (jn.active && jn_wmi_event(evid, pl + 4, plen - 4)) {
++			wp.msgs--;
 +		} else if (evid == 0x3001) {
 +			wp_scan_event(pl + 4, plen - 4);
 +		} else if (evid == 0x7001) {
@@ -1067,6 +1897,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		} else {
 +			wp.msgs--;
 +		}
++		return;
++	}
++	if (jn.active && wp.htt_eid && p[0] == wp.htt_eid && jn_htt(pl, plen)) {
++		wp.msgs--;
 +		return;
 +	}
 +	if (wp.htt_eid && p[0] == wp.htt_eid && plen >= 4 && pl[0] == 0 && !wp.htt_conf) {
@@ -1153,13 +1987,22 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	wp_send_init();
 +	if (wp_wait(&wp.wmi_ready, 5000, "WMI ready")) {
 +		wp_scan();
++		if (g_wlan_probe >= 7 && wp.scan_done && jn_join()) {
++			/* connected: listen for 20 s */
++			for (unsigned t = 0; t < 20000; t += 10) {
++				wp_poll();
++				sleep_ms(10);
++			}
++			ev("JOIN: end: tx %llu frames (%llu eapol, %llu failed), rx %llu frames (%llu eapol, %llu dropped)", jn.tx_frames, jn.tx_eapol, jn.tx_fail,
++			    jn.rx_frames, jn.rx_eapol, jn.rx_drop);
++		}
 +	}
 +}
 +
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2316,14 +3467,23 @@
+@@ -2316,14 +4303,23 @@
  		g_events[0] = 0;
  	}
  	ev("WLAN probe: registers mapped at %p", regs);
@@ -1176,7 +2019,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wlfw_dma_test(regs);
 +	} else if (g_wlan_probe == 3) {
 +		wlfw_smmu_dump(false);
-+	} else if (g_wlan_probe == 6) {
++	} else if (g_wlan_probe == 6 || g_wlan_probe == 7) {
 +		wlfw_wmi_bringup(regs);
 +	} else if (g_wlan_probe == 5) {
 +		wlfw_ce_rx_test(regs);

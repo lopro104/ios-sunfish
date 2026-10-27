@@ -692,3 +692,18 @@ neighbours stay out of git.)
 NEXT (needs a network to join; every step from here TRANSMITS): VDEV_START on the AP channel, PEER_CREATE, auth/assoc frames via WMI
 mgmt TX, PEER_ASSOC, VDEV_UP, WPA2 4-way handshake in the kernel (or a helper), key install, HTT TX/RX data path, then an iOS network
 interface (en1 / IONetworkInterface; the forks' en0 Apple80211 stand-in is the longer path). Real MAC: /chosen/cdt/cdb2/wlan_mac1.
+
+## 2026-10-27 ~17:45 MILESTONE: THE PIXEL 4a IS CONNECTED TO A WPA2-PSK WI-FI NETWORK (wlanprobe=7, shim/out/shim-local-0138j3-ce.img)
+Join sequence (patches 0138 = sweet_mpss.c jn_* code, 0139 = bsd/dev/sweet_wlan_util.c/.h: 802.11 frames, SHA-1/HMAC/AES-unwrap and the
+supplicant, checked offline against an independent Python AP in the scratchpad): net.conf (/fw/wlan/net.conf on the phone, git-ignored
+data: SSID line + the PMK as 64 hex digits, PBKDF2 done on the PC so the passphrase never reaches the phone) -> best BSS with that SSID
+and an RSN element (CCMP group required) -> VDEV_START on its channel -> power save off, beacon interval, management rate -> PEER_CREATE
+(HTT PEER_MAP) -> authentication and association request through WMI mgmt TX by reference (service 76 is on) -> PEER_ASSOC (legacy
+rates only, no HT yet) + dtim + VDEV_UP -> EAPOL msg 1 (HTT RX in-order indication) -> msg 2 / 3 / 4 via HTT TX_FRM (ext descriptor in
+the frag bank, two CE4 gather descriptors, shadow write index 0x32010) -> VDEV_INSTALL_KEY pairwise (HTT SEC_IND) -> PEER_SET_PARAM
+authorize -> group key. Result: CONNECTED in the same boot second, aid 4, then 95 data frames received and decrypted by the firmware
+(IPv6 router adverts, IPv4, ARP) with 0 dropped. A first try failed with the AP deauthenticating (reason 15) because my GTK KDE length
+was wrong (offline test had the same error: the test now uses the real layout). The firmware once asserted ("wlan_ps_sta_health_monitor_
+timeout", CRASH line in the events) after the failed handshake; not seen in the successful run.
+NEXT: prove TX of user data (DHCP -> IP, ARP the router, ICMP ping), then an iOS-facing interface (IONetworkInterface / en1) with a
+persistent service thread instead of the 20 s blocking test; HT/VHT rates; group rekey; power save; roaming; the real MAC address.

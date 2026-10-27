@@ -1,0 +1,815 @@
+From: Claude <noreply@anthropic.com>
+Subject: [PATCH] sweet: 802.11 frames and the WPA2-PSK 4-way handshake (sweet_wlan_util)
+
+---
+diff --git a/bsd/dev/sweet_wlan_util.c b/bsd/dev/sweet_wlan_util.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_util.c
+@@ -0,0 +1,739 @@
++/*
++ * 802.11 frames and the WPA2-PSK (CCMP) 4-way handshake for the WCN3990 station (sweet_mpss.c).
++ * Self-contained: SHA-1, HMAC-SHA-1, AES-128 (decrypt only, for the RFC 3394 key unwrap) so that it does not depend on
++ * corecrypto being registered. The PMK comes from the caller (PBKDF2 is done on the host PC).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include "sweet_wlan_util.h"
++
++/* ---- SHA-1 / HMAC-SHA-1 ---- */
++struct sha1 {
++	uint32_t h[5];
++	uint64_t len;
++	uint8_t buf[64];
++	unsigned fill;
++};
++
++static uint32_t
++rol32(uint32_t v, unsigned n)
++{
++	return (v << n) | (v >> (32 - n));
++}
++
++static void
++sha1_block(struct sha1 *s, const uint8_t *p)
++{
++	uint32_t w[80], a, b, c, d, e, t;
++
++	for (unsigned i = 0; i < 16; i++) {
++		w[i] = ((uint32_t)p[4 * i] << 24) | ((uint32_t)p[4 * i + 1] << 16) | ((uint32_t)p[4 * i + 2] << 8) | p[4 * i + 3];
++	}
++	for (unsigned i = 16; i < 80; i++) {
++		w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
++	}
++	a = s->h[0]; b = s->h[1]; c = s->h[2]; d = s->h[3]; e = s->h[4];
++	for (unsigned i = 0; i < 80; i++) {
++		uint32_t f, k;
++
++		if (i < 20) {
++			f = (b & c) | (~b & d);
++			k = 0x5a827999;
++		} else if (i < 40) {
++			f = b ^ c ^ d;
++			k = 0x6ed9eba1;
++		} else if (i < 60) {
++			f = (b & c) | (b & d) | (c & d);
++			k = 0x8f1bbcdc;
++		} else {
++			f = b ^ c ^ d;
++			k = 0xca62c1d6;
++		}
++		t = rol32(a, 5) + f + e + k + w[i];
++		e = d; d = c; c = rol32(b, 30); b = a; a = t;
++	}
++	s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e;
++}
++
++static void
++sha1_init(struct sha1 *s)
++{
++	s->h[0] = 0x67452301; s->h[1] = 0xefcdab89; s->h[2] = 0x98badcfe; s->h[3] = 0x10325476; s->h[4] = 0xc3d2e1f0;
++	s->len = 0;
++	s->fill = 0;
++}
++
++static void
++sha1_update(struct sha1 *s, const uint8_t *p, size_t n)
++{
++	s->len += n;
++	while (n) {
++		unsigned take = MIN((size_t)(64 - s->fill), n);
++
++		memcpy(s->buf + s->fill, p, take);
++		s->fill += take;
++		p += take;
++		n -= take;
++		if (s->fill == 64) {
++			sha1_block(s, s->buf);
++			s->fill = 0;
++		}
++	}
++}
++
++static void
++sha1_final(struct sha1 *s, uint8_t out[20])
++{
++	uint64_t bits = s->len * 8;
++	uint8_t pad = 0x80;
++
++	sha1_update(s, &pad, 1);
++	pad = 0;
++	while (s->fill != 56) {
++		sha1_update(s, &pad, 1);
++	}
++	for (int i = 7; i >= 0; i--) {
++		uint8_t b = (uint8_t)(bits >> (8 * i));
++
++		sha1_update(s, &b, 1);
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		out[4 * i] = (uint8_t)(s->h[i] >> 24);
++		out[4 * i + 1] = (uint8_t)(s->h[i] >> 16);
++		out[4 * i + 2] = (uint8_t)(s->h[i] >> 8);
++		out[4 * i + 3] = (uint8_t)s->h[i];
++	}
++}
++
++void
++swu_hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, uint8_t out[20])
++{
++	uint8_t k[64], pad[64], inner[20];
++	struct sha1 s;
++
++	memset(k, 0, sizeof(k));
++	if (klen > 64) {
++		sha1_init(&s);
++		sha1_update(&s, key, klen);
++		sha1_final(&s, k);
++	} else {
++		memcpy(k, key, klen);
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x36;
++	}
++	sha1_init(&s);
++	sha1_update(&s, pad, 64);
++	sha1_update(&s, a, alen);
++	if (blen) {
++		sha1_update(&s, b, blen);
++	}
++	sha1_final(&s, inner);
++	for (unsigned i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x5c;
++	}
++	sha1_init(&s);
++	sha1_update(&s, pad, 64);
++	sha1_update(&s, inner, 20);
++	sha1_final(&s, out);
++}
++
++/* IEEE 802.11 PRF: HMAC-SHA1(K, label || 0 || data || counter), as many bytes as asked */
++static void
++swu_prf(const uint8_t *key, size_t klen, const char *label, const uint8_t *data, size_t dlen, uint8_t *out, size_t olen)
++{
++	uint8_t msg[64 + 80 + 2], h[20];
++	size_t ll = strlen(label), n = 0;
++
++	memcpy(msg, label, ll);
++	msg[ll] = 0;
++	memcpy(msg + ll + 1, data, dlen);
++	for (uint8_t ctr = 0; n < olen; ctr++) {
++		msg[ll + 1 + dlen] = ctr;
++		swu_hmac_sha1(key, klen, msg, ll + 2 + dlen, NULL, 0, h);
++		memcpy(out + n, h, MIN((size_t)20, olen - n));
++		n += 20;
++	}
++}
++
++/* ---- AES-128 decryption, for the key unwrap ---- */
++static uint8_t aes_sbox[256], aes_inv[256];
++static bool aes_ready;
++
++static uint8_t
++xtime(uint8_t x)
++{
++	return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0));
++}
++
++static uint8_t
++gmul(uint8_t a, uint8_t b)
++{
++	uint8_t r = 0;
++
++	while (b) {
++		if (b & 1) {
++			r ^= a;
++		}
++		a = xtime(a);
++		b >>= 1;
++	}
++	return r;
++}
++
++static void
++aes_tables(void)
++{
++	uint8_t p = 1, q = 1;
++
++	if (aes_ready) {
++		return;
++	}
++	do {                                    /* the standard generator walk over GF(2^8) */
++		uint8_t x;
++
++		p = (uint8_t)(p ^ xtime(p));
++		q ^= (uint8_t)(q << 1);
++		q ^= (uint8_t)(q << 2);
++		q ^= (uint8_t)(q << 4);
++		if (q & 0x80) {
++			q ^= 0x09;
++		}
++		x = (uint8_t)(q ^ ((q << 1) | (q >> 7)) ^ ((q << 2) | (q >> 6)) ^ ((q << 3) | (q >> 5)) ^ ((q << 4) | (q >> 4)));
++		aes_sbox[p] = (uint8_t)(x ^ 0x63);
++	} while (p != 1);
++	aes_sbox[0] = 0x63;
++	for (unsigned i = 0; i < 256; i++) {
++		aes_inv[aes_sbox[i]] = (uint8_t)i;
++	}
++	aes_ready = true;
++}
++
++static void
++aes128_expand(const uint8_t key[16], uint8_t rk[176])
++{
++	uint8_t rcon = 1;
++
++	memcpy(rk, key, 16);
++	for (unsigned i = 16; i < 176; i += 4) {
++		uint8_t t[4];
++
++		memcpy(t, rk + i - 4, 4);
++		if ((i % 16) == 0) {
++			uint8_t u = t[0];
++
++			t[0] = (uint8_t)(aes_sbox[t[1]] ^ rcon);
++			t[1] = aes_sbox[t[2]];
++			t[2] = aes_sbox[t[3]];
++			t[3] = aes_sbox[u];
++			rcon = xtime(rcon);
++		}
++		for (unsigned j = 0; j < 4; j++) {
++			rk[i + j] = (uint8_t)(rk[i - 16 + j] ^ t[j]);
++		}
++	}
++}
++
++static void
++aes128_decrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16])
++{
++	uint8_t s[16], t[16];
++
++	for (unsigned i = 0; i < 16; i++) {
++		s[i] = in[i] ^ rk[160 + i];
++	}
++	for (int round = 9; round >= 0; round--) {
++		/* inverse shift rows */
++		for (unsigned c = 0; c < 4; c++) {
++			for (unsigned r = 0; r < 4; r++) {
++				t[4 * ((c + r) & 3) + r] = s[4 * c + r];
++			}
++		}
++		for (unsigned i = 0; i < 16; i++) {
++			s[i] = aes_inv[t[i]] ^ rk[16 * round + i];
++		}
++		if (round > 0) {
++			for (unsigned c = 0; c < 4; c++) {
++				uint8_t a0 = s[4 * c], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
++
++				s[4 * c] = (uint8_t)(gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9));
++				s[4 * c + 1] = (uint8_t)(gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13));
++				s[4 * c + 2] = (uint8_t)(gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11));
++				s[4 * c + 3] = (uint8_t)(gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14));
++			}
++		}
++	}
++	memcpy(out, s, 16);
++}
++
++/* RFC 3394: in is (n + 1) * 8 bytes, out n * 8 bytes; false if the integrity value is wrong */
++static bool
++aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t len, uint8_t *out)
++{
++	uint8_t rk[176], a[8], b[16];
++	size_t n;
++
++	if (len < 24 || (len % 8)) {
++		return false;
++	}
++	aes_tables();
++	aes128_expand(kek, rk);
++	n = len / 8 - 1;
++	memcpy(a, in, 8);
++	memcpy(out, in + 8, n * 8);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++
++			memcpy(b, a, 8);
++			for (unsigned k = 0; k < 8; k++) {
++				b[k] ^= (uint8_t)(t >> (8 * (7 - k)));
++			}
++			memcpy(b + 8, out + 8 * (i - 1), 8);
++			aes128_decrypt_block(rk, b, b);
++			memcpy(a, b, 8);
++			memcpy(out + 8 * (i - 1), b + 8, 8);
++		}
++	}
++	for (unsigned k = 0; k < 8; k++) {
++		if (a[k] != 0xa6) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* ---- information elements and frames ---- */
++const uint8_t *
++swu_ie_find(const uint8_t *ies, size_t len, uint8_t id)
++{
++	for (size_t o = 0; o + 2 <= len;) {
++		if (o + 2 + ies[o + 1] > len) {
++			return NULL;
++		}
++		if (ies[o] == id) {
++			return ies + o;
++		}
++		o += 2 + (size_t)ies[o + 1];
++	}
++	return NULL;
++}
++
++static uint8_t *
++put_ie(uint8_t *p, uint8_t id, const uint8_t *v, uint8_t l)
++{
++	*p++ = id;
++	*p++ = l;
++	memcpy(p, v, l);
++	return p + l;
++}
++
++static void
++mgmt_hdr(uint8_t *f, uint8_t subtype, const uint8_t bssid[6], const uint8_t sa[6])
++{
++	memset(f, 0, 24);
++	f[0] = (uint8_t)(subtype << 4);
++	memcpy(f + 4, bssid, 6);
++	memcpy(f + 10, sa, 6);
++	memcpy(f + 16, bssid, 6);
++}
++
++size_t
++swu_auth_req(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6])
++{
++	if (size < 30) {
++		return 0;
++	}
++	mgmt_hdr(f, 0xb, bssid, sa);
++	f[24] = 0; f[25] = 0;                   /* open system */
++	f[26] = 1; f[27] = 0;                   /* transaction 1 */
++	f[28] = 0; f[29] = 0;                   /* status */
++	return 30;
++}
++
++size_t
++swu_deauth(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason)
++{
++	if (size < 26) {
++		return 0;
++	}
++	mgmt_hdr(f, 0xc, bssid, sa);
++	f[24] = (uint8_t)reason;
++	f[25] = (uint8_t)(reason >> 8);
++	return 26;
++}
++
++/* the RSN element we send: CCMP group (or the AP's group cipher byte), CCMP pairwise, PSK */
++size_t
++swu_build_rsn(uint8_t *out, uint8_t group_type)
++{
++	static const uint8_t oui[3] = { 0x00, 0x0f, 0xac };
++	uint8_t *p = out;
++
++	*p++ = 48;
++	*p++ = 20;
++	*p++ = 1; *p++ = 0;                     /* version */
++	memcpy(p, oui, 3); p += 3; *p++ = group_type;
++	*p++ = 1; *p++ = 0;                     /* one pairwise */
++	memcpy(p, oui, 3); p += 3; *p++ = 4;    /* CCMP */
++	*p++ = 1; *p++ = 0;                     /* one AKM */
++	memcpy(p, oui, 3); p += 3; *p++ = 2;    /* PSK */
++	*p++ = 0; *p++ = 0;                     /* capabilities */
++	return (size_t)(p - out);
++}
++
++/* association request: capabilities, listen interval, SSID, the AP's rates (up to 8 + extended), the RSN element if any */
++size_t
++swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a)
++{
++	uint8_t *p = f;
++	const uint8_t *rates = swu_ie_find(a->ap_ies, a->ap_ies_len, 1);
++	const uint8_t *ext = swu_ie_find(a->ap_ies, a->ap_ies_len, 50);
++
++	if (size < 24 + 4 + 2 + 32 + 2 + 8 + 2 + 255 + 2 + 22 || !rates) {
++		return 0;
++	}
++	mgmt_hdr(f, 0x0, a->bssid, a->sa);
++	p += 24;
++	*p++ = (uint8_t)a->cap; *p++ = (uint8_t)(a->cap >> 8);
++	*p++ = 10; *p++ = 0;                    /* listen interval */
++	p = put_ie(p, 0, a->ssid, a->ssid_len);
++	p = put_ie(p, 1, rates + 2, rates[1]);
++	if (ext) {
++		p = put_ie(p, 50, ext + 2, ext[1]);
++	}
++	if (a->rsn_ie) {
++		memcpy(p, a->rsn_ie, a->rsn_ie_len);
++		p += a->rsn_ie_len;
++	}
++	return (size_t)(p - f);
++}
++
++/* parse an authentication response (fc 0xb0): 0 and *status on a match */
++int
++swu_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *status)
++{
++	if (len < 30 || f[0] != 0xb0 || memcmp(f + 10, bssid, 6) != 0 || memcmp(f + 4, me, 6) != 0 || f[26] != 2) {
++		return -1;
++	}
++	*status = (uint16_t)(f[28] | (f[29] << 8));
++	return 0;
++}
++
++int
++swu_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], struct swu_assoc_resp *r)
++{
++	if (len < 30 || f[0] != 0x10 || memcmp(f + 10, bssid, 6) != 0 || memcmp(f + 4, me, 6) != 0) {
++		return -1;
++	}
++	memset(r, 0, sizeof(*r));
++	r->cap = (uint16_t)(f[24] | (f[25] << 8));
++	r->status = (uint16_t)(f[26] | (f[27] << 8));
++	r->aid = (uint16_t)((f[28] | (f[29] << 8)) & 0x3fff);
++	for (size_t o = 30; o + 2 <= len;) {
++		uint8_t id = f[o], l = f[o + 1];
++
++		if (o + 2 + l > len) {
++			break;
++		}
++		if ((id == 1 || id == 50) && r->nrates + l <= sizeof(r->rates)) {
++			memcpy(r->rates + r->nrates, f + o + 2, l);
++			r->nrates += l;
++		} else if (id == 221 && l >= 7 && f[o + 2] == 0x00 && f[o + 3] == 0x50 && f[o + 4] == 0xf2 && f[o + 5] == 2) {
++			r->wmm = true;
++		}
++		o += 2u + l;
++	}
++	return 0;
++}
++
++/* deauthentication / disassociation from the AP; reason in *reason */
++int
++swu_kicked(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *reason)
++{
++	if (len < 26 || (f[0] != 0xc0 && f[0] != 0xa0) || memcmp(f + 10, bssid, 6) != 0 || (memcmp(f + 4, me, 6) != 0 && !(f[4] & 1))) {
++		return -1;
++	}
++	*reason = (uint16_t)(f[24] | (f[25] << 8));
++	return 0;
++}
++
++/* Ethernet II -> native wifi, to the AP: ToDS data frame, addr1 the AP, addr2 us, addr3 the destination; LLC/SNAP */
++size_t
++swu_eth_to_nwifi(const uint8_t *eth, size_t len, const uint8_t bssid[6], uint8_t *out, size_t size)
++{
++	size_t n = len - 14 + 8 + 24;
++
++	if (len < 14 || n > size) {
++		return 0;
++	}
++	memset(out, 0, 24);
++	out[0] = 0x08;                          /* data */
++	out[1] = 0x01;                          /* ToDS */
++	memcpy(out + 4, bssid, 6);
++	memcpy(out + 10, eth + 6, 6);
++	memcpy(out + 16, eth, 6);
++	out[24] = 0xaa; out[25] = 0xaa; out[26] = 0x03; out[27] = out[28] = out[29] = 0;
++	out[30] = eth[12];
++	out[31] = eth[13];
++	memcpy(out + 32, eth + 14, len - 14);
++	return n;
++}
++
++/* native wifi from the AP (FromDS) -> Ethernet II; 0 if it is not a data frame or has no LLC/SNAP */
++size_t
++swu_nwifi_to_eth(const uint8_t *f, size_t len, uint8_t *eth, size_t size)
++{
++	size_t hl = 24;
++	uint8_t fc0 = f[0];
++
++	if (len < 32 || (fc0 & 0x0c) != 0x08) {
++		return 0;
++	}
++	if (fc0 & 0x80) {                       /* QoS */
++		hl += 2;
++		if (f[1] & 0x80) {
++			hl += 4;
++		}
++	}
++	if ((f[1] & 3) == 3) {
++		hl += 6;
++	}
++	if (len < hl + 8 || f[hl] != 0xaa || f[hl + 1] != 0xaa || f[hl + 2] != 0x03 || len - hl - 8 + 14 > size) {
++		return 0;
++	}
++	memcpy(eth, f + 4, 6);                  /* DA */
++	memcpy(eth + 6, f + 16, 6);             /* SA */
++	eth[12] = f[hl + 6];
++	eth[13] = f[hl + 7];
++	memcpy(eth + 14, f + hl + 8, len - hl - 8);
++	return len - hl - 8 + 14;
++}
++
++/* ---- the 4-way handshake (supplicant side) ---- */
++#define KI_VER_MASK     0x0007
++#define KI_PAIRWISE     0x0008
++#define KI_INSTALL      0x0040
++#define KI_ACK          0x0080
++#define KI_MIC          0x0100
++#define KI_SECURE       0x0200
++#define KI_ERROR        0x0400
++#define KI_ENCRYPTED    0x1000
++
++static void
++be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static uint16_t
++get_be16(const uint8_t *p)
++{
++	return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++/* EAPOL-Key frame offsets (from the 802.1X header) */
++enum { EK_TYPE = 4, EK_INFO = 5, EK_KLEN = 7, EK_REPLAY = 9, EK_NONCE = 17, EK_IV = 49, EK_RSC = 65, EK_MIC = 81, EK_DLEN = 97, EK_DATA = 99 };
++
++static size_t
++eapol_key(uint8_t *f, uint16_t info, uint16_t klen, const uint8_t replay[8], const uint8_t nonce[32], const uint8_t *data, size_t dlen,
++    const uint8_t kck[16])
++{
++	uint8_t mic[20];
++
++	memset(f, 0, EK_DATA);
++	f[0] = 2;                               /* 802.1X-2004 */
++	f[1] = 3;                               /* EAPOL-Key */
++	be16(f + 2, (uint16_t)(EK_DATA - 4 + dlen));
++	f[EK_TYPE] = 2;                         /* RSN key descriptor */
++	be16(f + EK_INFO, info);
++	be16(f + EK_KLEN, klen);
++	memcpy(f + EK_REPLAY, replay, 8);
++	if (nonce) {
++		memcpy(f + EK_NONCE, nonce, 32);
++	}
++	be16(f + EK_DLEN, (uint16_t)dlen);
++	if (dlen) {
++		memcpy(f + EK_DATA, data, dlen);
++	}
++	swu_hmac_sha1(kck, 16, f, EK_DATA + dlen, NULL, 0, mic);
++	memcpy(f + EK_MIC, mic, 16);
++	return EK_DATA + dlen;
++}
++
++void
++swu_wpa_start(struct swu_wpa *w, const struct swu_wpa_ops *ops, void *arg, const uint8_t pmk[32], const uint8_t aa[6],
++    const uint8_t spa[6], const uint8_t *sta_rsn, size_t sta_rsn_len)
++{
++	memset(w, 0, sizeof(*w));
++	w->ops = ops;
++	w->arg = arg;
++	memcpy(w->pmk, pmk, 32);
++	memcpy(w->aa, aa, 6);
++	memcpy(w->spa, spa, 6);
++	memcpy(w->rsn, sta_rsn, MIN(sta_rsn_len, sizeof(w->rsn)));
++	w->rsn_len = MIN(sta_rsn_len, sizeof(w->rsn));
++	w->state = 0;
++}
++
++void
++swu_wpa_stop(struct swu_wpa *w)
++{
++	memset(w, 0, sizeof(*w));
++}
++
++/* one EAPOL frame from the AP; 0 handled, else an errno-style reason */
++int
++swu_wpa_rx(struct swu_wpa *w, const uint8_t *f, size_t len)
++{
++	uint16_t info, dlen;
++	uint8_t mic[20], reply[EK_DATA + 128], got[16];
++	uint8_t data[256];
++
++	if (!w->ops || len < EK_DATA || f[1] != 3 || f[EK_TYPE] != 2) {
++		return 22;
++	}
++	info = get_be16(f + EK_INFO);
++	dlen = get_be16(f + EK_DLEN);
++	if ((info & KI_VER_MASK) != 2 || (size_t)EK_DATA + dlen > len || dlen > sizeof(data)) {
++		return 22;
++	}
++	w->rx++;
++	if ((info & KI_PAIRWISE) && (info & KI_ACK) && !(info & KI_MIC)) {
++		/* message 1: ANonce; derive the PTK, answer with message 2 */
++		uint8_t ptkdata[76], snonce[32];
++		const uint8_t *lo, *hi;
++
++		memcpy(w->anonce, f + EK_NONCE, 32);
++		memcpy(w->replay, f + EK_REPLAY, 8);
++		w->ops->random(snonce, 32);
++		memcpy(w->snonce, snonce, 32);
++		lo = memcmp(w->aa, w->spa, 6) < 0 ? w->aa : w->spa;
++		hi = lo == w->aa ? w->spa : w->aa;
++		memcpy(ptkdata, lo, 6);
++		memcpy(ptkdata + 6, hi, 6);
++		lo = memcmp(w->anonce, w->snonce, 32) < 0 ? w->anonce : w->snonce;
++		hi = lo == w->anonce ? w->snonce : w->anonce;
++		memcpy(ptkdata + 12, lo, 32);
++		memcpy(ptkdata + 44, hi, 32);
++		swu_prf(w->pmk, 32, "Pairwise key expansion", ptkdata, 76, w->ptk, 48);
++		w->have_ptk = true;
++		size_t n = eapol_key(reply, KI_PAIRWISE | KI_MIC | 2, get_be16(f + EK_KLEN), w->replay, w->snonce, w->rsn, w->rsn_len, w->ptk);
++		w->state = 1;
++		w->ops->tx(w->arg, reply, n);
++		return 0;
++	}
++	if (!w->have_ptk) {
++		return 22;
++	}
++	/* every later frame carries a MIC under the KCK */
++	memcpy(got, f + EK_MIC, 16);
++	{
++		uint8_t tmp[EK_DATA + 256];
++
++		memcpy(tmp, f, EK_DATA + dlen);
++		memset(tmp + EK_MIC, 0, 16);
++		swu_hmac_sha1(w->ptk, 16, tmp, EK_DATA + dlen, NULL, 0, mic);
++	}
++	if (memcmp(mic, got, 16) != 0) {
++		return 5;                       /* EIO: wrong MIC (wrong PMK?) */
++	}
++	if ((info & KI_PAIRWISE) && (info & KI_ACK) && (info & KI_INSTALL)) {
++		/* message 3: same ANonce, RSN element(s) + GTK, encrypted with the KEK */
++		const uint8_t *kd = f + EK_DATA;
++		size_t kl = dlen;
++		bool gtk = false;
++
++		if (memcmp(f + EK_NONCE, w->anonce, 32) != 0) {
++			return 71;
++		}
++		if (memcmp(f + EK_REPLAY, w->replay, 8) <= 0) {
++			return 71;
++		}
++		if (w->state >= 2) {            /* a retransmitted message 3: only answer again */
++			size_t n;
++
++			memcpy(w->replay, f + EK_REPLAY, 8);
++			n = eapol_key(reply, KI_PAIRWISE | KI_MIC | KI_SECURE | 2, 0, w->replay, NULL, NULL, 0, w->ptk);
++			w->ops->tx(w->arg, reply, n);
++			return 0;
++		}
++		if (info & KI_ENCRYPTED) {
++			if (!aes_unwrap(w->ptk + 16, f + EK_DATA, dlen, data)) {
++				return 74;
++			}
++			kd = data;
++			kl = dlen - 8;
++		}
++		for (size_t o = 0; o + 2 <= kl;) {
++			uint8_t id = kd[o], l = kd[o + 1];
++
++			if (id == 0) {
++				break;
++			}
++			if (o + 2 + l > kl) {
++				break;
++			}
++			if (id == 0xdd && l >= 6 + 16 && kd[o + 2] == 0x00 && kd[o + 3] == 0x0f && kd[o + 4] == 0xac && kd[o + 5] == 1) {
++				w->gtk_idx = kd[o + 6] & 3;
++				w->gtk_len = l - 6;                     /* OUI + type (4), key id and reserved (2), then the GTK */
++				if (w->gtk_len > sizeof(w->gtk)) {
++					return 22;
++				}
++				memcpy(w->gtk, kd + o + 8, w->gtk_len);
++				gtk = true;
++			}
++			o += 2u + l;
++		}
++		memcpy(w->replay, f + EK_REPLAY, 8);
++		{
++			size_t n = eapol_key(reply, KI_PAIRWISE | KI_MIC | KI_SECURE | 2, 0, w->replay, NULL, NULL, 0, w->ptk);
++
++			w->state = 2;
++			w->ops->tx(w->arg, reply, n);
++		}
++		if (w->ops->key(w->arg, 1, 0, w->ptk + 32, 16) != 0) {
++			return 95;
++		}
++		if (gtk && w->ops->key(w->arg, 0, w->gtk_idx, w->gtk, w->gtk_len) != 0) {
++			return 95;
++		}
++		w->ops->done(w->arg, 0);
++		return 0;
++	}
++	if (!(info & KI_PAIRWISE) && (info & KI_ACK) && (info & KI_ENCRYPTED)) {
++		/* group key handshake: GTK in the key data, answer with the group message 2 */
++		uint8_t idx = (uint8_t)((info >> 4) & 3);
++
++		if (w->state < 2 || !aes_unwrap(w->ptk + 16, f + EK_DATA, dlen, data)) {
++			return 74;
++		}
++		for (size_t o = 0; o + 2 <= (size_t)dlen - 8;) {
++			uint8_t id = data[o], l = data[o + 1];
++
++			if (id == 0 || o + 2 + l > (size_t)dlen - 8) {
++				break;
++			}
++			if (id == 0xdd && l >= 6 + 16 && data[o + 2] == 0x00 && data[o + 3] == 0x0f && data[o + 4] == 0xac && data[o + 5] == 1) {
++				w->gtk_idx = data[o + 6] & 3;
++				w->gtk_len = l - 6;
++				if (w->gtk_len <= sizeof(w->gtk)) {
++					memcpy(w->gtk, data + o + 8, w->gtk_len);
++				}
++				w->ops->key(w->arg, 0, w->gtk_idx, w->gtk, w->gtk_len);
++				w->rekeys++;
++			}
++			o += 2u + l;
++		}
++		(void)idx;
++		memcpy(w->replay, f + EK_REPLAY, 8);
++		{
++			size_t n = eapol_key(reply, KI_MIC | KI_SECURE | 2 | (uint16_t)(idx << 4), 0, w->replay, NULL, NULL, 0, w->ptk);
++
++			w->ops->tx(w->arg, reply, n);
++		}
++		return 0;
++	}
++	return 22;
++}
+diff --git a/bsd/dev/sweet_wlan_util.h b/bsd/dev/sweet_wlan_util.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_util.h
+@@ -0,0 +1,56 @@
++#ifndef SWEET_WLAN_UTIL_H
++#define SWEET_WLAN_UTIL_H
++#include <stdint.h>
++#include <stddef.h>
++#include <stdbool.h>
++
++struct swu_assoc {
++	uint8_t bssid[6], sa[6];
++	uint16_t cap;
++	uint8_t ssid[32];
++	uint8_t ssid_len;
++	const uint8_t *ap_ies;
++	size_t ap_ies_len;
++	const uint8_t *rsn_ie;
++	size_t rsn_ie_len;
++};
++
++struct swu_assoc_resp {
++	uint16_t cap, status, aid;
++	uint8_t rates[32], nrates;
++	bool wmm;
++};
++
++struct swu_wpa_ops {
++	void (*tx)(void *arg, const uint8_t *eapol, size_t len);
++	int (*key)(void *arg, int pairwise, unsigned idx, const uint8_t *key, size_t len);
++	void (*done)(void *arg, int status);
++	void (*random)(uint8_t *buf, size_t len);
++};
++
++struct swu_wpa {
++	const struct swu_wpa_ops *ops;
++	void *arg;
++	uint8_t pmk[32], aa[6], spa[6], anonce[32], snonce[32], ptk[48], replay[8], gtk[32], rsn[64];
++	size_t rsn_len;
++	unsigned gtk_len, gtk_idx, rx, rekeys;
++	int state;                      /* 0 idle, 1 message 2 sent, 2 message 4 sent */
++	bool have_ptk;
++};
++
++void swu_hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *a, size_t alen, const uint8_t *b, size_t blen, uint8_t out[20]);
++const uint8_t *swu_ie_find(const uint8_t *ies, size_t len, uint8_t id);
++size_t swu_auth_req(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6]);
++size_t swu_deauth(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason);
++size_t swu_build_rsn(uint8_t *out, uint8_t group_type);
++size_t swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a);
++int swu_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *status);
++int swu_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], struct swu_assoc_resp *r);
++int swu_kicked(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *reason);
++size_t swu_eth_to_nwifi(const uint8_t *eth, size_t len, const uint8_t bssid[6], uint8_t *out, size_t size);
++size_t swu_nwifi_to_eth(const uint8_t *f, size_t len, uint8_t *eth, size_t size);
++void swu_wpa_start(struct swu_wpa *w, const struct swu_wpa_ops *ops, void *arg, const uint8_t pmk[32], const uint8_t aa[6],
++    const uint8_t spa[6], const uint8_t *sta_rsn, size_t sta_rsn_len);
++void swu_wpa_stop(struct swu_wpa *w);
++int swu_wpa_rx(struct swu_wpa *w, const uint8_t *f, size_t len);
++#endif
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,1 +114,2 @@
+ bsd/dev/sweet_mpss.c			standard
++bsd/dev/sweet_wlan_util.c			standard
