@@ -1,0 +1,61 @@
+From: sunfish-gpu
+Subject: [PATCH] SweetFramebuffer: sysctl kern.sweetfb_shown (+ _retry, _older, _late): frames the display showed
+
+To measure the frame rate that reaches the panel, not the GL layer's draw time.
+---
+--- a/bsd/dev/sweet_sample.c	2026-10-27 10:13:41.348963472 +0200
++++ b/bsd/dev/sweet_sample.c	2026-10-27 10:13:41.359477425 +0200
+@@ -98,6 +98,16 @@
+ int sweet_fb_gpu_waits = -1;    /* -1: the boot-arg's (SweetFramebuffer.cpp sets it at start) */
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_gpuwait, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gpu_waits, 0,
+     "the display waits for the GPU before it shows a swap");
++/* What the display showed (SweetFramebuffer.cpp counts them), for measuring the frame rate. */
++unsigned int sweet_fb_stat[4];
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[0], 0,
++    "frames the display showed");
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown_retry, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[1], 0,
++    "of those, shown between vsyncs once the GPU was done (sweetfb_gpuwait)");
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown_older, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[2], 0,
++    "of those, the swap before the newest (sweetfb_gpuwait)");
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown_late, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[3], 0,
++    "of those, shown before the GPU was done, after 3 vsyncs (sweetfb_gpuwait)");
+ 
+ static int
+ sweet_prof_find(proc_t p, __unused void *arg)
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 10:13:41.347974184 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 10:13:41.359826092 +0200
+@@ -58,6 +58,7 @@
+ extern "C" uint32_t sweet_gpu_last(void);
+ static uint32_t sweet_fb_fence_late;   /* swaps shown before the GPU was done (logged) */
+ extern "C" int sweet_fb_gpu_waits;      /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_gpuwait */
++extern "C" unsigned int sweet_fb_stat[4];       /* kern.sweetfb_shown, _retry, _older, _late */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -432,6 +433,7 @@
+ 				    fb->fPendingFence);
+ 			}
+ 			src = fb->fPending;
++			sweet_fb_stat[3]++;
+ 		}
+ 	}
+ 	uint8_t *rec = NULL;
+@@ -595,6 +597,10 @@
+ {
+ 	fHaveReady = false;
+ 	fFenceTicks = 0;
++	sweet_fb_stat[0]++;
++	if (src == fReady) {
++		sweet_fb_stat[2]++;
++	}
+ 	if (src == fPending) {
+ 		fDirty = false;
+ 		fPendingFence = 0;
+@@ -615,6 +621,7 @@
+ 			if (rec != NULL) {
+ 				memcpy(rec, src, SWEET_FB_SWAP_REC_SIZE);
+ 				fb->taken(src);
++				sweet_fb_stat[1]++;
+ 			}
+ 		} else if (++fb->fRetries < 14) {
+ 			sender->setTimeoutUS(1000);

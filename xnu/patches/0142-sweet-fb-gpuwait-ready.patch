@@ -1,0 +1,184 @@
+From: sunfish-gpu
+Subject: [PATCH] SweetFramebuffer: sweetfb_gpuwait keeps the swap before the newest, and looks again 1 ms on
+
+With sweetfb_gpuwait=1 the user saw it worse: frames 34 ms apart. Each swap
+replaced the waiting one and its fence, so a GPU slower than a vsync per frame
+left nothing finished to show, and a frame not done at the tick waited a whole
+vsync. Keep the replaced swap (fReady), show the newest finished one, look again
+every millisecond until the next tick, show the newest as it is after 3 ticks.
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 07:21:43.321321135 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 07:22:08.411941211 +0200
+@@ -123,7 +123,13 @@
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
+ 
++	IOTimerEventSource *fRetry;     /* sweetfb_gpuwait: looks again, 1 ms on, for a frame the GPU had not finished */
++	uint32_t            fRetries;
++
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void retryFired(OSObject *owner, IOTimerEventSource *sender);
++	uint8_t *doneFrame(void);
++	void taken(const uint8_t *src);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -141,7 +147,10 @@
+ 	bool          fDirty;
+ 	bool          fGPUWaits;      /* boot-arg sweetfb_gpuwait=1: a swap is shown once the GPU is done with it */
+ 	uint32_t      fPendingFence;  /* the GPU's last submission when the pending swap came; 0: none */
+-	uint32_t      fFenceTicks;    /* vsync ticks the pending swap has waited for it */
++	uint32_t      fFenceTicks;    /* vsync ticks the oldest swap not yet shown has waited */
++	uint8_t       fReady[SWEET_FB_SWAP_REC_SIZE];       /* the swap before fPending, not yet shown */
++	bool          fHaveReady;
++	uint32_t      fReadyFence;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -309,6 +318,10 @@
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++	fRetry = IOTimerEventSource::timerEventSource(this, &AppleCLCD::retryFired);
++	if (fRetry != NULL && fWorkLoop->addEventSource(fRetry) != kIOReturnSuccess) {
++		OSSafeReleaseNULL(fRetry);
++	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+@@ -394,29 +407,39 @@
+ 		/* kern.sweetfb_gpuwait changed */
+ 		fb->fGPUWaits = sweet_fb_gpu_waits != 0;
+ 		fb->fPendingFence = 0;
++		fb->fHaveReady = false;
+ 		IOLockUnlock(fb->fLock);
+ 		fb->setProperty("RedwoodWaitsForGPU", fb->fGPUWaits);
+ 		IOLog("SWEET FB: the display %s for the GPU\n", fb->fGPUWaits ? "waits" : "does not wait");
+ 		IOLockLock(fb->fLock);
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	if (flush && fb->fPendingFence != 0 && !sweet_gpu_done(fb->fPendingFence)) {
+-		/* the GPU is still drawing it: the next tick (and after 10 ticks, as it is) */
+-		if (++fb->fFenceTicks < 10) {
+-			flush = false;
+-		} else if (sweet_fb_fence_late++ < 8) {
+-			IOLog("SWEET FB: the GPU was not done with a swap after 10 vsyncs (fence %u): shown as it is\n",
+-			    fb->fPendingFence);
++	uint8_t *src = flush ? fb->doneFrame() : NULL;
++	if (flush && src == NULL) {
++		/*
++		 * The GPU has not finished any swap waiting: look again every millisecond until the next
++		 * tick (it showed nothing for a whole vsync, and the rate halved), and after 3 ticks show
++		 * the newest as it is.
++		 */
++		if (++fb->fFenceTicks < 3) {
++			if (fb->fRetry != NULL) {
++				fb->fRetries = 0;
++				fb->fRetry->setTimeoutUS(1000);
++			}
++		} else {
++			if (sweet_fb_fence_late++ < 8) {
++				IOLog("SWEET FB: the GPU was not done with a swap after 3 vsyncs (fence %u): shown as it is\n",
++				    fb->fPendingFence);
++			}
++			src = fb->fPending;
+ 		}
+ 	}
+ 	uint8_t *rec = NULL;
+-	if (flush) {
++	if (src != NULL) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-			fb->fPendingFence = 0;
+-			fb->fFenceTicks = 0;
++			memcpy(rec, src, SWEET_FB_SWAP_REC_SIZE);
++			fb->taken(src);
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -553,6 +576,58 @@
+ 	return v;
+ }
+ 
++/* Under fLock: the newest swap waiting that the GPU is done with (any, without sweetfb_gpuwait); NULL: none. */
++uint8_t *
++AppleCLCD::doneFrame(void)
++{
++	if (fPendingFence == 0 || sweet_gpu_done(fPendingFence)) {
++		return fPending;
++	}
++	if (fHaveReady && sweet_gpu_done(fReadyFence)) {
++		return fReady;
++	}
++	return NULL;
++}
++
++/* Under fLock: src (fPending or fReady) was copied out to be shown. */
++void
++AppleCLCD::taken(const uint8_t *src)
++{
++	fHaveReady = false;
++	fFenceTicks = 0;
++	if (src == fPending) {
++		fDirty = false;
++		fPendingFence = 0;
++	}
++}
++
++void
++AppleCLCD::retryFired(OSObject *owner, IOTimerEventSource *sender)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	uint8_t *rec = NULL;
++
++	IOLockLock(fb->fLock);
++	if (fb->fDirty && !fb->fPowerOff) {
++		uint8_t *src = fb->doneFrame();
++		if (src != NULL) {
++			rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++			if (rec != NULL) {
++				memcpy(rec, src, SWEET_FB_SWAP_REC_SIZE);
++				fb->taken(src);
++			}
++		} else if (++fb->fRetries < 14) {
++			sender->setTimeoutUS(1000);
++		}
++	}
++	IOLockUnlock(fb->fLock);
++	if (rec != NULL) {
++		fb->present(rec);
++		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
++		fb->kick();
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -567,10 +642,23 @@
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+ 	IOLockLock(fLock);
++	if (fDirty && fPendingFence != 0) {
++		/*
++		 * The swap this one replaces is not shown yet: keep it, it is done before this one (the
++		 * GPU never finished the newest swap while every frame took it longer than a vsync,
++		 * and nothing was shown). One already finished stays, unless this replaced one is too.
++		 */
++		if (!fHaveReady || !sweet_gpu_done(fReadyFence) || sweet_gpu_done(fPendingFence)) {
++			memcpy(fReady, fPending, SWEET_FB_SWAP_REC_SIZE);
++			fReadyFence = fPendingFence;
++			fHaveReady = true;
++		}
++	} else if (!fDirty) {
++		fFenceTicks = 0;
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	fPendingFence = fGPUWaits && sweet_gpu_ready() ? sweet_gpu_last() : 0;
+-	fFenceTicks = 0;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
