@@ -609,3 +609,13 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## 2026-10-27 WCN3990 register probe (shim-local-0136r-probe.img, wlanprobe=1) — RESULT
+Observed: booted fine, no hang. The WLAN MMIO window maps (0xfffffe5bed9dc000) and reads return live values, so the
+WLAN SMMU stream does not fault for host MMIO reads. WLAN FW_READY at ~8 s, then CE ring sizes read from the
+firmware-programmed copy engines (srri/drri all 0 = idle):
+CE0 dr 0x20 | CE1 sr 0x20 | CE2 sr 0x40 | CE3 dr 0x20 | CE4 dr 0x100 | CE5 none | CE6 sr 0x20 dr 0x20 | CE7,CE8 none.
+(Matches the usual ath10k WCN3990 layout: CE0 host->target, CE1 target->host, CE2 target->host wmi, CE3 host->target wmi,
+CE4 host->target data, CE6 diag.) Next: host side of the rings (allocate descriptor memory, program base lo/hi, write idx,
+HTC ready message on CE2/CE1). Open question: whether the chip can DMA to host memory (SMMU stream).
+Phone is left running the probe image; boot shim-local-0136r-default.img (NOT -gpuwait) for normal use.
