@@ -668,3 +668,14 @@ xnu/patches/0138-op7t-usb-smmu-identity.patch; aTechGeekDev/ios-apollo has a wif
 NEXT: source rings CE0 (HTC control tx, 16) and CE3 (WMI tx, 32) with the shadow write indexes, HTC CONNECT_SERVICE for
 WMI_CONTROL (0x100) and HTT_DATA (0x300), SETUP_COMPLETE, WMI TLV service ready/init/ready, then a passive scan (Bergamota
 1119+). Note the forks keep the pool outside xnu RAM; here kmem_alloc + per-page kvtophys works.
+
+## 2026-10-27 ~16:30 MILESTONE: WMI IS UP ON THE WCN3990 (wlanprobe=6, image shim/out/shim-local-0138w-ce.img, patch 0138)
+Everything in one blocking run after the WLFW mode request (wlfw_wmi_bringup in bsd/dev/sweet_mpss.c): SMMU identity bank 60 for
+SIDs 0x240/0x241; 4 MiB contiguous pool (kmem_alloc_contig, flags KMA_DATA|KMA_ZERO|KMA_PERMANENT) with host rings CE0 src 32,
+CE3 src 32, CE1 dst 32, CE2 dst 64 (cacheable memory: dc civac around every DMA access); HTC READY (2 credits of 2184, 22 endpoints);
+HTC CONNECT_SERVICE HTT 0x300 -> endpoint 1 (max 2000), WMI 0x100 -> endpoint 2 (max 2040); SETUP_COMPLETE_EX; WMI SERVICE_READY (fw
+0x3226822e, abi 0x01000000, phy_cap 3, 2 chains, ht 0x381b, vht 0x739139fa, 0 host memory requests, 128-byte service map); WMI INIT
+(220 bytes); READY event (MAC reads 00:00:00:00:00:00 here: the real MAC is /chosen/cdt/cdb2/wlan_mac1, set by the host later).
+Source ring write indexes go through the shadow registers 0x32000 (CE0) / 0x3200c (CE3), as in the forks.
+NEXT: WMI commands for a passive scan: pdev params, vdev create (station), scan start; read WMI mgmt-rx events (beacons) -> list SSIDs.
+Then a supplicant/auth/assoc, then an iOS network interface. Reference: Bergamota docs/WIFI_IOS26_PHASE2.md, patches-12377/1119+.

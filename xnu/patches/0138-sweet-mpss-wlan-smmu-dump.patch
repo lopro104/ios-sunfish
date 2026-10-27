@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -2301,6 +2301,290 @@
+@@ -2301,6 +2301,820 @@
  	}
  }
  
@@ -289,10 +289,540 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +}
 +
++/*
++ * wlanprobe=6: the host side of HTC and WMI (ath10k htc.c, wmi-tlv.c; ported from the Beryllium fork's 1118/1119).
++ * Blocking, run once from the WLFW handler after the mode request, at most ~20 s: SMMU bank, a 4 MiB physically
++ * contiguous pool (rings and buffers in the first 1 MiB, the firmware's host memory chunks after it), the four host
++ * rings (source CE0 = HTC control tx, CE3 = WMI tx; destination CE1 = HTT rx, CE2 = control/WMI rx), HTC ready,
++ * connect HTT and WMI, setup complete, WMI service ready -> init -> ready (the MAC address).
++ */
++#define WP_POOL         0x400000u
++#define WP_HOSTMEM      0x100000u
++#define WP_BUF          2048u
++#define WP_NR           4
++
++static const struct wp_ring_cfg {
++	unsigned ce, n, ring, bufs;
++	bool src;
++} wp_cfg[WP_NR] = {
++	{ 0, 32, 0x000, 0x10000, true },
++	{ 3, 32, 0x400, 0x20000, true },
++	{ 1, 32, 0x800, 0x30000, false },
++	{ 2, 64, 0xc00, 0x40000, false },
++};
++
++static struct {
++	volatile uint32_t *regs;
++	uint8_t *pool;
++	uint64_t pa;
++	uint32_t wr[WP_NR], sw[WP_NR];
++	uint8_t seq[8], wmi_eid, htt_eid, mac[6];
++	bool htc_ready, got_conn, svc_ready, svc_avail, wmi_ready, ack_rssi, ext_addr;
++	uint8_t conn_st, conn_eid;
++	uint16_t conn_svc, conn_max, credits, credit_size;
++	uint32_t wmi_credits, nchunks, svc[32], svc_bytes, msgs;
++	struct {
++		uint32_t req_id, len;
++		uint64_t pa;
++	} chunk[16];
++	uint32_t req_id[16], req_len[16], nreq;
++} wp;
++
++struct wp_desc {
++	uint64_t addr;
++	uint16_t nbytes, flags;
++	uint32_t hash;
++};
++
++struct wp_rsrc {
++	uint32_t num_vdevs, num_peers, num_offload_peers, num_offload_reorder_bufs, num_peer_keys, num_tids,
++	    ast_skid_limit, tx_chain_mask, rx_chain_mask, rx_timeout_pri[4], rx_decap_mode, scan_max_pending_reqs,
++	    bmiss_offload_max_vdev, roam_offload_max_vdev, roam_offload_max_ap_profiles, num_mcast_groups,
++	    num_mcast_table_elems, mcast2ucast_mode, tx_dbg_log_size, num_wds_entries, dma_burst_size, mac_aggr_delim,
++	    rx_skip_defrag_timeout_dup_detection_check, vow_config, gtk_offload_max_vdev, num_msdu_desc,
++	    max_frag_entries, num_tdls_vdevs, num_tdls_conn_table_entries, beacon_tx_offload_max_vdev,
++	    num_multicast_filter_entries, num_wow_filters, num_keep_alive_pattern, keep_alive_pattern_size,
++	    max_tdls_concurrent_sleep_sta, max_tdls_concurrent_buffer_sta, wmi_send_separate, num_ocb_vdevs,
++	    num_ocb_channels, num_ocb_schedules, host_capab;
++};
++
++static void
++wp_sync(const void *p, size_t n)
++{
++	for (uintptr_t a = (uintptr_t)p & ~63ul; a < (uintptr_t)p + n; a += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (a) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static volatile uint32_t *
++wp_ce(unsigned ce)
++{
++	return wp.regs + (WCN_CE_BASE + 0x1000 * ce) / 4;
++}
++
++static struct wp_desc *
++wp_desc(unsigned r, unsigned i)
++{
++	return (struct wp_desc *)(wp.pool + wp_cfg[r].ring) + i;
++}
++
++static void
++wp_repost(unsigned r)
++{
++	struct wp_desc *d = wp_desc(r, wp.wr[r]);
++
++	d->addr = (wp.pa + wp_cfg[r].bufs + (uint64_t)wp.wr[r] * WP_BUF) & 0x1fffffffffull;
++	d->nbytes = 0;
++	wp_sync(d, sizeof(*d));
++	wp.wr[r] = (wp.wr[r] + 1) & (wp_cfg[r].n - 1);
++	wp_ce(wp_cfg[r].ce)[0x40 / 4] = wp.wr[r];
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* ath10k_ce_init_pipe for the four host rings; false if memory is missing */
++static bool
++wp_rings(void)
++{
++	vm_offset_t mem = 0;
++
++	if (kmem_alloc_contig(kernel_map, &mem, WP_POOL, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		ev("WMI: no contiguous pool");
++		return false;
++	}
++	wp.pool = (uint8_t *)mem;
++	wp.pa = kvtophys(mem);
++	ev("WMI: pool pa %#llx", wp.pa);
++	for (unsigned r = 0; r < WP_NR; r++) {
++		volatile uint32_t *ce = wp_ce(wp_cfg[r].ce);
++		uint64_t rpa = wp.pa + wp_cfg[r].ring;
++		unsigned n = wp_cfg[r].n;
++
++		if (wp_cfg[r].src) {
++			wp.sw[r] = ce[0x44 / 4] & (n - 1);
++			wp.wr[r] = ce[0x3c / 4] & (n - 1);
++			ce[0] = (uint32_t)rpa;
++			ce[1] = (ce[1] & ~0x1fu) | ((uint32_t)(rpa >> 32) & 0x1f);
++			ce[2] = n;
++			ce[0x18 / 4] = (ce[0x18 / 4] & ~(0xffffu | (1u << 17))) | 0x800;  /* dmax 2048, no byte swap */
++		} else {
++			wp.sw[r] = ce[0x48 / 4] & (n - 1);
++			wp.wr[r] = ce[0x40 / 4] & (n - 1);
++			ce[3] = (uint32_t)rpa;
++			ce[4] = (ce[4] & ~0x1fu) | ((uint32_t)(rpa >> 32) & 0x1f);
++			ce[5] = n;
++			ce[0x18 / 4] = ce[0x18 / 4] & ~(1u << 18);
++			for (unsigned k = 0; k < n - 1; k++) {
++				wp_repost(r);
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		ev("WMI: CE%u %s ring %u at %#llx sw %u wr %u ctrl1 %#x", wp_cfg[r].ce, wp_cfg[r].src ? "src" : "dst", n, rpa, wp.sw[r], wp.wr[r],
++		    ce[0x18 / 4]);
++	}
++	return true;
++}
++
++/* HTC send on source ring r (0 = CE0, 1 = CE3): 8-byte header + payload; the write index goes through the shadow registers */
++static bool
++wp_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
++{
++	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
++	uint32_t srri = wp_ce(wp_cfg[r].ce)[0x44 / 4] & mask;
++	uint8_t *buf = wp.pool + wp_cfg[r].bufs + (uint64_t)wr * WP_BUF;
++	struct wp_desc *d = wp_desc(r, wr);
++	uint16_t l = (uint16_t)plen;
++
++	if (8 + plen > WP_BUF || ((srri - 1 - wr) & mask) == 0) {
++		return false;
++	}
++	buf[0] = eid;
++	buf[1] = (eid != 0 && eid == wp.wmi_eid) ? 1 : 0;      /* NEED_CREDIT_UPDATE on the credit-flow endpoint */
++	memcpy(buf + 2, &l, 2);
++	buf[4] = 0;
++	buf[5] = wp.seq[eid & 7]++;
++	buf[6] = buf[7] = 0;
++	memcpy(buf + 8, payload, plen);
++	wp_sync(buf, 8 + plen);
++	d->addr = (wp.pa + wp_cfg[r].bufs + (uint64_t)wr * WP_BUF) & 0x1fffffffffull;
++	d->nbytes = (uint16_t)(8 + plen);
++	d->flags = (uint16_t)(((uint32_t)eid << 4) & 0xfff0);   /* transfer id = endpoint (meta data) */
++	d->hash = 0;
++	wp_sync(d, sizeof(*d));
++	wr = (wr + 1) & mask;
++	wp.wr[r] = wr;
++	wp.regs[(wp_cfg[r].ce == 0 ? 0x32000u : 0x3200cu) / 4] = wr;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return true;
++}
++
++static bool
++wp_svc_on(uint32_t id)
++{
++	uint32_t len = wp.svc_bytes, words = MIN(len / 4, 32u), w;
++
++	if (id < len) {
++		w = id / 4;
++		return w < words && ((wp.svc[w] >> (id % 4)) & 1);
++	}
++	if (id >= 256) {
++		return false;
++	}
++	w = (id - len) / 32;
++	return w < words && ((wp.svc[w] >> ((id - len) % 32)) & 1);
++}
++
++static bool
++wp_connect(uint16_t svc)
++{
++	uint8_t m[8] = { 2, 0 };
++	uint16_t flags = svc == 0x0100 ? (uint16_t)(1u << 8) : (uint16_t)(1u << 3);
++
++	memcpy(m + 2, &svc, 2);
++	memcpy(m + 4, &flags, 2);
++	wp.got_conn = false;
++	wp.conn_svc = svc;
++	return wp_send(0, 0, m, sizeof(m));
++}
++
++/* WMI_TLV service ready: capabilities, service bitmap, host memory requests (ath10k_wmi_tlv_op_pull_svc_rdy_ev) */
++static void
++wp_service_ready(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *evp = NULL, *bmap = NULL, *reqs = NULL;
++	uint16_t evl = 0, bmapl = 0, reqsl = 0;
++	uint32_t e[22];
++
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == 32) {
++			evp = t + o + 4;
++			evl = l;
++		} else if (tag == 16 && !bmap) {
++			bmap = t + o + 4;
++			bmapl = l;
++		} else if (tag == 18) {
++			reqs = t + o + 4;
++			reqsl = l;
++		}
++		o += 4 + l;
++	}
++	if (!evp || evl < 88 || !bmap || !reqs) {
++		ev("WMI: malformed SERVICE_READY");
++		return;
++	}
++	memset(e, 0, sizeof(e));
++	memcpy(e, evp, 88);
++	memset(wp.svc, 0, sizeof(wp.svc));
++	memcpy(wp.svc, bmap, MIN((uint32_t)bmapl, (uint32_t)sizeof(wp.svc)));
++	wp.svc_bytes = bmapl;
++	ev("WMI: SERVICE_READY fw %#x abi %#x ns %#x %#x phy_cap %#x chains %u ht %#x vht %#x, %u memory requests, service map %u bytes",
++	    e[0], e[1], e[3], e[4], e[7], e[9], e[10], e[11], e[18], bmapl);
++	wp.nreq = 0;
++	for (uint32_t o = 0; o + 4 <= reqsl && wp.nreq < 16;) {
++		uint16_t l, tag;
++		uint32_t q[4], units, usize;
++
++		memcpy(&l, reqs + o, 2);
++		memcpy(&tag, reqs + o + 2, 2);
++		if (o + 4 + l > reqsl || tag != 34 || l < 16) {
++			break;
++		}
++		memcpy(q, reqs + o + 4, 16);
++		units = q[3];
++		usize = (q[1] + 3) & ~3u;
++		if (q[2] & 6) {
++			units = 33 + 1;                         /* NUM_UNITS_IS_NUM_(ACTIVE_)PEERS */
++		} else if (q[2] & 1) {
++			units = 4 + 1;                          /* NUM_UNITS_IS_NUM_VDEVS */
++		}
++		wp.req_id[wp.nreq] = q[0];
++		wp.req_len[wp.nreq] = units * usize;
++		ev("WMI: memory request %u: id %u, %u units of %u (info %#x) = %u bytes", wp.nreq, q[0], units, q[1], q[2], units * usize);
++		wp.nreq++;
++		o += 4 + l;
++	}
++	wp.svc_ready = true;
++}
++
++static void
++wp_send_init(void)
++{
++	uint8_t c[4 + 4 + 28 + 4 + sizeof(struct wp_rsrc) + 4 + 16 * 20];
++	uint32_t n = 4, cmd = 0x1, off = WP_HOSTMEM;
++	uint16_t tl, tg;
++	struct wp_rsrc cfg;
++	bool reorder = wp_svc_on(65);                   /* WMI_TLV_SERVICE_RX_FULL_REORDER */
++	uint32_t abi[7];
++
++	for (unsigned k = 0; k < wp.nreq; k++) {
++		if ((uint64_t)off + wp.req_len[k] > WP_POOL) {
++			ev("WMI: memory request %u does not fit the pool", k);
++			return;
++		}
++		wp.chunk[k].req_id = wp.req_id[k];
++		wp.chunk[k].len = wp.req_len[k];
++		wp.chunk[k].pa = wp.pa + off;
++		off = (off + wp.req_len[k] + 0xfff) & ~0xfffu;
++	}
++	wp.nchunks = wp.nreq;
++	memcpy(c, &cmd, 4);
++	tl = 28;
++	tg = 74;                                        /* WMI_TLV_TAG_STRUCT_INIT_CMD */
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	abi[0] = 0x01000000u; abi[1] = 53; abi[2] = 0x5f414351u; abi[3] = 0x00004c4du; abi[4] = 0; abi[5] = 0; abi[6] = wp.nchunks;
++	memcpy(c + n + 4, abi, 28);
++	n += 4 + 28;
++	memset(&cfg, 0, sizeof(cfg));
++	cfg.num_vdevs = 4;
++	cfg.num_peers = 33;
++	cfg.ast_skid_limit = 16;
++	cfg.num_wds_entries = 2;
++	cfg.num_offload_peers = reorder ? 4 : 0;
++	cfg.num_offload_reorder_bufs = reorder ? 4 : 0;
++	cfg.num_peer_keys = 2;
++	cfg.num_tids = 33 * 2;
++	cfg.tx_chain_mask = 7;
++	cfg.rx_chain_mask = 7;
++	cfg.rx_timeout_pri[0] = cfg.rx_timeout_pri[1] = cfg.rx_timeout_pri[2] = 0x64;
++	cfg.rx_timeout_pri[3] = 0x28;
++	cfg.rx_decap_mode = 1;                          /* native wifi */
++	cfg.scan_max_pending_reqs = 4;
++	cfg.bmiss_offload_max_vdev = 4;
++	cfg.roam_offload_max_vdev = 4;
++	cfg.roam_offload_max_ap_profiles = 8;
++	cfg.tx_dbg_log_size = 0x400;
++	cfg.gtk_offload_max_vdev = 2;
++	cfg.num_msdu_desc = 1024 + 32;
++	cfg.max_frag_entries = 2;
++	cfg.num_tdls_vdevs = 1;
++	cfg.num_tdls_conn_table_entries = 0x20;
++	cfg.beacon_tx_offload_max_vdev = 2;
++	cfg.num_multicast_filter_entries = 5;
++	cfg.num_wow_filters = 22;
++	cfg.num_keep_alive_pattern = 6;
++	cfg.max_tdls_concurrent_sleep_sta = 1;
++	cfg.max_tdls_concurrent_buffer_sta = 1;
++	cfg.host_capab = 1u << 9;
++	if (wp.ack_rssi) {
++		cfg.host_capab |= 1u << 18;
++	}
++	tl = sizeof(cfg);
++	tg = 75;                                        /* WMI_TLV_TAG_STRUCT_RESOURCE_CONFIG */
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	memcpy(c + n + 4, &cfg, sizeof(cfg));
++	n += 4 + (uint32_t)sizeof(cfg);
++	tl = (uint16_t)(wp.nchunks * 20);
++	tg = 18;                                        /* WMI_TLV_TAG_ARRAY_STRUCT */
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	n += 4;
++	for (unsigned k = 0; k < wp.nchunks; k++) {
++		uint32_t ch[4] = { wp.chunk[k].req_id, (uint32_t)wp.chunk[k].pa, wp.chunk[k].len, wp.ext_addr ? (uint32_t)(wp.chunk[k].pa >> 32) : 0 };
++
++		tl = 16;
++		tg = 76;                                /* WMI_TLV_TAG_STRUCT_HOST_MEMORY_CHUNK */
++		memcpy(c + n, &tl, 2);
++		memcpy(c + n + 2, &tg, 2);
++		memcpy(c + n + 4, ch, 16);
++		n += 20;
++	}
++	ev("WMI: INIT %u bytes, %u chunks, reorder %u, ack rssi %u, ext addr %u", n, wp.nchunks, reorder, wp.ack_rssi, wp.ext_addr);
++	if (!wp_send(1, wp.wmi_eid, c, n)) {
++		ev("WMI: INIT not sent");
++	}
++}
++
++/* one received message (HTC header: eid, flags, len, ctrl[2], seq?, ...) */
++static void
++wp_rx(unsigned ce, const uint8_t *p, uint32_t len)
++{
++	uint16_t hlen, id;
++	uint32_t trailer, plen;
++	const uint8_t *pl;
++
++	wp.msgs++;
++	if (wp.msgs <= 12) {
++		ev("WMI: CE%u msg %u bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", ce, len, p[0], p[1], p[2], p[3], p[4],
++		    p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
++	}
++	if (len < 10) {
++		return;
++	}
++	memcpy(&hlen, p + 2, 2);
++	trailer = (p[1] & 2) ? p[4] : 0;
++	if (8u + hlen > len || trailer > hlen) {
++		return;
++	}
++	pl = p + 8;
++	plen = hlen - trailer;
++	for (uint32_t o = plen; o + 4 <= hlen;) {       /* trailer records: id 1 = credit report {eid, credits} */
++		uint8_t rid = pl[o], rl = pl[o + 1];
++
++		if (o + 4 + rl > hlen) {
++			break;
++		}
++		for (uint32_t k = 0; rid == 1 && k + 4 <= rl; k += 4) {
++			if (wp.wmi_eid && pl[o + 4 + k] == wp.wmi_eid) {
++				wp.wmi_credits += pl[o + 4 + k + 1];
++			}
++		}
++		o += 4u + rl;
++	}
++	memcpy(&id, pl, 2);
++	if (p[0] == 0) {                                /* HTC control */
++		if (id == 1 && plen >= 8) {
++			memcpy(&wp.credits, pl + 2, 2);
++			memcpy(&wp.credit_size, pl + 4, 2);
++			wp.htc_ready = true;
++			ev("WMI: HTC READY %u credits of %u, %u endpoints", wp.credits, wp.credit_size, pl[6]);
++		} else if (id == 3 && plen >= 8) {
++			memcpy(&wp.conn_svc, pl + 2, 2);
++			memcpy(&wp.conn_max, pl + 6, 2);
++			wp.conn_st = pl[4];
++			wp.conn_eid = pl[5];
++			wp.got_conn = true;
++			ev("WMI: HTC connect %#x -> status %u endpoint %u max message %u", wp.conn_svc, wp.conn_st, wp.conn_eid, wp.conn_max);
++		}
++		return;
++	}
++	if (wp.wmi_eid && p[0] == wp.wmi_eid && plen >= 4) {
++		uint32_t evid;
++
++		memcpy(&evid, pl, 4);
++		evid &= 0xffffff;
++		if (evid == 0x1) {
++			wp_service_ready(pl + 4, plen - 4);
++		} else if (evid == 0x3) {
++			uint16_t l, tag;
++
++			if (plen >= 4 + 4 + 8) {
++				memcpy(&l, pl + 4, 2);
++				memcpy(&tag, pl + 6, 2);
++				if (tag == 559 && l >= 4 + 8 && 8u + l <= plen) {
++					uint32_t ext[2];
++
++					memcpy(ext, pl + 12, 8);
++					wp.ack_rssi = (ext[(174 - 128) / 32] >> ((174 - 128) % 32)) & 1;
++					wp.ext_addr = (ext[(179 - 128) / 32] >> ((179 - 128) % 32)) & 1;
++				}
++			}
++			wp.svc_avail = true;
++		} else if (evid == 0x2) {
++			for (uint32_t o = 4; o + 4 <= plen;) {
++				uint16_t l, tag;
++
++				memcpy(&l, pl + o, 2);
++				memcpy(&tag, pl + o + 2, 2);
++				if (o + 4 + l > plen) {
++					break;
++				}
++				if (tag == 35 && l >= 36) {
++					memcpy(wp.mac, pl + o + 4 + 24, 6);
++					wp.wmi_ready = true;
++				}
++				o += 4u + l;
++			}
++			ev("WMI: READY, MAC %02x:%02x:%02x:%02x:%02x:%02x", wp.mac[0], wp.mac[1], wp.mac[2], wp.mac[3], wp.mac[4], wp.mac[5]);
++		} else {
++			ev("WMI: event %#x (%u bytes)", evid, plen);
++		}
++		return;
++	}
++	if (wp.htt_eid && p[0] == wp.htt_eid) {
++		ev("WMI: HTT message type %u (%u bytes)", pl[0], plen);
++	}
++}
++
++static void
++wp_poll(void)
++{
++	for (unsigned r = 0; r < WP_NR; r++) {
++		unsigned mask = wp_cfg[r].n - 1;
++
++		if (wp_cfg[r].src) {
++			continue;
++		}
++		for (unsigned guard = 0; guard < wp_cfg[r].n; guard++) {
++			struct wp_desc *d = wp_desc(r, wp.sw[r]);
++			const uint8_t *buf = wp.pool + wp_cfg[r].bufs + (uint64_t)wp.sw[r] * WP_BUF;
++			uint16_t nb;
++
++			wp_sync(d, sizeof(*d));
++			nb = *(volatile uint16_t *)&d->nbytes;
++			if (nb == 0) {
++				break;
++			}
++			wp_sync(buf, MIN((uint32_t)nb, WP_BUF));
++			wp_rx(wp_cfg[r].ce, buf, MIN((uint32_t)nb, WP_BUF));
++			wp.sw[r] = (wp.sw[r] + 1) & mask;
++			wp_repost(r);
++		}
++	}
++}
++
++static bool
++wp_wait(bool *flag, unsigned ms, const char *what)
++{
++	for (unsigned t = 0; t < ms; t += 10) {
++		wp_poll();
++		if (*flag) {
++			return true;
++		}
++		sleep_ms(10);
++	}
++	ev("WMI: timeout waiting for %s", what);
++	return false;
++}
++
++static void
++wlfw_wmi_bringup(volatile uint32_t *regs)
++{
++	uint8_t sc[12] = { 5 };
++
++	if (!wlfw_smmu_identity(0x240) || !wlfw_smmu_identity(0x241)) {
++		ev("WMI: SMMU not set up");
++		return;
++	}
++	wp.regs = regs;
++	if (!wp_rings() || !wp_wait(&wp.htc_ready, 3000, "HTC ready")) {
++		return;
++	}
++	wp.wmi_credits = 0;
++	if (!wp_connect(0x0300) || !wp_wait(&wp.got_conn, 2000, "HTT connect") || wp.conn_st != 0) {
++		return;
++	}
++	wp.htt_eid = wp.conn_eid;
++	if (!wp_connect(0x0100) || !wp_wait(&wp.got_conn, 2000, "WMI connect") || wp.conn_st != 0) {
++		return;
++	}
++	wp.wmi_eid = wp.conn_eid;
++	wp.wmi_credits = 1;
++	if (!wp_send(0, 0, sc, sizeof(sc))) {
++		ev("WMI: setup complete not sent");
++		return;
++	}
++	ev("WMI: setup complete sent");
++	if (!wp_wait(&wp.svc_ready, 5000, "WMI service ready")) {
++		return;
++	}
++	wp_wait(&wp.svc_avail, 300, "service available");
++	wp_send_init();
++	wp_wait(&wp.wmi_ready, 5000, "WMI ready");
++}
++
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2323,7 +2607,14 @@
+@@ -2323,7 +3137,16 @@
  		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
  		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
  	}
@@ -301,6 +831,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wlfw_dma_test(regs);
 +	} else if (g_wlan_probe == 3) {
 +		wlfw_smmu_dump(false);
++	} else if (g_wlan_probe == 6) {
++		wlfw_wmi_bringup(regs);
 +	} else if (g_wlan_probe == 5) {
 +		wlfw_ce_rx_test(regs);
 +	} else if (g_wlan_probe == 4) {
