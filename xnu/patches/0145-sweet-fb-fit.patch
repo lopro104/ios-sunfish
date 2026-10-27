@@ -1,0 +1,228 @@
+From: sunfish-gpu
+Subject: [PATCH] SweetFramebuffer: kern.sweetfb_fit / boot-arg sweetfb_fit: the presented display shrunk 24/25 onto the panel, whole
+
+The panel showed the centre of the presented 1125x2436 display at full size: 22 columns
+cut off at each side, 48 rows at the top and the bottom. With sweetfb_fit the whole display is
+shrunk onto the panel's 1080 columns (24 of 25, as the iPhone 12 mini shows 1125x2436 on
+1080x2340): of each 25 columns and rows the 13th and 14th are averaged, the rest copied.
+Touch follows (SweetHID.cpp). Off by default; switch at run time with the sysctl.
+---
+--- a/bsd/dev/sweet_sample.c	2026-10-27 15:12:11.591027170 +0200
++++ b/bsd/dev/sweet_sample.c	2026-10-27 15:12:11.602249272 +0200
+@@ -98,6 +98,14 @@
+ int sweet_fb_gpu_waits = -1;    /* -1: the boot-arg's (SweetFramebuffer.cpp sets it at start) */
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_gpuwait, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gpu_waits, 0,
+     "the display waits for the GPU before it shows a swap");
++/*
++ * kern.sweetfb_fit=1: the presented 1125x2436 display is shrunk by 24/25 onto the 1080 columns of
++ * the panel, whole, instead of its centre shown at full size with the edges cut off
++ * (SweetFramebuffer.cpp; touch follows, SweetHID.cpp). Boot-arg sweetfb_fit sets it at start.
++ */
++int sweet_fb_fit = 0;
++SYSCTL_INT(_kern, OID_AUTO, sweetfb_fit, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_fit, 0,
++    "the presented display shrunk to fit the panel, whole");
+ /* What the display showed (SweetFramebuffer.cpp counts them), for measuring the frame rate. */
+ unsigned int sweet_fb_stat[4];
+ SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[0], 0,
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 15:12:11.585392024 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 15:12:29.469753670 +0200
+@@ -58,6 +58,7 @@
+ extern "C" uint32_t sweet_gpu_last(void);
+ static uint32_t sweet_fb_fence_late;   /* swaps shown before the GPU was done (logged) */
+ extern "C" int sweet_fb_gpu_waits;      /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_gpuwait */
++extern "C" int sweet_fb_fit;            /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_fit */
+ extern "C" unsigned int sweet_fb_stat[4];       /* kern.sweetfb_shown, _retry, _older, _late */
+ #include <sys/proc.h>
+ 
+@@ -91,6 +92,7 @@
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_FIT_MIX                0x8000  /* fFitCol, fFitRow: average with the next one */
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -157,6 +159,16 @@
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	vm_offset_t   fMDP;           /* command-mode panel: the display controller (MDP) */
+ 	int           fKickCTL;       /* CTL to kick with CTL_START after each frame; -1: none */
++	/*
++	 * kern.sweetfb_fit: panel column c shows presented column fFitCol[c], panel row fFitTop + r
++	 * presented row fFitRow[r] (fFitH rows); with SWEET_FB_FIT_MIX, that one and the next averaged.
++	 */
++	uint16_t     *fFitCol, *fFitRow;
++	uint32_t      fFitTop, fFitH;
++	bool          fFitShown;      /* the rows above and below the shrunk picture are black */
++	int           fFitWas;
++
++	void fitLayer(uintptr_t src, uint32_t row, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h);
+ 
+ 	void cmdModeSetup(void);
+ 	void kick(void);
+@@ -300,6 +312,39 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/*
++	 * kern.sweetfb_fit (boot-arg sweetfb_fit): 1125 presented columns onto 1080 panel ones is 24 of
++	 * every 25, as the iPhone 12 mini shows its 1125x2436 on 1080x2340. Of each 25 columns (and
++	 * rows) the 13th and 14th are averaged into one and the rest copied: no line of a pixel is
++	 * lost, and it costs little more than the copy.
++	 */
++	fFitCol = NULL;
++	fFitRow = NULL;
++	if (fLogicalW * 24 == fWidth * 25 && fLogicalH * 24 / 25 <= fHeight) {
++		fFitH = fLogicalH * 24 / 25;
++		fFitTop = (fHeight - fFitH) / 2;
++		fFitCol = (uint16_t *)IOMallocData(fWidth * sizeof(uint16_t));
++		fFitRow = (uint16_t *)IOMallocData(fFitH * sizeof(uint16_t));
++	}
++	if (fFitCol != NULL && fFitRow != NULL) {
++		for (uint32_t i = 0; i < fWidth || i < fFitH; i++) {
++			uint32_t j = i % 24, at = i / 24 * 25 + (j <= 12 ? j : j + 1);
++			uint16_t v = (uint16_t)(at | (j == 12 ? SWEET_FB_FIT_MIX : 0));
++			if (i < fWidth) {
++				fFitCol[i] = v;
++			}
++			if (i < fFitH) {
++				fFitRow[i] = v;
++			}
++		}
++		int fit = 0;
++		PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++		sweet_fb_fit = fit;
++	} else {
++		sweet_fb_fit = 0;
++	}
++	fFitShown = false;
++	fFitWas = sweet_fb_fit;
+ 	fMDP = 0;
+ 	fKickCTL = -1;
+ 	cmdModeSetup();
+@@ -414,6 +459,11 @@
+ 		IOLog("SWEET FB: the display %s for the GPU\n", fb->fGPUWaits ? "waits" : "does not wait");
+ 		IOLockLock(fb->fLock);
+ 	}
++	if (sweet_fb_fit != fb->fFitWas) {
++		/* kern.sweetfb_fit changed: show the last swap again, the other way */
++		fb->fFitWas = sweet_fb_fit;
++		fb->fDirty = true;
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *src = flush ? fb->doneFrame() : NULL;
+ 	if (flush && src == NULL) {
+@@ -672,6 +722,51 @@
+ 	}
+ }
+ 
++/* Two pixels averaged, each channel (rounded up). */
++static inline uint32_t
++sweet_fb_mix(uint32_t a, uint32_t b)
++{
++	return ((a >> 1) & 0x7f7f7f7fu) + ((b >> 1) & 0x7f7f7f7fu) + ((a | b) & 0x01010101u);
++}
++
++/*
++ * kern.sweetfb_fit: a layer's w x h pixels from (sx, sy) of src, placed at (dx, dy) of the presented
++ * display, shrunk onto the panel through fFitCol and fFitRow.
++ */
++void
++AppleCLCD::fitLayer(uintptr_t src, uint32_t row, int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	for (uint32_t r = 0; r < fFitH; r++) {
++		int32_t ly = (int32_t)(fFitRow[r] & ~SWEET_FB_FIT_MIX) - dy;
++		if (ly < 0 || ly >= h) {
++			continue;
++		}
++		bool ymix = (fFitRow[r] & SWEET_FB_FIT_MIX) && ly + 1 < h;
++		const uint32_t *r0 = (const uint32_t *)(src + (uint64_t)(sy + ly) * row) + sx;
++		const uint32_t *r1 = (const uint32_t *)((uintptr_t)r0 + (ymix ? row : 0));
++		uint32_t *out = (uint32_t *)(fPixels + (uint64_t)(fFitTop + r) * fRowBytes);
++		for (uint32_t c = 0; c < fWidth; c++) {
++			int32_t lx = (int32_t)(fFitCol[c] & ~SWEET_FB_FIT_MIX) - dx;
++			if (lx < 0 || lx >= w) {
++				continue;
++			}
++			uint32_t v = r0[lx];
++			bool xmix = (fFitCol[c] & SWEET_FB_FIT_MIX) && lx + 1 < w;
++			if (xmix) {
++				v = sweet_fb_mix(v, r0[lx + 1]);
++			}
++			if (ymix) {
++				uint32_t u = r1[lx];
++				if (xmix) {
++					u = sweet_fb_mix(u, r1[lx + 1]);
++				}
++				v = sweet_fb_mix(v, u);
++			}
++			out[c] = v;
++		}
++	}
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -688,6 +783,16 @@
+ 		}
+ 	}
+ 
++	bool fit = sweet_fb_fit > 0 && fFitCol != NULL && fFitRow != NULL;
++	if (fit && !fFitShown) {
++		for (uint32_t y = 0; y < fHeight; y++) {
++			if (y < fFitTop || y >= fFitTop + fFitH) {
++				bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
++			}
++		}
++	}
++	fFitShown = fit;
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -733,6 +838,21 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (fit) {
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			uint64_t end = (uint64_t)base + (uint64_t)(sy + h - 1) * row + (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 && s->elementHeight == 1 &&
++			    s->memory != NULL && end <= s->memory->getLength()) {
++				fitLayer(src + base, row, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp	2026-10-27 15:12:11.588660169 +0200
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp	2026-10-27 15:12:11.602986562 +0200
+@@ -23,6 +23,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ #include "IOHIDEventService.h"
++extern "C" int sweet_fb_fit;            /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_fit */
+ #include "IOHIDEventServiceUserClient.h"
+ #include "IOHIDEvent.h"
+ #include "IOHIDKeys.h"
+@@ -477,6 +478,13 @@
+ 	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
+ 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
+ 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
++	if (sweet_fb_fit > 0 && fLogicalW * 24 == fPanelW * 25 && fLogicalH * 24 / 25 <= fPanelH) {
++		/* kern.sweetfb_fit: the whole display shrunk onto the panel's width, centred in its height */
++		int fitH = fLogicalH * 24 / 25, top = (fPanelH - fitH) / 2;
++		int fy = y < top ? 0 : (y - top >= fitH ? fitH - 1 : y - top);
++		nx = (IOFixed)((((int64_t)x << 16) + 0x8000) / fPanelW);
++		ny = (IOFixed)((((int64_t)fy << 16) + 0x8000) / fitH);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
