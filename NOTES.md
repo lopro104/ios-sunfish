@@ -707,3 +707,12 @@ was wrong (offline test had the same error: the test now uses the real layout). 
 timeout", CRASH line in the events) after the failed handshake; not seen in the successful run.
 NEXT: prove TX of user data (DHCP -> IP, ARP the router, ICMP ping), then an iOS-facing interface (IONetworkInterface / en1) with a
 persistent service thread instead of the 20 s blocking test; HT/VHT rates; group rekey; power save; roaming; the real MAC address.
+
+## 2026-10-27 ~18:10 MILESTONE: IP OVER WI-FI WORKS: DHCP LEASE AND 3/3 PINGS TO THE ROUTER (wlanprobe=7, shim/out/shim-local-0138n1-ce.img)
+After CONNECTED (previous entry) jn_net_test() runs a tiny in-kernel IPv4 client: DHCP DISCOVER/OFFER/REQUEST/ACK (lease 192.168.1.14 from
+192.168.1.1, mask /24, dns = router), ARP for the router (reply from the AP's MAC), ICMP echo x3: 3 of 3 answered, RTT about 2.3 ms.
+So TX of user data (HTT TX_FRM, native wifi, CCMP by the firmware) and RX both work. Events: `sysctl -n kern.sweet_mpss_events | grep -a NET`.
+NEXT: (1) a persistent WLAN service thread (no blocking one-shot, keep modem services + WMI alive, handle kickouts/rekeys, firmware
+crash recovery); (2) an iOS interface: bsd ifnet (en1) with if_output -> jn_tx_eth and RX -> ifnet_input, a configd/IPConfiguration-
+friendly Ethernet-type interface, so iOS does DHCP and its own stack; (3) selecting the network from user space (sysctl/ioctl) instead of
+/fw/wlan/net.conf; (4) HT/VHT rates, group rekey path (coded, untested), power save, real MAC (/chosen/cdt/cdb2/wlan_mac1).

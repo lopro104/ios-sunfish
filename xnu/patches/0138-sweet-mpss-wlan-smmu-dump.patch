@@ -10,7 +10,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  
  extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
  extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
-@@ -2301,6 +2303,1991 @@
+@@ -2301,6 +2303,2242 @@
  	}
  }
  
@@ -1561,7 +1561,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		return;
 +	}
 +	jn.rx_frames++;
-+	if (jn.rx_logged < 12) {
++	if (jn.rx_logged < 3) {
 +		jn.rx_logged++;
 +		ev("JOIN: rx %zu bytes type %02x%02x from %02x%02x%02x%02x%02x%02x", n, eth[12], eth[13], eth[6], eth[7], eth[8], eth[9], eth[10], eth[11]);
 +	}
@@ -1790,11 +1790,262 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	return true;
 +}
 +
++/* ---- a minimal IPv4 test client: DHCP, ARP the router, ping it (proves data TX and RX) ---- */
++static struct {
++	int state;                      /* 0 idle, 1 discover sent, 2 offer seen, 3 request sent, 4 bound */
++	uint32_t xid;
++	uint8_t yiaddr[4], server[4], router[4], mask[4], dns[4], router_mac[6];
++	bool have_mac;
++	unsigned pongs, offers;
++	uint16_t ping_seq;
++	uint64_t ping_t0;
++	int64_t rtt_us[3];
++} nt;
++
++static uint64_t
++nt_us(void)
++{
++	uint64_t abs, ns;
++
++	clock_get_uptime(&abs);
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static uint16_t
++ip_sum(const uint8_t *p, size_t n)
++{
++	uint32_t sum = 0;
++
++	for (size_t i = 0; i + 1 < n; i += 2) {
++		sum += (uint32_t)((p[i] << 8) | p[i + 1]);
++	}
++	if (n & 1) {
++		sum += (uint32_t)(p[n - 1] << 8);
++	}
++	while (sum >> 16) {
++		sum = (sum & 0xffff) + (sum >> 16);
++	}
++	return (uint16_t)~sum;
++}
++
++static size_t
++nt_ip_hdr(uint8_t *f, const uint8_t src[4], const uint8_t dst[4], uint8_t proto, size_t payload)
++{
++	uint16_t sum, total = (uint16_t)(20 + payload);
++
++	memset(f, 0, 20);
++	f[0] = 0x45;
++	f[2] = (uint8_t)(total >> 8);
++	f[3] = (uint8_t)total;
++	f[6] = 0x40;                                    /* don't fragment */
++	f[8] = 64;
++	f[9] = proto;
++	memcpy(f + 12, src, 4);
++	memcpy(f + 16, dst, 4);
++	sum = ip_sum(f, 20);
++	f[10] = (uint8_t)(sum >> 8);
++	f[11] = (uint8_t)sum;
++	return 20;
++}
++
++static void
++nt_dhcp(uint8_t type)
++{
++	uint8_t f[400], *d, *o;
++	static const uint8_t zero[4], bcast[4] = { 255, 255, 255, 255 };
++	size_t dl, ul;
++
++	memset(f, 0, sizeof(f));
++	memset(f, 0xff, 6);
++	memcpy(f + 6, wp_mac, 6);
++	f[12] = 0x08;
++	f[13] = 0x00;
++	d = f + 14 + 20 + 8;                            /* BOOTP */
++	d[0] = 1; d[1] = 1; d[2] = 6;
++	d[4] = (uint8_t)(nt.xid >> 24); d[5] = (uint8_t)(nt.xid >> 16); d[6] = (uint8_t)(nt.xid >> 8); d[7] = (uint8_t)nt.xid;
++	d[10] = 0x80;                                   /* broadcast flag */
++	memcpy(d + 28, wp_mac, 6);
++	d[236] = 99; d[237] = 130; d[238] = 83; d[239] = 99;
++	o = d + 240;
++	*o++ = 53; *o++ = 1; *o++ = type;
++	*o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, wp_mac, 6); o += 6;
++	if (type == 3) {
++		*o++ = 50; *o++ = 4; memcpy(o, nt.yiaddr, 4); o += 4;
++		*o++ = 54; *o++ = 4; memcpy(o, nt.server, 4); o += 4;
++	}
++	*o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 15;
++	*o++ = 255;
++	dl = (size_t)(o - d);
++	ul = 8 + dl;
++	nt_ip_hdr(f + 14, zero, bcast, 17, ul);
++	f[34] = 0; f[35] = 68; f[36] = 0; f[37] = 67;
++	f[38] = (uint8_t)(ul >> 8); f[39] = (uint8_t)ul;
++	(void)jn_tx_eth(f, 14 + 20 + ul, false);
++}
++
++static void
++nt_arp_router(void)
++{
++	uint8_t f[42];
++
++	memset(f, 0xff, 6);
++	memcpy(f + 6, wp_mac, 6);
++	f[12] = 0x08; f[13] = 0x06;
++	f[14] = 0; f[15] = 1; f[16] = 0x08; f[17] = 0; f[18] = 6; f[19] = 4; f[20] = 0; f[21] = 1;
++	memcpy(f + 22, wp_mac, 6);
++	memcpy(f + 28, nt.yiaddr, 4);
++	memset(f + 32, 0, 6);
++	memcpy(f + 38, nt.router, 4);
++	(void)jn_tx_eth(f, 42, false);
++}
++
++static void
++nt_ping(void)
++{
++	uint8_t f[14 + 20 + 40];
++	uint16_t sum;
++
++	memset(f, 0, sizeof(f));
++	memcpy(f, nt.router_mac, 6);
++	memcpy(f + 6, wp_mac, 6);
++	f[12] = 0x08;
++	nt_ip_hdr(f + 14, nt.yiaddr, nt.router, 1, 40);
++	f[34] = 8;                                      /* echo request */
++	f[38] = 0x53; f[39] = 0x57;                     /* id */
++	f[40] = (uint8_t)(nt.ping_seq >> 8); f[41] = (uint8_t)nt.ping_seq;
++	for (unsigned i = 0; i < 32; i++) {
++		f[42 + i] = (uint8_t)i;
++	}
++	sum = ip_sum(f + 34, 40);
++	f[36] = (uint8_t)(sum >> 8);
++	f[37] = (uint8_t)sum;
++	nt.ping_t0 = nt_us();
++	(void)jn_tx_eth(f, sizeof(f), false);
++}
++
 +static void
 +jn_dataframe(const uint8_t *eth, size_t n)
 +{
-+	(void)eth;
-+	(void)n;
++	uint16_t type = (uint16_t)((eth[12] << 8) | eth[13]);
++
++	if (type == 0x0806 && n >= 42 && eth[21] == 2 && nt.state == 4 && memcmp(eth + 28, nt.router, 4) == 0) {
++		memcpy(nt.router_mac, eth + 22, 6);
++		nt.have_mac = true;
++		return;
++	}
++	if (type != 0x0800 || n < 14 + 20) {
++		return;
++	}
++	if (eth[23] == 17 && n >= 14 + 20 + 8 + 240 && eth[36] == 0 && eth[37] == 68) {         /* UDP to port 68 */
++		const uint8_t *d = eth + 14 + 20 + 8, *o = d + 240;
++		uint8_t mt = 0;
++		uint32_t xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | ((uint32_t)d[6] << 8) | d[7];
++
++		if (d[0] != 2 || xid != nt.xid) {
++			return;
++		}
++		for (; o + 2 <= eth + n && *o != 255;) {
++			uint8_t code = o[0], l = o[1];
++
++			if (code == 0) {
++				o++;
++				continue;
++			}
++			if (o + 2 + l > eth + n) {
++				break;
++			}
++			if (code == 53) {
++				mt = o[2];
++			} else if (code == 54 && l == 4) {
++				memcpy(nt.server, o + 2, 4);
++			} else if (code == 3 && l >= 4) {
++				memcpy(nt.router, o + 2, 4);
++			} else if (code == 1 && l == 4) {
++				memcpy(nt.mask, o + 2, 4);
++			} else if (code == 6 && l >= 4) {
++				memcpy(nt.dns, o + 2, 4);
++			}
++			o += 2 + l;
++		}
++		if (mt == 2 && nt.state == 1) {
++			memcpy(nt.yiaddr, d + 16, 4);
++			nt.state = 2;
++			nt.offers++;
++		} else if (mt == 5 && nt.state == 3) {
++			memcpy(nt.yiaddr, d + 16, 4);
++			nt.state = 4;
++		}
++		return;
++	}
++	if (eth[23] == 1 && nt.state == 4 && memcmp(eth + 26, nt.router, 4) == 0 && eth[34] == 0 && n >= 14 + 20 + 8) {
++		unsigned seq = (unsigned)((eth[40] << 8) | eth[41]);
++
++		if (seq < 3 && nt.rtt_us[seq] == 0) {
++			nt.rtt_us[seq] = (int64_t)(nt_us() - nt.ping_t0);
++			nt.pongs++;
++		}
++	}
++}
++
++static void
++jn_net_test(void)
++{
++	uint64_t t0;
++	unsigned tries;
++
++	nt.xid = 0x53575746;
++	for (tries = 0; tries < 4 && nt.state != 2; tries++) {
++		nt.state = 1;
++		nt_dhcp(1);
++		t0 = nt_us();
++		while (nt.state == 1 && nt_us() - t0 < 2000000) {
++			wp_poll();
++			sleep_ms(5);
++		}
++	}
++	if (nt.state != 2) {
++		ev("NET: no DHCP offer after %u tries", tries);
++		return;
++	}
++	ev("NET: DHCP offer %u.%u.%u.%u from %u.%u.%u.%u, router %u.%u.%u.%u", nt.yiaddr[0], nt.yiaddr[1], nt.yiaddr[2], nt.yiaddr[3], nt.server[0],
++	    nt.server[1], nt.server[2], nt.server[3], nt.router[0], nt.router[1], nt.router[2], nt.router[3]);
++	nt.state = 3;
++	nt_dhcp(3);
++	t0 = nt_us();
++	while (nt.state == 3 && nt_us() - t0 < 3000000) {
++		wp_poll();
++		sleep_ms(5);
++	}
++	if (nt.state != 4) {
++		ev("NET: no DHCP ack");
++		return;
++	}
++	ev("NET: bound %u.%u.%u.%u mask %u.%u.%u.%u router %u.%u.%u.%u dns %u.%u.%u.%u", nt.yiaddr[0], nt.yiaddr[1], nt.yiaddr[2], nt.yiaddr[3],
++	    nt.mask[0], nt.mask[1], nt.mask[2], nt.mask[3], nt.router[0], nt.router[1], nt.router[2], nt.router[3], nt.dns[0], nt.dns[1], nt.dns[2], nt.dns[3]);
++	for (tries = 0; tries < 5 && !nt.have_mac; tries++) {
++		nt_arp_router();
++		t0 = nt_us();
++		while (!nt.have_mac && nt_us() - t0 < 500000) {
++			wp_poll();
++			sleep_ms(5);
++		}
++	}
++	if (!nt.have_mac) {
++		ev("NET: the router did not answer ARP");
++		return;
++	}
++	ev("NET: router MAC %02x%02x%02x%02x%02x%02x", nt.router_mac[0], nt.router_mac[1], nt.router_mac[2], nt.router_mac[3], nt.router_mac[4], nt.router_mac[5]);
++	for (nt.ping_seq = 0; nt.ping_seq < 3; nt.ping_seq++) {
++		nt_ping();
++		t0 = nt_us();
++		while (nt.rtt_us[nt.ping_seq] == 0 && nt_us() - t0 < 1000000) {
++			wp_poll();
++			sleep_ms(2);
++		}
++		ev("NET: ping %u: %s %lld us", nt.ping_seq, nt.rtt_us[nt.ping_seq] ? "reply" : "NO REPLY", (long long)nt.rtt_us[nt.ping_seq]);
++	}
++	ev("NET: %u of 3 pings answered", nt.pongs);
 +}
 +
 +/* one received message (HTC header: eid, flags, len, ctrl[2], seq?, ...) */
@@ -1988,8 +2239,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	if (wp_wait(&wp.wmi_ready, 5000, "WMI ready")) {
 +		wp_scan();
 +		if (g_wlan_probe >= 7 && wp.scan_done && jn_join()) {
-+			/* connected: listen for 20 s */
-+			for (unsigned t = 0; t < 20000; t += 10) {
++			jn_net_test();
++			for (unsigned t = 0; t < 5000; t += 10) {
 +				wp_poll();
 +				sleep_ms(10);
 +			}
@@ -2002,7 +2253,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2316,14 +4303,23 @@
+@@ -2316,14 +4554,23 @@
  		g_events[0] = 0;
  	}
  	ev("WLAN probe: registers mapped at %p", regs);
