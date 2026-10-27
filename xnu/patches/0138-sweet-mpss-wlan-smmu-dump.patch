@@ -3348,7 +3348,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  				/* 1. Outbound SMP2P setup */
  				if (tick <= 100 || tick % 200 == 0) {
  					sweet_smp2p_setup_outbound(phdr, part_size);
-@@ -3201,7 +6377,53 @@
+@@ -3201,7 +6377,55 @@
  	} else {
  		printf("SWEET SMEM: Partition 7 (hosts 0:1) not found!\n");
  	}
@@ -3373,6 +3373,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	g_crash_seen = false;
 +	g_modem_crashed = false;
 +	g_wlan_crashed = false;
++	g_events_length = 0;                    /* the 16 KB log was full: keep the story of this restart */
++	g_events[0] = 0;
 +	if (g_wlan_probe >= 8) {
 +		wlan_rails_cycle();
 +	}

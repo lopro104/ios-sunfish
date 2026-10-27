@@ -758,3 +758,7 @@ STILL UNKNOWN: why the WLAN firmware dies 30-260 s after a join ("Task starvatio
 QDSS clock, rails/RF clock, CE1/5/8-11 rings of ath10k's host config (128 entries), STA keepalive/PS params/pdev params of ath10k_mac_start, WLFW INI (fw log
 mode 0). Not tried: HT rates/VHT in PEER_ASSOC, WMM params, TXBF, interrupts/host_ie, RRI-in-DDR.
 Also: the default route stays on USB; a scoped route makes Wi-Fi testable: `route add -ifscope ew0 default 192.168.1.1; ping -b ew0 1.1.1.1` (6 ms).
+
+## 2026-10-28 00:55 handoff note (Wi-Fi session)
+Full state, facts and open problems for the next agent: research/wifi/HANDOFF.md (git-ignored, on this PC). The usage limit ends at 04:21; packing up starts 04:15.
+tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (run on the phone). A soak test (30 s ping loop over ew0) showed crash -> modem restart -> link back.
