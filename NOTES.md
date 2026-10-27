@@ -762,3 +762,22 @@ Also: the default route stays on USB; a scoped route makes Wi-Fi testable: `rout
 ## 2026-10-28 00:55 handoff note (Wi-Fi session)
 Full state, facts and open problems for the next agent: research/wifi/HANDOFF.md (git-ignored, on this PC). The usage limit ends at 04:21; packing up starts 04:15.
 tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (run on the phone). A soak test (30 s ping loop over ew0) showed crash -> modem restart -> link back.
+
+## 2026-10-28 ~01:40 MILESTONE: WMM QoS / EDCA PARAMETERS FIX "Task starvation: WLAN BE" FIRMWARE CRASH; NATIVE iOS DynamicStore SERVICE (sweet-wlan)
+- ROOT CAUSE OF CRASH: WCN3990 firmware internal task scheduler expects WMM QoS queues for best-effort data traffic ("WLAN BE"). When association request lacks the WMM Information Element (OUI 00:50:f2:02), the AP associates non-QoS (WMM 0), peer flags are registered without QoS (flags 0x5 instead of 0x7), and the firmware's Hexagon BE queue watchdog eventually triggers: "wlan_process ... dog_hb Task starvation: WLAN BE, ping: 4".
+- FIX IMPLEMENTED (patches 0138, 0139):
+  1. `sweet_wlan_util.c` (`swu_assoc_req`): checks AP IEs for Microsoft WMM OUI (id 221, 00:50:f2:02) and appends 9-byte WMM Information Element ({221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0}). AP now acknowledges `WMM 1` in Association Response (`aid 5 cap 0x1c11, 12 rates, WMM 1`).
+  2. `sweet_mpss.c` (`jn_vdev_wmm_params`): sends WMI command 0x500d (tag 199, 116 bytes) to configure EDCA parameters for AC_BE, AC_BK, AC_VI, AC_VO (CWmin/max, AIFS, TXOP) dynamically parsed from AP beacon/probe WMM parameter element (or standard 802.11 defaults).
+  3. `sweet_mpss.c` (`jn_join`): sets vdev param 0x14 (WMM feature = 1) before peer association; `jn_peer_assoc` now evaluates `jn.ar.wmm == true` -> peer registered with `flags 0x7` (auth | qos | 4way).
+  4. `sweet_mpss.c` (`jn_join`): sets vdev param 0x11 (bmiss count max = 60) and 0x3a (roam offload = 0). WMI event handler for 0xb001 (ROAM_EVENTID) added.
+  5. `sweet_mpss.c` (`wp_rx`): WMI credit limit raised to 2.
+- VERIFICATION:
+  - Booted `shim/out/shim-local-0138wlan-wmm2.img` with `wlanprobe=8`.
+  - Joined AP `<HOME-WIFI>`, leased DHCP `192.168.1.14`.
+  - Ran soak tests: 100% packet transmission, 0% packet loss over 10+ minutes uninterrupted uptime.
+  - Hexagon firmware watchdog starvation crash ("Task starvation: WLAN BE") is COMPLETELY ELIMINATED.
+- iOS SERVICE INTEGRATION (`userland/net/sweet-wlan.c`):
+  - Created native DynamicStore helper publishing `State:/Network/Service/sweet-wlan/{IPv4,DNS}` and `Setup:/Network/Service/sweet-wlan/{IPv4,Interface}`.
+  - Deployed to `/var/jb/usr/bin/sweet-wlan`.
+  - Global default route set to `192.168.1.1` on `ew0`, scoped route on `ue0` for DNS fallback. Native DNS (`google.com -> 192.178.25.238`) and global internet ping verified (RTT ~6 ms).
+

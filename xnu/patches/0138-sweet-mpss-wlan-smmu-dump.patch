@@ -123,7 +123,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  #define WLFW_HOST_CAP           0x34
  
  enum { WL_IDLE, WL_IND_REG, WL_HOST_CAP, WL_MSA_INFO, WL_MSA_READY, WL_CAP, WL_BDF, WL_CAL, WL_WAIT_READY, WL_CFG, WL_MODE, WL_DONE, WL_FAILED };
-@@ -2301,12 +2367,3082 @@
+@@ -2301,12 +2367,3169 @@
  	}
  }
  
@@ -1726,6 +1726,85 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +}
 +
 +static bool
++jn_vdev_wmm_params(void)
++{
++	uint8_t c[140];
++	struct {
++		uint32_t vdev_id;
++		struct {
++			uint32_t dummy;
++			uint32_t cwmin;
++			uint32_t cwmax;
++			uint32_t aifs;
++			uint32_t txop;
++			uint32_t acm;
++			uint32_t no_ack;
++		} ac[4];
++	} cmd;
++	uint32_t n;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.vdev_id = 0;
++	/* Standard 802.11 STA EDCA defaults */
++	cmd.ac[0].cwmin = 15;
++	cmd.ac[0].cwmax = 1023;
++	cmd.ac[0].aifs = 3;
++	cmd.ac[0].txop = 0;
++
++	cmd.ac[1].cwmin = 15;
++	cmd.ac[1].cwmax = 1023;
++	cmd.ac[1].aifs = 7;
++	cmd.ac[1].txop = 0;
++
++	cmd.ac[2].cwmin = 7;
++	cmd.ac[2].cwmax = 15;
++	cmd.ac[2].aifs = 2;
++	cmd.ac[2].txop = 3008;
++
++	cmd.ac[3].cwmin = 3;
++	cmd.ac[3].cwmax = 7;
++	cmd.ac[3].aifs = 2;
++	cmd.ac[3].txop = 1504;
++
++	if (jn.bss >= 0 && (unsigned)jn.bss < wp.nbss) {
++		const uint8_t *ies = wp.bss[jn.bss].ie;
++		size_t ies_len = wp.bss[jn.bss].ie_len;
++		for (size_t o = 0; o + 2 <= ies_len;) {
++			uint8_t id = ies[o], l = ies[o + 1];
++			if (o + 2 + l > ies_len) {
++				break;
++			}
++			if (id == 221 && l >= 24 &&
++			    ies[o + 2] == 0x00 && ies[o + 3] == 0x50 && ies[o + 4] == 0xf2 &&
++			    ies[o + 5] == 2 && ies[o + 6] == 1) {
++				const uint8_t *rec = ies + o + 8;
++				for (int i = 0; i < 4; i++, rec += 4) {
++					int aci = (rec[0] >> 5) & 3;
++					int acm = (rec[0] >> 4) & 1;
++					int aifsn = rec[0] & 0xf;
++					int ecwmin = rec[1] & 0xf;
++					int ecwmax = (rec[1] >> 4) & 0xf;
++					uint16_t txop = (uint16_t)(rec[2] | (rec[3] << 8));
++					if (aci >= 0 && aci < 4) {
++						cmd.ac[aci].aifs = aifsn < 2 ? 2 : aifsn;
++						cmd.ac[aci].cwmin = (1u << ecwmin) - 1;
++						cmd.ac[aci].cwmax = (1u << ecwmax) - 1;
++						cmd.ac[aci].txop = (uint32_t)txop * 32;
++						cmd.ac[aci].acm = acm;
++					}
++				}
++				ev("JOIN: WMM params from AP applied");
++				break;
++			}
++			o += 2u + l;
++		}
++	}
++
++	n = wp_cmd(c, 0x500d, 199, &cmd, sizeof(cmd));
++	return wp_wmi("vdev set wmm", c, n);
++}
++
++static bool
 +jn_vdev_start(void)
 +{
 +	uint8_t c[128];
@@ -1875,6 +1954,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	case 0x6001:
 +		jn.kicked = true;
 +		ev("JOIN: firmware kickout of the AP");
++		return true;
++	case 0xb001:                                            /* ROAM_EVENTID */
++		ev("JOIN: ROAM event reason %u rssi %d", v[1], (int)v[2]);
 +		return true;
 +	case 0x5003:                                            /* INSTALL_KEY_COMPLETE */
 +	case 0x6006:                                            /* PEER_ASSOC_CONF */
@@ -2063,7 +2145,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	wp_fault_check("vdev start");
 +	v[0] = 0; v[1] = 0;
 +	if (!wp_wmi("power save off", c, wp_cmd(c, 0x9001, 108, v, 8)) || !jn_vdev_param(0x03, wp.bss[jn.bss].bint, "beacon interval") ||
-+	    !jn_vdev_param(0x19, jn.mgmt_rate, "management rate")) {
++	    !jn_vdev_param(0x19, jn.mgmt_rate, "management rate") ||
++	    !jn_vdev_param(0x11, 60, "bmiss count max") ||
++	    !jn_vdev_param(0x3a, 0, "roam offload disable")) {
 +		return false;
 +	}
 +	v[0] = 0; v[1] = 0; v[2] = 0; v[3] = 0;
@@ -2120,7 +2204,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	wp_fault_check("assoc");
 +	jn.aid = jn.ar.aid;
 +	swu_wpa_start(&jn.wpa, &jn_ops, NULL, jn.pmk, jn.bssid, wp_mac, jn.sta_rsn, jn.sta_rsn_len);
-+	if (!jn_vdev_param(0x0d, jn.dtim, "dtim period") || !jn_peer_assoc()) {
++	if (!jn_vdev_param(0x0d, jn.dtim, "dtim period") ||
++	    !jn_vdev_param(0x14, 1, "feature wmm") ||
++	    !jn_vdev_wmm_params() ||
++	    !jn_peer_assoc()) {
 +		return false;
 +	}
 +	{
@@ -2766,7 +2853,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		}
 +		for (uint32_t k = 0; rid == 1 && k + 4 <= rl; k += 4) {
 +			if (wp.wmi_eid && pl[o + 4 + k] == wp.wmi_eid) {
-+				wp.wmi_credits = MIN(wp.wmi_credits + pl[o + 4 + k + 1], 1u);
++				wp.wmi_credits = MIN(wp.wmi_credits + pl[o + 4 + k + 1], 2u);
 +			}
 +		}
 +		o += 4u + rl;
@@ -3207,7 +3294,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	if (regs == NULL) {
  		ev("WLAN probe: cannot map the chip's registers");
  		return;
-@@ -2316,14 +5452,25 @@
+@@ -2316,14 +5539,25 @@
  		g_events[0] = 0;
  	}
  	ev("WLAN probe: registers mapped at %p", regs);
@@ -3235,7 +3322,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		wlfw_dma_test(regs);
  	}
  }
-@@ -2379,6 +5526,8 @@
+@@ -2379,6 +5613,8 @@
  static bool
  wlfw_assign(uint64_t addr, uint64_t size, bool secure)
  {
@@ -3244,7 +3331,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	vm_offset_t page = 0;
  	uint8_t *p;
  	uint64_t answer = ~0ull, phys;
-@@ -2409,6 +5558,17 @@
+@@ -2409,6 +5645,17 @@
  	scm_fifth = phys + 256;
  	result = scm("to share the WLAN memory", SCM_64 | SCM_SIP | SCM_MP_ASSIGN, SCM_ARGS_ASSIGN, phys + 64, 16, phys, &answer);
  	ev("WLFW assign_mem %#llx +%#llx (%s): %d", addr, size, secure ? "secure" : "shared", result);
@@ -3262,7 +3349,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	return result == 0;
  }
  
-@@ -2526,7 +5686,7 @@
+@@ -2526,7 +5773,7 @@
  {
  	uint32_t at = 7;
  
@@ -3271,7 +3358,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		wlfw_fail("request", result, error);
  		ev("WLFW request %#x was refused", msg);
  		return;
-@@ -2644,6 +5804,14 @@
+@@ -2644,6 +5891,14 @@
  	case WL_MODE:
  		g_wlfw.state = WL_DONE;
  		ev("WLFW configured in mission mode");
@@ -3286,7 +3373,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		if (g_wlan_probe) {
  			wlfw_probe_hw();
  		}
-@@ -2711,7 +5879,12 @@
+@@ -2711,7 +5966,12 @@
  	uint32_t client = WLFW_CLIENT_ID;
  
  	if (g_wlfw.state != WL_IDLE) {
@@ -3300,7 +3387,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	}
  	g_tftp_ch = ch;
  	g_wlfw.known = true;
-@@ -3089,16 +6262,9 @@
+@@ -3089,16 +6349,9 @@
  }
  
  static void
@@ -3319,7 +3406,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  
  	/* Map SMEM header once to log status */
  	volatile uint8_t *hdr_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY, PAGE_SIZE, WIMG_WCOMB);
-@@ -3156,16 +6322,26 @@
+@@ -3156,16 +6409,26 @@
  			    phdr, part_phys, part_size, phdr9, p9_phys, p9_size);
  
  			/* Fast poll loop: 50 ms ticks = 20 Hz */
@@ -3348,12 +3435,12 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  				/* 1. Outbound SMP2P setup */
  				if (tick <= 100 || tick % 200 == 0) {
  					sweet_smp2p_setup_outbound(phdr, part_size);
-@@ -3201,7 +6377,55 @@
+@@ -3201,7 +6464,55 @@
  	} else {
  		printf("SWEET SMEM: Partition 7 (hosts 0:1) not found!\n");
  	}
 +}
-+
+ 
 +/* everything the host remembers about the running modem, for the next boot */
 +static void
 +mpss_restart_cleanup(void)
@@ -3379,7 +3466,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		wlan_rails_cycle();
 +	}
 +}
- 
++
 +static void
 +mpss_thread(void *arg, wait_result_t result)
 +{

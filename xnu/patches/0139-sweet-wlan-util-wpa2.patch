@@ -6,7 +6,7 @@ diff --git a/bsd/dev/sweet_wlan_util.c b/bsd/dev/sweet_wlan_util.c
 new file mode 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_wlan_util.c
-@@ -0,0 +1,739 @@
+@@ -0,0 +1,758 @@
 +/*
 + * 802.11 frames and the WPA2-PSK (CCMP) 4-way handshake for the WCN3990 station (sweet_mpss.c).
 + * Self-contained: SHA-1, HMAC-SHA-1, AES-128 (decrypt only, for the RFC 3394 key unwrap) so that it does not depend on
@@ -391,16 +391,30 @@ new file mode 100644
 +	return (size_t)(p - out);
 +}
 +
-+/* association request: capabilities, listen interval, SSID, the AP's rates (up to 8 + extended), the RSN element if any */
++/* association request: capabilities, listen interval, SSID, the AP's rates (up to 8 + extended), the RSN element if any, WMM if AP supports it */
 +size_t
 +swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a)
 +{
 +	uint8_t *p = f;
 +	const uint8_t *rates = swu_ie_find(a->ap_ies, a->ap_ies_len, 1);
 +	const uint8_t *ext = swu_ie_find(a->ap_ies, a->ap_ies_len, 50);
++	bool ap_has_wmm = false;
 +
-+	if (size < 24 + 4 + 2 + 32 + 2 + 8 + 2 + 255 + 2 + 22 || !rates) {
++	if (size < 24 + 4 + 2 + 32 + 2 + 8 + 2 + 255 + 2 + 22 + 12 || !rates) {
 +		return 0;
++	}
++	for (size_t o = 0; o + 2 <= a->ap_ies_len;) {
++		uint8_t id = a->ap_ies[o], l = a->ap_ies[o + 1];
++		if (o + 2 + l > a->ap_ies_len) {
++			break;
++		}
++		if (id == 221 && l >= 6 &&
++		    a->ap_ies[o + 2] == 0x00 && a->ap_ies[o + 3] == 0x50 && a->ap_ies[o + 4] == 0xf2 &&
++		    a->ap_ies[o + 5] == 2) {
++			ap_has_wmm = true;
++			break;
++		}
++		o += 2u + l;
 +	}
 +	mgmt_hdr(f, 0x0, a->bssid, a->sa);
 +	p += 24;
@@ -414,6 +428,11 @@ new file mode 100644
 +	if (a->rsn_ie) {
 +		memcpy(p, a->rsn_ie, a->rsn_ie_len);
 +		p += a->rsn_ie_len;
++	}
++	if (ap_has_wmm) {
++		static const uint8_t wmm_ie[9] = { 221, 7, 0x00, 0x50, 0xf2, 2, 0, 1, 0 };
++		memcpy(p, wmm_ie, 9);
++		p += 9;
 +	}
 +	return (size_t)(p - f);
 +}
