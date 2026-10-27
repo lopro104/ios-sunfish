@@ -49,7 +49,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	uint32_t num_intents;
  };
  
-@@ -1405,6 +1430,1226 @@
+@@ -1405,6 +1430,1255 @@
  	note("[GLINK sent v1]");
  }
  
@@ -849,6 +849,32 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	uint8_t out[WLFW_OUT_MAX];
 +} g_wlfw;
 +static uint8_t g_wlfw_bdf[WLFW_BDF_MAX];
++static uint32_t g_wlan_probe;            /* boot-arg wlanprobe=1: read the chip's copy-engine registers once the mode is set */
++
++#define WCN_MMIO                0x18800000ull
++#define WCN_MMIO_SIZE           0x800000u
++#define WCN_CE_BASE             0x240000u               /* ce0; each next copy engine 0x1000 on */
++#define WIMG_IO                 0x7u                    /* VM_WIMG_IO: guarded, coherent, not cacheable */
++
++/* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
++static void
++wlfw_probe_hw(void)
++{
++	volatile uint32_t *regs = (volatile uint32_t *)ml_io_map_unmappable(WCN_MMIO, WCN_MMIO_SIZE, WIMG_IO);
++
++	if (regs == NULL) {
++		ev("WLAN probe: cannot map the chip's registers");
++		return;
++	}
++	ev("WLAN probe: registers mapped at %p", regs);
++	for (unsigned ce = 0; ce < 12; ce++) {
++		uint32_t base = (WCN_CE_BASE + 0x1000 * ce) / 4;
++
++		/* sr_size 0x8, dr_size 0x14, current_srri 0x44, current_drri 0x48 */
++		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
++		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
++	}
++}
 +
 +static void
 +qmi_put_header(uint8_t *p, uint16_t txn, uint16_t msg)
@@ -1165,7 +1191,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		break;
 +	case WL_MODE:
 +		g_wlfw.state = WL_DONE;
-+		ev("WLFW configured: waiting for the firmware to say it is ready");
++		ev("WLFW configured in mission mode");
++		if (g_wlan_probe) {
++			wlfw_probe_hw();
++		}
 +		break;
 +	default:
 +		break;
@@ -1276,7 +1305,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  static void
  sweet_glink_poll(void)
  {
-@@ -1525,7 +2770,14 @@
+@@ -1525,7 +2799,14 @@
  				} pair;
  				uint32_t pair_off = (rx_tail + (uint32_t)sizeof(msg) + i * 8) % g_glink.rx_size;
  				sweet_glink_rx_peek(&g_glink, pair_off, &pair, sizeof(pair));
@@ -1292,7 +1321,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					ch->intents[ch->num_intents].size = pair.size;
  					ch->intents[ch->num_intents].iid = pair.iid;
  					ch->intents[ch->num_intents].in_use = false;
-@@ -1537,15 +2789,21 @@
+@@ -1537,15 +2818,21 @@
  		}
  		case GLINK_CMD_RX_DONE:
  		case GLINK_CMD_RX_DONE_W_REUSE: {
@@ -1318,7 +1347,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  				}
  			}
  			sweet_glink_rx_advance(&g_glink, sizeof(msg));
-@@ -1559,7 +2817,9 @@
+@@ -1559,7 +2846,9 @@
  			uint32_t data_pkt_sz = (sizeof(tdata) + tdata.chunk_size + 7) & ~7;
  			if (avail < data_pkt_sz) return;
  
@@ -1329,7 +1358,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  			uint32_t data_off = (rx_tail + (uint32_t)sizeof(tdata)) % g_glink.rx_size;
  			sweet_glink_rx_peek(&g_glink, data_off, payload, MIN(tdata.chunk_size, sizeof(payload)));
  
-@@ -1613,7 +2873,7 @@
+@@ -1613,7 +2902,7 @@
  
  					/* Announce local services */
  					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 14, 1, 14);     /* RMTFS */
@@ -1338,7 +1367,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					sweet_qrtr_announce_server(ch, qhdr->src_node_id, 4096, 1, 4096); /* TFTP */
  				} else if (qtype == QRTR_TYPE_NEW_SERVER) {
  					struct qrtr_ctrl_pkt *cp = (struct qrtr_ctrl_pkt *)(payload + sizeof(*qhdr));
-@@ -1621,9 +2881,22 @@
+@@ -1621,9 +2910,22 @@
  					    cp->server.service, cp->server.instance, cp->server.node, cp->server.port);
  					note("[QRTR svc %u inst %#x port %u]",
  					    cp->server.service, cp->server.instance, cp->server.port);
@@ -1361,7 +1390,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					} else {
  						printf("SWEET QRTR DATA: p%u -> p%u sz %u\n",
  						    qhdr->src_port_id, qhdr->dst_port_id, qhdr->size);
-@@ -1634,6 +2907,36 @@
+@@ -1634,6 +2936,36 @@
  			}
  			break;
  		}
@@ -1398,7 +1427,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		case GLINK_CMD_SIGNALS: {
  			printf("SWEET GLINK RX: SIGNALS rcid %u sigs %#x\n", msg.param1, msg.param2);
  			sweet_glink_rx_advance(&g_glink, sizeof(msg));
-@@ -1750,7 +3053,14 @@
+@@ -1750,7 +3082,14 @@
  
  			/* Fast poll loop: 50 ms ticks = 20 Hz */
  			for (int tick = 1; tick <= 12000; tick++) {
@@ -1414,7 +1443,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  
  				/* 1. Outbound SMP2P setup */
  				if (tick <= 100 || tick % 200 == 0) {
-@@ -1831,6 +3141,16 @@
+@@ -1831,6 +3170,16 @@
  SYSCTL_PROC(_kern, OID_AUTO, sweet_mpss, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
      sysctl_mpss_report, "A", "MPSS boot and SMEM report");
  
@@ -1431,3 +1460,11 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  void
  sweet_mpss_init(void)
  {
+@@ -1842,6 +3191,7 @@
+ 		return;
+ 	}
+ 	started = true;
++	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
+ 	if (kernel_thread_start(mpss_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
