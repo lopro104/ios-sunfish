@@ -3764,8 +3764,26 @@ install(void)
 	size_t size = sizeof(arguments) - 1;
 	const char *argument;
 
-	/* the kernel's boot-args are where a run is told things */
+	/*
+	 * The kernel's boot-args are where a run is told things; ios-sunfish: and /usr/lib/sunfish-gl.args, which is
+	 * added to them (to try a setting with a respring instead of a reboot).
+	 */
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
+		FILE *more = fopen("/usr/lib/sunfish-gl.args", "r");
+
+		if (more != NULL) {
+			size_t used = strlen(arguments);
+
+			if (used + 2 < sizeof(arguments)) {
+				arguments[used++] = ' ';
+				used += fread(arguments + used, 1, sizeof(arguments) - 1 - used, more);
+				arguments[used] = 0;
+				for (char *c = arguments; *c != 0; c++) {
+					*c = *c == '\n' ? ' ' : *c;
+				}
+			}
+			fclose(more);
+		}
 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
 			if (*argument == '-') {

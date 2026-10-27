@@ -1,0 +1,82 @@
+From: ios-sunfish
+Subject: [PATCH] sweet fb: boot-arg sweetfb_gpuwait=1, the display waits for the GPU (RedwoodWaitsForGPU)
+
+The GL layer then skips its glFinish before each swap; the vsync timer copies a swap in once
+the GPU has finished every submission it had when the swap came (at most 10 ticks late).
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 04:10:13.461391349 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 04:10:39.580281690 +0200
+@@ -52,6 +52,11 @@
+ 
+ /* osfmk/arm64/machine_routines.c; its header keeps it to Mach/pexpert code */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* bsd/dev/sweet_adreno.c: the GPU's submissions (SweetGPU.cpp) */
++extern "C" bool sweet_gpu_ready(void);
++extern "C" bool sweet_gpu_done(uint32_t fence);
++extern "C" uint32_t sweet_gpu_last(void);
++static uint32_t sweet_fb_fence_late;   /* swaps shown before the GPU was done (logged) */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -133,6 +138,9 @@
+ 	bool          fConsolePaused;
+ 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+ 	bool          fDirty;
++	bool          fGPUWaits;      /* boot-arg sweetfb_gpuwait=1: a swap is shown once the GPU is done with it */
++	uint32_t      fPendingFence;  /* the GPU's last submission when the pending swap came; 0: none */
++	uint32_t      fFenceTicks;    /* vsync ticks the pending swap has waited for it */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -305,6 +313,18 @@
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 
++	/*
++	 * Boot-arg sweetfb_gpuwait=1: "RedwoodWaitsForGPU", the display waits for the GPU. The GL layer
++	 * (userland/gpu/eagl.c) then only sends a frame's commands out before the swap, and does not
++	 * glFinish (on the drawing thread, half of a busy frame's time); the vsync timer copies a swap
++	 * in once the GPU is done with everything it had been given when the swap came.
++	 */
++	uint32_t gpuwait = 0;
++	PE_parse_boot_argn("sweetfb_gpuwait", &gpuwait, sizeof(gpuwait));
++	fGPUWaits = gpuwait != 0;
++	if (fGPUWaits) {
++		setProperty("RedwoodWaitsForGPU", true);
++	}
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -369,12 +389,23 @@
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	if (flush && fb->fPendingFence != 0 && !sweet_gpu_done(fb->fPendingFence)) {
++		/* the GPU is still drawing it: the next tick (and after 10 ticks, as it is) */
++		if (++fb->fFenceTicks < 10) {
++			flush = false;
++		} else if (sweet_fb_fence_late++ < 8) {
++			IOLog("SWEET FB: the GPU was not done with a swap after 10 vsyncs (fence %u): shown as it is\n",
++			    fb->fPendingFence);
++		}
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			fb->fPendingFence = 0;
++			fb->fFenceTicks = 0;
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -527,6 +558,8 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fPendingFence = fGPUWaits && sweet_gpu_ready() ? sweet_gpu_last() : 0;
++	fFenceTicks = 0;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);

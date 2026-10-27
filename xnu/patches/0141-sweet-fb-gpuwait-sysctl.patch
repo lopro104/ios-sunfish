@@ -1,0 +1,56 @@
+From: ios-sunfish
+Subject: [PATCH] sweet fb: sysctl kern.sweetfb_gpuwait switches 0140 at run time
+
+---
+--- a/bsd/dev/sweet_sample.c	2026-10-27 05:10:27.674959428 +0200
++++ b/bsd/dev/sweet_sample.c	2026-10-27 05:10:27.683918127 +0200
+@@ -90,6 +90,15 @@
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_bigcore, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_bigcore, "I", "bind the calling thread to big core N (6, 7; -1 unbinds)");
+ 
++/*
++ * kern.sweetfb_gpuwait=0|1 (root): the display waits for the GPU before it shows a swap
++ * (SweetFramebuffer.cpp, boot-arg sweetfb_gpuwait); the GL layer reads RedwoodWaitsForGPU when
++ * backboardd starts, so restart it after a change.
++ */
++int sweet_fb_gpu_waits = -1;    /* -1: the boot-arg's (SweetFramebuffer.cpp sets it at start) */
++SYSCTL_INT(_kern, OID_AUTO, sweetfb_gpuwait, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_gpu_waits, 0,
++    "the display waits for the GPU before it shows a swap");
++
+ static int
+ sweet_prof_find(proc_t p, __unused void *arg)
+ {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 05:10:27.671376818 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-27 05:10:27.684040921 +0200
+@@ -57,6 +57,7 @@
+ extern "C" bool sweet_gpu_done(uint32_t fence);
+ extern "C" uint32_t sweet_gpu_last(void);
+ static uint32_t sweet_fb_fence_late;   /* swaps shown before the GPU was done (logged) */
++extern "C" int sweet_fb_gpu_waits;      /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_gpuwait */
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -325,6 +326,7 @@
+ 	if (fGPUWaits) {
+ 		setProperty("RedwoodWaitsForGPU", true);
+ 	}
++	sweet_fb_gpu_waits = fGPUWaits;
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+@@ -388,6 +390,15 @@
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
++	if ((sweet_fb_gpu_waits != 0) != fb->fGPUWaits && sweet_fb_gpu_waits >= 0) {
++		/* kern.sweetfb_gpuwait changed */
++		fb->fGPUWaits = sweet_fb_gpu_waits != 0;
++		fb->fPendingFence = 0;
++		IOLockUnlock(fb->fLock);
++		fb->setProperty("RedwoodWaitsForGPU", fb->fGPUWaits);
++		IOLog("SWEET FB: the display %s for the GPU\n", fb->fGPUWaits ? "waits" : "does not wait");
++		IOLockLock(fb->fLock);
++	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	if (flush && fb->fPendingFence != 0 && !sweet_gpu_done(fb->fPendingFence)) {
+ 		/* the GPU is still drawing it: the next tick (and after 10 ticks, as it is) */
