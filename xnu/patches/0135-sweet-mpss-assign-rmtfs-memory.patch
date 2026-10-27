@@ -1,0 +1,104 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -58,6 +58,12 @@
+ #define SCM_THREE_VALUES        3
+ #define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
+ #define SCM_INTERRUPTED         1
++/* qcom_scm_assign_mem(): QCOM_SCM_SVC_MP (0xc), QCOM_SCM_MP_ASSIGN (0x16), 7 arguments: RO, VAL, RO, VAL, RO, VAL, VAL */
++#define SCM_MP_ASSIGN           SCM_CALL(0xc, 0x16)
++#define SCM_ARGS_ASSIGN         (7u | 1u << 4 | 1u << 8 | 1u << 12)
++#define VMID_HLOS               3u
++#define VMID_MSS_MSA            0xfu
++#define SCM_PERM_RW             6u
+ 
+ #define ELF_PT_LOAD             1
+ #define MDT_TYPE_HASH           (2u << 24)
+@@ -90,11 +96,16 @@
+ 	delay_for_interval(ms, 1000 * 1000);
+ }
+ 
++/* The fifth SMC argument (x5) of the next scm() call: a call with more than 4 arguments passes the rest in a buffer. */
++static uint64_t scm_fifth;
++
+ static int32_t
+ scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second, uint64_t third,
+     uint64_t *answer)
+ {
+-	uint64_t session = 0;
++	uint64_t session = 0, fifth = scm_fifth;
++
++	scm_fifth = 0;
+ 
+ 	printf("SWEET MPSS: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n", what, function, first,
+ 	    second, third);
+@@ -104,7 +115,7 @@
+ 		register uint64_t x2 __asm__("x2") = first;
+ 		register uint64_t x3 __asm__("x3") = second;
+ 		register uint64_t x4 __asm__("x4") = third;
+-		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x5 __asm__("x5") = fifth;
+ 		register uint64_t x6 __asm__("x6") = session;
+ 		register uint64_t x7 __asm__("x7") = 0;
+ 
+@@ -221,6 +232,52 @@
+ 	return segment->type == ELF_PT_LOAD && (segment->flags & (7u << 24)) != MDT_TYPE_HASH && segment->memsz != 0;
+ }
+ 
++/*
++ * The memory the modem's remote file system service (RMTFS, below) shares with the modem: TrustZone's
++ * memory protection lets only its owners reach it, and the modem faults on it (Hexagon fs:0x19e, a bus
++ * error) unless it is shared with the modem's VMID. As Linux does (rmtfs_mem.c: qcom,vmid =
++ * MSS_MSA; qcom_scm.c qcom_scm_assign_mem()): owned by HLOS only -> HLOS and MSS_MSA, read/write.
++ */
++#define RMTFS_ASSIGN_PHYS       0xfde01000ull
++#define RMTFS_ASSIGN_SIZE       0x600000ull
++
++static bool
++mpss_assign_rmtfs(void)
++{
++	vm_offset_t page = 0;
++	uint8_t *p;
++	uint64_t answer = ~0ull, phys;
++	int32_t result;
++
++	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return false;
++	}
++	p = (uint8_t *)page;
++	phys = kvtophys(page);
++	/* +0: the source VM list; +64: the memory (address, size); +128: the new owners; +256: arguments 4 to 7 */
++	*(uint32_t *)(p + 0) = VMID_HLOS;
++	*(uint64_t *)(p + 64) = RMTFS_ASSIGN_PHYS;
++	*(uint64_t *)(p + 72) = RMTFS_ASSIGN_SIZE;
++	/* struct qcom_scm_current_perm_info: vmid, perm, ctx (u64), ctx_size, unused */
++	*(uint32_t *)(p + 128) = VMID_HLOS;
++	*(uint32_t *)(p + 132) = SCM_PERM_RW;
++	*(uint32_t *)(p + 152) = VMID_MSS_MSA;
++	*(uint32_t *)(p + 156) = SCM_PERM_RW;
++	*(uint64_t *)(p + 256) = 4;             /* source list size */
++	*(uint64_t *)(p + 264) = phys + 128;    /* new owners */
++	*(uint64_t *)(p + 272) = 48;            /* their size: 2 x 24 */
++	*(uint64_t *)(p + 280) = 0;
++	for (int o = 0; o < 512; o += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (p + o) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	scm_fifth = phys + 256;
++	result = scm("to share the rmtfs memory with the modem", SCM_64 | SCM_SIP | SCM_MP_ASSIGN, SCM_ARGS_ASSIGN,
++	    phys + 64, 16, phys, &answer);        /* the (address, size) record and its size; the source list */
++	note("[assign_mem %d,%#llx]", result, answer);
++	return result == 0;
++}
++
+ static bool
+ mpss_start(void)
+ {
+@@ -346,6 +403,7 @@
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	note("[%u segments copied, first word after %#llx]", loaded, mpss_first_word());
++	printf("SWEET MPSS: rmtfs memory shared with the modem: %s\n", mpss_assign_rmtfs() ? "yes" : "NO");
+ 	if (scm("to authenticate the modem and start it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE, PAS_MODEM,
+ 	    0, 0, &answer) != 0 || answer != 0) {
+ 		printf("SWEET MPSS: TrustZone does not authenticate/start the modem (%#llx)\n", answer);
