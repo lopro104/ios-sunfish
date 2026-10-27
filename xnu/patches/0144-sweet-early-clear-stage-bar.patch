@@ -1,0 +1,28 @@
+From: sunfish-gpu
+Subject: [PATCH] sweet_early: black out the stage bar when the early console hands over
+
+The green to yellow strip at the bottom of the verbose boot (user photo,
+2026-10-27) was the rest of sweet_early_mark()'s stage bar: the video
+console's 16-pixel rows stop 4 pixels short of the panel's 2340.
+---
+--- a/osfmk/arm64/sweet_early.c	2026-10-27 15:01:52.020412382 +0200
++++ b/osfmk/arm64/sweet_early.c	2026-10-27 15:01:52.030751485 +0200
+@@ -138,6 +138,18 @@
+ void
+ sweet_early_disable(void)
+ {
++	/*
++	 * Black out the stage bar (sweet_early_mark): the console that follows draws rows of 16
++	 * pixels and never reaches the panel's last 4 (2340 = 146 * 16 + 4), so a strip of the green
++	 * to yellow blocks stayed at the bottom of the verbose boot.
++	 */
++	if (!early_disabled) {
++		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++			for (unsigned int x = 0; x < EARLY_WIDTH; x++) {
++				EARLY_FB[y * EARLY_STRIDE + x] = 0xff000000u;
++			}
++		}
++	}
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
