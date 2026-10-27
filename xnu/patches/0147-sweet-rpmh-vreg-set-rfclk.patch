@@ -1,16 +1,17 @@
 diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 --- a/bsd/dev/sweet_rpmh.c
 +++ b/bsd/dev/sweet_rpmh.c
-@@ -19,6 +19,8 @@
+@@ -19,6 +19,9 @@
  
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
  int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
 +int sweet_rpmh_vreg_set(const char *res, unsigned mv);
++int sweet_rpmh_vreg_off(const char *res);
 +int sweet_rpmh_rfclk_enable(const char *res);
  int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
  int sweet_rpmh_crypto_vote(uint32_t vote);
  int sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
-@@ -376,6 +378,73 @@
+@@ -376,6 +379,105 @@
  	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
  	return error;
  }
@@ -46,6 +47,38 @@ diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
 +	}
 +out:
 +	printf("SWEET RPMH: %s %u mV: %s (errno %d)\n", res, mv, error ? "FAILED" : "on", error);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++/* the opposite: just the enable word at +4 set to 0 (the WCN3990's rails are power cycled before a modem restart) */
++int
++sweet_rpmh_vreg_off(const char *res)
++{
++	int error = EIO;
++	uint32_t address = 0;
++
++	if (!res || strncmp(res, "ldo", 3)) {
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	if (rh_poisoned) {
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, RH_VRM, &address);
++	}
++	if (!error) {
++		const uint32_t addresses[1] = {address + 4};
++		const uint32_t values[1] = {0};
++
++		error = rh_send(addresses, values, 1, res);
++	}
++out:
++	printf("SWEET RPMH: %s off: %s (errno %d)\n", res, error ? "FAILED" : "done", error);
 +	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
 +	return error;
 +}

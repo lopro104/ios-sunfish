@@ -739,3 +739,22 @@ Observed:
   only a root-domain crash sets it ("wlan_process" crashes set g_wlan_crashed instead). The first crash text of a boot is a leftover of the
   previous one (SMEM survives a warm reboot) and is ignored.
 - Event log is now 16 KB (a 32 KB one once left the phone at the Apple logo; unrelated or not, unknown).
+
+## 2026-10-28 ~15:10 MILESTONE: Wi-Fi SURVIVES FIRMWARE CRASHES: the modem is restarted and the link comes back (wlanprobe=8, patches 0138/0147)
+Why the crash handling was hard: a crash of the modem's wlan_process domain is ESCALATED by the modem to a whole-modem fatal (SMEM item 421 text, SMP2P
+slave-kernel bit 0); the modem does not respawn the domain (PDR is off on this SKU: we answer 0 domains for tms/pdr_enabled, as stock does). Android recovers
+with a full subsystem restart. Research (agent, ~/ACK-sunfish-7.2 qcom_q6v5*.c, smp2p.c): the host shuts the modem down through PAS and boots it again.
+Implemented (bsd/dev/sweet_mpss.c): mpss_thread is now a loop mpss_start() -> mpss_run() (the SMEM/GLINK/RMTFS/TFTP poll loop, no longer limited to 10
+minutes) -> on g_wlan_crashed/g_modem_crashed (two seconds grace) mpss_restart_cleanup() (wlan thread stopped, g_glink/g_wlfw/tftp/rmtfs state zeroed,
+WCN3990 rails power cycled via sweet_rpmh_vreg_off + vote on) -> mpss_start() again; WLFW re-handshakes, wlfw_probe_hw restarts the service thread
+(wlfw_wmi_bringup restart path keeps the DMA pool, SMMU bank, ew0), the station joins again.
+THE KEY FIX for the restart: the SMP2P SSR ack. Both items advertise SMP2P_FEATURE_SSR_ACK; when the modem restarts it toggles RESTART_DONE (flags bit 0)
+in its item and the AP must set RESTART_ACK (flags bit 1) of ITS item to the same value (sweet_smp2p_poll_inbound). Without it the restarted modem's wlan
+domain asserted at platform_main.c:platform_main_task:222 every time (a restart loop every ~7 s). With it: crash -> link down -> ~20 s -> ew0 up again,
+iOS pings the router. Test without waiting for a crash: `sysctl kern.sweet_wlan_kick=2` (fake WLAN-domain crash), `=1` (fake kick: rejoin only).
+Other fixes in this round: the SMEM crash text "SFR Init" is the modem's own start-up text (not a crash); the crash dedupe compared 128 bytes of a longer
+string (re-reported every 56 ms); a repeating TFTP/glink path was unaffected. Rail l9a (ldoa9, vdd-cx-mx, 640 mV as the Pixel's icnss node says) is voted now.
+STILL UNKNOWN: why the WLAN firmware dies 30-260 s after a join ("Task starvation: WLAN BE"; beacons stop ~20 s before, then ROAM events). Tried without effect:
+QDSS clock, rails/RF clock, CE1/5/8-11 rings of ath10k's host config (128 entries), STA keepalive/PS params/pdev params of ath10k_mac_start, WLFW INI (fw log
+mode 0). Not tried: HT rates/VHT in PEER_ASSOC, WMM params, TXBF, interrupts/host_ie, RRI-in-DDR.
+Also: the default route stays on USB; a scoped route makes Wi-Fi testable: `route add -ifscope ew0 default 192.168.1.1; ping -b ew0 1.1.1.1` (6 ms).

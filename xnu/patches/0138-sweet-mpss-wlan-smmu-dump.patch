@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -29,9 +29,27 @@
+@@ -29,9 +29,28 @@
  #include <pexpert/pexpert.h>
  #include <vm/vm_kern.h>
  #include <sys/sysctl.h>
@@ -26,28 +26,61 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
 +extern int sweet_rpmh_vreg_set(const char *res, unsigned mv);
 +extern int sweet_rpmh_rfclk_enable(const char *res);
++extern int sweet_rpmh_vreg_off(const char *res);
  extern int sweet_rpmh_crypto_vote(uint32_t vote);
  extern int sweet_rpmh_arc_votes(const char *const *res, const uint32_t *level, unsigned n);
  extern int sweet_rpmh_ddr_vote(uint32_t vote, bool send);
-@@ -85,7 +103,9 @@
+@@ -85,7 +104,12 @@
  }
  
  /* Events with the second of the modem's life they happened at (read with sysctl kern.sweet_mpss_events). */
 -static char g_events[8192];
 +static char g_events[16384];
 +static volatile bool g_modem_crashed;      /* the modem reported a crash: do not touch its memory any more */
-+static volatile bool g_wlan_crashed;       /* only the WLAN protection domain crashed (the modem restarts it): the service restarts */
++static volatile bool g_wlan_crashed;       /* the WLAN protection domain crashed: the modem as a whole is restarted (it escalates the crash) */
++static volatile bool g_wlan_thread_running;
++static char g_last_crash[128];
++static bool g_crash_seen;
  static size_t g_events_length;
  static uint32_t g_events_second;
  
-@@ -642,10 +662,23 @@
+@@ -609,6 +633,27 @@
+ 	struct smp2p_smem_item *smp = (struct smp2p_smem_item *)sweet_smem_get_entry(phdr, part_size, 435, &ssz);
+ 	if (!smp) return;
+ 
++	/*
++	 * SSR ack (smp2p.c qcom_smp2p_check_ssr / do_ssr_ack): when the modem restarts it toggles RESTART_DONE (flags bit 0) in its
++	 * item; the AP answers by making RESTART_ACK (flags bit 1) of its own item equal to it. Without that a restarted modem's SMP2P
++	 * is not usable (its WLAN domain asserted in platform_main_task at every restart).
++	 */
++	{
++		uint32_t osz = 0;
++		struct smp2p_smem_item *out = (struct smp2p_smem_item *)sweet_smem_get_entry(phdr, part_size, 428, &osz);
++
++		if (out && (smp->features & 1)) {
++			bool done = (smp->flags & 1) != 0, ack = (out->flags & 2) != 0;
++
++			if (done != ack) {
++				out->flags = (out->flags & ~2u) | (done ? 2u : 0u);
++				__asm__ volatile ("dsb sy" ::: "memory");
++				sweet_apcs_kick(14);
++				ev("SMP2P: restart ack %u (modem flags %#x)", done, smp->flags);
++			}
++		}
++	}
++
+ 	static uint16_t last_smp_valid = 0xffff;
+ 	if (tick == 1 || smp->valid_entries != last_smp_valid || tick % 200 == 0) {
+ 		printf("SWEET SMP2P 435: mag %#x, ver %u, %u->%u, valid %u/%u, flags %#x\n",
+@@ -641,11 +686,22 @@
+ 	uint32_t csz = 0;
  	char *cmsg = (char *)sweet_smem_get_entry(phdr, part_size, 421, &csz);
  	if (cmsg && cmsg[0]) {
- 		static char last_crash[128];
+-		static char last_crash[128];
 -		if (strncmp(last_crash, cmsg, sizeof(last_crash)) != 0) {
-+		static bool crash_seen;
-+		if (strncmp(last_crash, cmsg, sizeof(last_crash) - 1) != 0) {
- 			strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
+-			strncpy(last_crash, cmsg, sizeof(last_crash) - 1);
++		if (strncmp(g_last_crash, cmsg, sizeof(g_last_crash) - 1) != 0) {
++			strncpy(g_last_crash, cmsg, sizeof(g_last_crash) - 1);
 +			static unsigned ncrash;
 +
  			printf("SWEET MPSS CRASH: %s\n", cmsg);
@@ -55,18 +88,18 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			if (ncrash++ < 3) {
 +				ev("CRASH %.150s", cmsg);
 +			}
-+			if (crash_seen) {                       /* the first message may be left over from the previous boot */
++			if (g_crash_seen && strncmp(cmsg, "SFR Init", 8) != 0) {   /* a first message is left over from the previous boot; "SFR Init" is the modem's own start-up text */
 +				if (strnstr(cmsg, "wlan_process", 160) != NULL) {
-+					g_wlan_crashed = true;          /* the modem's other protection domains keep running */
++					g_wlan_crashed = true;          /* the modem escalates a user-domain crash: it needs a restart */
 +				} else {
 +					g_modem_crashed = true;
 +				}
 +			}
-+			crash_seen = true;
++			g_crash_seen = true;
  			note("[CRASH: %.50s]", cmsg);
  		}
  	}
-@@ -2103,6 +2136,15 @@
+@@ -2103,6 +2159,15 @@
  	txn = (uint16_t)(p[1] | p[2] << 8);
  	msg = (uint16_t)(p[3] | p[4] << 8);
  	msg_len = (uint16_t)(p[5] | p[6] << 8);
@@ -82,7 +115,15 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	if (msg != SERVREG_LOC_GET_DOMAINS) {
  		printf("SWEET SERVREG_LOC: unhandled message %#x from %u:%u\n", msg, qh->src_node_id, qh->src_port_id);
  		ev("SERVREG_LOC unhandled msg %#x", msg);
-@@ -2301,12 +2343,3020 @@
+@@ -2214,6 +2279,7 @@
+ #define WLFW_MSA_READY_IND      0x2b
+ #define WLFW_MSA_INFO           0x2d
+ #define WLFW_MSA_READY          0x2e
++#define WLFW_INI                0x2f
+ #define WLFW_HOST_CAP           0x34
+ 
+ enum { WL_IDLE, WL_IND_REG, WL_HOST_CAP, WL_MSA_INFO, WL_MSA_READY, WL_CAP, WL_BDF, WL_CAL, WL_WAIT_READY, WL_CFG, WL_MODE, WL_DONE, WL_FAILED };
+@@ -2301,12 +2367,3082 @@
  	}
  }
  
@@ -537,10 +578,10 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 + * rings (source CE0 = HTC control tx, CE3 = WMI tx; destination CE1 = HTT rx, CE2 = control/WMI rx), HTC ready,
 + * connect HTT and WMI, setup complete, WMI service ready -> init -> ready (the MAC address).
 + */
-+#define WP_POOL         0xc00000u
++#define WP_POOL         0x1000000u
 +#define WP_HOSTMEM      0x100000u
 +#define WP_BUF          2048u
-+#define WP_NR           9
++#define WP_NR           10
 +#define WP_HTT_FRAG     0x400000u
 +#define WP_HTT_RXRING   0x420000u
 +#define WP_HTT_ALLOCIDX 0x424000u
@@ -554,17 +595,19 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	bool src;
 +	uint32_t dmax;
 +} wp_cfg[WP_NR] = {
-+	{ 0, 32, 0x000, 0x10000, true, 0x800 },
-+	{ 3, 32, 0x400, 0x20000, true, 0x800 },
-+	{ 1, 32, 0x800, 0x30000, false, 0 },
-+	{ 2, 64, 0xc00, 0x40000, false, 0 },
-+	{ 4, 64, 0x1000, 0x60000, true, 0x100 },        /* HTT host to target: control messages and TX_FRM gather pairs */
-+	/* CE8..CE11 are target-to-host pipes in the configuration we send (pktlog, dbglog ...): the firmware writes to them on its own
-+	 * schedule, and without a destination ring they went to an uninitialised address (the repeating SMMU fault, then the crash) */
-+	{ 8, 32, 0x1400, 0x80000, false, 0 },
-+	{ 9, 32, 0x1600, 0x90000, false, 0 },
-+	{ 10, 32, 0x1800, 0xa0000, false, 0 },
-+	{ 11, 32, 0x1a00, 0xb0000, false, 0 },
++	{ 0, 32, 0x000, 0x10000, true, 0x800 },         /* 0: CE0 HTC control tx */
++	{ 3, 32, 0x400, 0x20000, true, 0x800 },         /* 1: CE3 WMI tx */
++	{ 1, 128, 0x2000, 0xc00000, false, 0 },         /* 2: CE1 HTT/HTC rx */
++	{ 2, 64, 0xc00, 0x40000, false, 0 },            /* 3: CE2 WMI rx */
++	{ 4, 64, 0x1000, 0x60000, true, 0x100 },        /* 4: CE4 HTT host to target: control messages and TX_FRM gather pairs */
++	/* The other target-to-host pipes of ath10k's host_ce_config_wlan (CE5, CE8-CE11): without a destination ring the firmware's transfers
++	 * wait for one (an unexplained repeating write fault at a garbage address), and with a small ring it stalls when the host lags.
++	 * ath10k uses 512 entries; 128 here, buffers in the pool's last 4 MiB. */
++	{ 5, 128, 0x2800, 0xc40000, false, 0 },
++	{ 8, 128, 0x3000, 0xc80000, false, 0 },
++	{ 9, 128, 0x3800, 0xcc0000, false, 0 },
++	{ 10, 128, 0x4000, 0xd00000, false, 0 },
++	{ 11, 128, 0x4800, 0xd40000, false, 0 },
 +};
 +
 +static struct {
@@ -704,6 +747,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +}
 +
 +static void wp_hist(uint32_t key);
++static void wp_hist_dump(void);
 +
 +/* HTC send on source ring r (0 = CE0, 1 = CE3): 8-byte header + payload; the write index goes through the shadow registers */
 +static bool
@@ -1228,6 +1272,40 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +		n = wp_cmd(c, 0x5008, 95, v, 12);
 +		if (!wp_wmi("vdev encap", c, n)) {
 +			return false;
++		}
++	}
++	/*
++	 * What ath10k configures at vdev create / start and we did not (the research agent's list; the firmware's STA power-save health
++	 * monitor and keepalive timers are the best match for the crash 30-150 s after a join): firmware keepalive off, the PS parameters,
++	 * and the pdev parameters of ath10k_mac_start.
++	 */
++	if (wp_svc_on(29)) {                                    /* WMI_SERVICE_STA_KEEP_ALIVE: STA_KEEPALIVE_CMD */
++		uint32_t ka[4] = { 0, 1, 1, 0 };                  /* vdev 0, enabled, method NULL frame, interval 0 */
++		uint32_t arp[4] = { 0, 0, 0, 0 };
++
++		n = wp_cmd(c, 0x1c005, 127, ka, 16);
++		wp_tlv(c, &n, 128, arp, 16);
++		(void)wp_wmi("sta keepalive", c, n);
++	}
++	for (unsigned k = 0; k < 3; k++) {                      /* STA_POWERSAVE_PARAM: rx wake policy 0, tx wake threshold 1, pspoll count 0 */
++		uint32_t pp[3] = { 0, k, k == 1 ? 1u : 0u };
++
++		(void)wp_wmi("sta ps param", c, wp_cmd(c, 0x9002, 109, pp, 12));
++	}
++	{
++		static const struct { uint32_t id, val; } pdev[] = {
++			{ 0x22, 1 }, { 0x0a, 1 }, { 0x2c, 1 }, { 0x23, 0 }, { 0x25, 1 },     /* pmf qos, dynamic bw, idle ps, arp ac override, ani */
++		};
++
++		for (unsigned k = 0; k < sizeof(pdev) / sizeof(pdev[0]); k++) {
++			uint32_t pp[3] = { 0, pdev[k].id, pdev[k].val };
++
++			(void)wp_wmi("pdev param", c, wp_cmd(c, 0x4003, 82, pp, 12));
++		}
++		if (wp_svc_on(37)) {                            /* burst enable off */
++			uint32_t pp[3] = { 0, 0x30, 0 };
++
++			(void)wp_wmi("pdev burst", c, wp_cmd(c, 0x4003, 82, pp, 12));
 +		}
 +	}
 +	return true;
@@ -1995,6 +2073,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	jn.peer = true;
 +	if (!jn_wait(&jn.peer_mapped, 3000, "HTT PEER_MAP")) {
++		wp_hist_dump();
 +		return false;
 +	}
 +	n = swu_auth_req(f, sizeof(f), jn.bssid, wp_mac);
@@ -2322,6 +2401,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +
 +	if (err == 0 && req->newptr != USER_ADDR_NULL && v == 1) {
 +		jn.kicked = true;
++	} else if (err == 0 && req->newptr != USER_ADDR_NULL && v == 2) {
++		g_wlan_crashed = true;                  /* test the modem restart without waiting for the firmware to crash */
 +	}
 +	return err;
 +}
@@ -2819,6 +2900,40 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	return false;
 +}
 +
++/* the WCN3990's supplies as the Pixel's icnss node lists them: vdd-cx-mx (l9a, 640 mV), xo, rfa, ch0, ch1 */
++static const struct { const char *res; unsigned mv; } g_wlan_rails[] = {
++	{ "ldoa9", 640 }, { "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 }, { "ldoc11", 3312 },
++};
++
++static void
++wlan_rails_on(void)
++{
++	char log[96];
++	unsigned lp = 0;
++
++	for (unsigned k = 0; k < sizeof(g_wlan_rails) / sizeof(g_wlan_rails[0]); k++) {
++		int err = sweet_rpmh_vreg_set(g_wlan_rails[k].res, g_wlan_rails[k].mv);
++
++		lp += (unsigned)snprintf(log + lp, sizeof(log) - lp, " %s=%d", g_wlan_rails[k].res, err);
++		lp = MIN(lp, (unsigned)sizeof(log) - 1);
++		sleep_ms(2);
++	}
++	ev("EW: WCN3990 rails voted:%s, rfclka2=%d", log, sweet_rpmh_rfclk_enable("rfclka2"));
++	(void)aop_send("{class: clock, res: qdss, val: 1}");
++}
++
++/* power cycle the chip around a modem restart, as icnss does in its recovery path: the new firmware wants a chip at reset */
++static void
++wlan_rails_cycle(void)
++{
++	for (int k = (int)(sizeof(g_wlan_rails) / sizeof(g_wlan_rails[0])) - 1; k >= 0; k--) {
++		(void)sweet_rpmh_vreg_off(g_wlan_rails[k].res);
++		sleep_ms(2);
++	}
++	sleep_ms(300);
++	wlan_rails_on();
++}
++
 +/* frames ew0 queued: out through the data path (service thread only) */
 +static void
 +wlan_tx_pump(void)
@@ -2997,21 +3112,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	}
 +	g_wlan_crashed = false;
 +	if (g_wlan_probe >= 8 && ew.ifp == NULL) {
-+		static const struct { const char *res; unsigned mv; } rails[] = {
-+			{ "ldoc1", 1800 }, { "ldoc2", 1304 }, { "ldoc10", 3312 }, { "ldoc11", 3312 },
-+		};
-+		char log[96];
-+		unsigned lp = 0;
-+
-+		for (unsigned k = 0; k < sizeof(rails) / sizeof(rails[0]); k++) {
-+			int err = sweet_rpmh_vreg_set(rails[k].res, rails[k].mv);
-+
-+			lp += (unsigned)snprintf(log + lp, sizeof(log) - lp, " %s=%d", rails[k].res, err);
-+			lp = MIN(lp, (unsigned)sizeof(log) - 1);
-+			sleep_ms(2);
-+		}
-+		ev("EW: WCN3990 rails voted:%s, rfclka2=%d", log, sweet_rpmh_rfclk_enable("rfclka2"));
-+		(void)aop_send("{class: clock, res: qdss, val: 1}");
++		wlan_rails_on();
 +		ew_if_create();
 +	}
 +	if (!wlfw_smmu_identity(0x240) || !wlfw_smmu_identity(0x241)) {
@@ -3071,7 +3172,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +wlan_thread(void *arg, wait_result_t wr)
 +{
 +#pragma unused(arg, wr)
++	g_wlan_thread_running = true;
 +	wlfw_wmi_bringup(g_wlan_regs);
++	g_wlan_thread_running = false;
 +	ev("EW: service thread ended");
 +	thread_terminate(current_thread());
 +}
@@ -3104,7 +3207,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	if (regs == NULL) {
  		ev("WLAN probe: cannot map the chip's registers");
  		return;
-@@ -2316,14 +5366,25 @@
+@@ -2316,14 +5452,25 @@
  		g_events[0] = 0;
  	}
  	ev("WLAN probe: registers mapped at %p", regs);
@@ -3132,7 +3235,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		wlfw_dma_test(regs);
  	}
  }
-@@ -2379,6 +5440,8 @@
+@@ -2379,6 +5526,8 @@
  static bool
  wlfw_assign(uint64_t addr, uint64_t size, bool secure)
  {
@@ -3141,30 +3244,49 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	vm_offset_t page = 0;
  	uint8_t *p;
  	uint64_t answer = ~0ull, phys;
-@@ -2386,6 +5449,12 @@
- 	unsigned n = secure ? 2 : 3;
- 	int32_t result;
- 
-+	for (unsigned i = 0; i < ndone; i++) {
-+		if (done[i] == addr) {
-+			ev("WLFW assign_mem %#llx +%#llx: already shared with the WLAN (restart)", addr, size);
-+			return true;
-+		}
-+	}
- 	if (kmem_alloc(kernel_map, &page, PAGE_SIZE, KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
- 		return false;
- 	}
-@@ -2409,6 +5478,9 @@
+@@ -2409,6 +5558,17 @@
  	scm_fifth = phys + 256;
  	result = scm("to share the WLAN memory", SCM_64 | SCM_SIP | SCM_MP_ASSIGN, SCM_ARGS_ASSIGN, phys + 64, 16, phys, &answer);
  	ev("WLFW assign_mem %#llx +%#llx (%s): %d", addr, size, secure ? "secure" : "shared", result);
++	if (result != 0) {
++		for (unsigned i = 0; i < ndone; i++) {
++			if (done[i] == addr) {
++				ev("WLFW assign_mem %#llx: still shared with the WLAN from before the restart", addr);
++				return true;
++			}
++		}
++	}
 +	if (result == 0 && ndone < 4) {
 +		done[ndone++] = addr;
 +	}
  	return result == 0;
  }
  
-@@ -2711,7 +5783,12 @@
+@@ -2526,7 +5686,7 @@
+ {
+ 	uint32_t at = 7;
+ 
+-	if (result != 0 && !(msg == WLFW_HOST_CAP)) {
++	if (result != 0 && !(msg == WLFW_HOST_CAP) && msg != WLFW_INI) {
+ 		wlfw_fail("request", result, error);
+ 		ev("WLFW request %#x was refused", msg);
+ 		return;
+@@ -2644,6 +5804,14 @@
+ 	case WL_MODE:
+ 		g_wlfw.state = WL_DONE;
+ 		ev("WLFW configured in mission mode");
++		{
++			/* ath10k_qmi_ini_send_sync_msg: fw_log_mode 0 (diag log), what ath10k_core_start asks for after the mode is on */
++			uint32_t a = wlfw_begin(WLFW_INI);
++			uint8_t mode = 0;
++
++			a = qmi_put_tlv(g_wlfw.out, a, 0x10, &mode, 1);
++			wlfw_queue(a);
++		}
+ 		if (g_wlan_probe) {
+ 			wlfw_probe_hw();
+ 		}
+@@ -2711,7 +5879,12 @@
  	uint32_t client = WLFW_CLIENT_ID;
  
  	if (g_wlfw.state != WL_IDLE) {
@@ -3178,22 +3300,31 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  	}
  	g_tftp_ch = ch;
  	g_wlfw.known = true;
-@@ -3092,7 +6169,13 @@
- mpss_thread(void *arg, wait_result_t result)
+@@ -3089,16 +6262,9 @@
+ }
+ 
+ static void
+-mpss_thread(void *arg, wait_result_t result)
++mpss_run(void)
  {
- #pragma unused(arg, result)
+-#pragma unused(arg, result)
 -	bool ok = mpss_start();
-+	bool ok;
-+
-+	if (g_wlan_probe >= 8) {
-+		/* before the modem boots, as ath10k_snoc enables its "qdss" clock before the firmware runs */
-+		(void)aop_send("{class: clock, res: qdss, val: 1}");
-+	}
-+	ok = mpss_start();
- 	if (!ok) {
- 		printf("SWEET MPSS: failed to start\n");
- 		(void)thread_terminate(current_thread());
-@@ -3160,12 +6243,17 @@
+-	if (!ok) {
+-		printf("SWEET MPSS: failed to start\n");
+-		(void)thread_terminate(current_thread());
+-		thread_block(THREAD_CONTINUE_NULL);
+-		return;
+-	}
++	unsigned crash_ticks = 0;
+ 
+ 	/* Map SMEM header once to log status */
+ 	volatile uint8_t *hdr_win = (volatile uint8_t *)ml_io_map_unmappable(SMEM_MEMORY, PAGE_SIZE, WIMG_WCOMB);
+@@ -3156,16 +6322,26 @@
+ 			    phdr, part_phys, part_size, phdr9, p9_phys, p9_size);
+ 
+ 			/* Fast poll loop: 50 ms ticks = 20 Hz */
+-			for (int tick = 1; tick <= 12000; tick++) {
++			for (int tick = 1;; tick = (tick >= 1000000) ? 201 : tick + 1) {      /* no end: the modem is polled for as long as the phone runs */
  				g_events_second = (uint32_t)(tick / 20);
  				for (int sub = 0; sub < 10; sub++) {
  					sleep_ms(5);
@@ -3204,11 +3335,70 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  					}
  				}
  
-+				if (g_modem_crashed) {
-+					/* the modem's SMEM state is not ours to poke while it restarts (a GLINK send aborted the kernel) */
-+					continue;
++				if (g_modem_crashed || g_wlan_crashed) {
++					if (g_wlan_probe >= 8 && ++crash_ticks >= 40) {
++						break;                          /* two seconds for the service thread to notice; then the modem is restarted */
++					}
++					if (g_modem_crashed) {
++						/* the modem's SMEM state is not ours to poke while it restarts (a GLINK send aborted the kernel) */
++						continue;
++					}
 +				}
 +
  				/* 1. Outbound SMP2P setup */
  				if (tick <= 100 || tick % 200 == 0) {
  					sweet_smp2p_setup_outbound(phdr, part_size);
+@@ -3201,7 +6377,53 @@
+ 	} else {
+ 		printf("SWEET SMEM: Partition 7 (hosts 0:1) not found!\n");
+ 	}
++}
++
++/* everything the host remembers about the running modem, for the next boot */
++static void
++mpss_restart_cleanup(void)
++{
++	for (unsigned t = 0; t < 3000 && g_wlan_thread_running; t += 10) {
++		sleep_ms(10);
++	}
++	memset(&g_glink, 0, sizeof(g_glink));
++	g_tftp_ch = NULL;
++	memset(g_rmtfs_callers, 0, sizeof(g_rmtfs_callers));
++	memset(g_tftp, 0, sizeof(g_tftp));
++	g_big_pending = g_pump_clock = g_last_req_clock = 0;
++	g_send_failure = 0;
++	memset(&g_wlfw, 0, offsetof(typeof(g_wlfw), out));
++	g_wlfw.state = WL_IDLE;
++	g_last_crash[0] = 0;
++	g_crash_seen = false;
++	g_modem_crashed = false;
++	g_wlan_crashed = false;
++	if (g_wlan_probe >= 8) {
++		wlan_rails_cycle();
++	}
++}
+ 
++static void
++mpss_thread(void *arg, wait_result_t result)
++{
++#pragma unused(arg, result)
++	for (;;) {
++		if (g_wlan_probe >= 8) {
++			/* before the modem boots, as ath10k_snoc enables its "qdss" clock before the firmware runs */
++			(void)aop_send("{class: clock, res: qdss, val: 1}");
++		}
++		if (!mpss_start()) {
++			printf("SWEET MPSS: failed to start\n");
++			break;
++		}
++		mpss_run();
++		if (g_wlan_probe < 8) {
++			break;
++		}
++		ev("MPSS: the modem crashed: restarting it (PAS shutdown, load, start)");
++		printf("SWEET MPSS: restarting the modem after a crash\n");
++		mpss_restart_cleanup();
++	}
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
