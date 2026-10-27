@@ -652,3 +652,18 @@ Observed (apps_smmu 0x15000000, 79 stream matchers, 61 context banks, 4K pages):
 Next: give stream 0x240 a translation context (S2CR TYPE=0, CBNDX = a free context bank) with a stage-1 page table that
 identity-maps the DMA memory (like the GPU's SMMU work); first find a free context bank without touching the ones the
 hypervisor owns (S2CRs show cb0..cb3 in use). Phone left on shim-local-0144.img (default cmdline).
+
+## 2026-10-27 15:40 MILESTONE: THE WCN3990 SENDS ITS HTC READY MESSAGE INTO HOST MEMORY (patch 0138, wlanprobe=5, image shim/out/shim-local-0138y-ce.img)
+Recipe taken from the forks (ry-diffusion/Bergamota docs/WIFI_IOS26.md + xnu/patches-12377/1118; URFAVF3MBOY/ios-sweet
+xnu/patches/0138-op7t-usb-smmu-identity.patch; aTechGeekDev/ios-apollo has a wifi/ dir too, not read yet):
+- apps SMMU (0x15000000): bypass is refused by the hypervisor; a stage-1 context bank is accepted. Bank 60 (top-down,
+  skipping banks an S2CR uses, SCTLR.M clear), one 4K level-1 table with 1 GiB identity blocks 0x80000000..0x3ffffffff,
+  CBAR VA64 stage 1, T0SZ 25, MAIR0 0x44, SCTLR M|TRE|AFE|CFRE|ASIDPNE; SMR6/SMR7 = exact 0x240/0x241 -> S2CR bank 60. All
+  read back fine ("taken"), no panic. (The earlier panic was reading context banks from 0 upward: do not.)
+- The rings I wrote earlier on CE0 were the TARGET's (in the MSA); the host's receive rings are CE2 (64) and CE1 (32):
+  dr_base lo/hi(&0x1f) 0xc/0x10, dr_size 0x14, dst_wr 0x40 = n-1. CE0/CE3 are host source rings (16/32), CE4 data.
+- Result: after <100 ms CE2 desc0 nbytes 20 and drri 1; the buffer holds 00000c00 00000000 01000200 88081600 = HTC READY
+  (2 credits of 0x888 = 2184 bytes). kmem_alloc memory is NOT physically contiguous: use kvtophys per buffer.
+NEXT: source rings CE0 (HTC control tx, 16) and CE3 (WMI tx, 32) with the shadow write indexes, HTC CONNECT_SERVICE for
+WMI_CONTROL (0x100) and HTT_DATA (0x300), SETUP_COMPLETE, WMI TLV service ready/init/ready, then a passive scan (Bergamota
+1119+). Note the forks keep the pool outside xnu RAM; here kmem_alloc + per-page kvtophys works.

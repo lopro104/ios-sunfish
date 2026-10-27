@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 --- a/bsd/dev/sweet_mpss.c
 +++ b/bsd/dev/sweet_mpss.c
-@@ -2301,6 +2301,289 @@
+@@ -2301,6 +2301,290 @@
  	}
  }
  
@@ -230,7 +230,8 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	pa = kvtophys(mem);
 +	for (unsigned k = 0; k < 2; k++) {
 +		for (unsigned i = 0; i < rx[k].n; i++) {
-+			*(uint64_t *)(m + rx[k].ring + 16 * i) = (pa + rx[k].bufs + (uint64_t)i * CE_RX_BUF) & 0x1fffffffffull;
++			/* kmem_alloc memory is not physically contiguous: each buffer's own address */
++			*(uint64_t *)(m + rx[k].ring + 16 * i) = kvtophys((vm_offset_t)(m + rx[k].bufs + (uint64_t)i * CE_RX_BUF)) & 0x1fffffffffull;
 +		}
 +	}
 +	for (vm_offset_t o = 0; o < 0x40000; o += 64) {
@@ -291,7 +292,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  /* Read what the WCN3990 copy engines look like from the host: the first check that the host can reach the chip. */
  static void
  wlfw_probe_hw(void)
-@@ -2323,7 +2606,14 @@
+@@ -2323,7 +2607,14 @@
  		ev("WLAN CE%u: sr_size %#x dr_size %#x srri %#x drri %#x", ce, regs[base + 0x8 / 4], regs[base + 0x14 / 4],
  		    regs[base + 0x44 / 4], regs[base + 0x48 / 4]);
  	}
