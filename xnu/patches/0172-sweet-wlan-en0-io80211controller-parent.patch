@@ -1,0 +1,316 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -2889,7 +2889,7 @@
+ 		int8_t rssi;
+ 		char ssid[33];
+ 		uint16_t cap, bint, ie_len;
+-		uint8_t ie[256];
++		uint8_t ie[512];
+ 	} bss[48];
+ 	struct {
+ 		uint32_t req_id, len;
+@@ -3382,6 +3382,17 @@
+ 			if (rxmhz == bssmhz) {
+ 				wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
+ 			}
++			if (wp.bss[k].ssid[0] == 0) {
++				const uint8_t *ssid_ie = swu_ie_find(fr + 36, frl - 36, 0);
++				if (ssid_ie && ssid_ie[1] > 0) {
++					unsigned n = MIN((unsigned)ssid_ie[1], 32u);
++					for (unsigned i = 0; i < n; i++) {
++						uint8_t ch = ssid_ie[2 + i];
++						wp.bss[k].ssid[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
++					}
++					wp.bss[k].ssid[n] = 0;
++				}
++			}
+ 			return;
+ 		}
+ 	}
+@@ -3395,26 +3406,29 @@
+ 	wp.bss[k].ssid[0] = 0;
+ 	wp.bss[k].cap = (uint16_t)(fr[34] | (fr[35] << 8));
+ 	wp.bss[k].bint = (uint16_t)(fr[32] | (fr[33] << 8));
+-	wp.bss[k].ie_len = (uint16_t)MIN(frl - 36, (uint32_t)sizeof(wp.bss[k].ie));
+-	memcpy(wp.bss[k].ie, fr + 36, wp.bss[k].ie_len);
+-	for (uint32_t o = 36; o + 2 <= frl;) {
+-		uint8_t id = fr[o], l = fr[o + 1];
+-
+-		if (o + 2 + l > frl) {
+-			break;
+-		}
+-		if (id == 0) {
+-			unsigned n = MIN(l, 32u);
+-
+-			for (unsigned i = 0; i < n; i++) {
+-				uint8_t ch = fr[o + 2 + i];
+-
+-				wp.bss[k].ssid[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
++	{
++		uint32_t max_ie = (uint32_t)sizeof(wp.bss[k].ie);
++		uint32_t valid_ie = 0;
++		for (uint32_t o = 36; o + 2u <= frl; ) {
++			uint8_t id = fr[o], l = fr[o + 1];
++			if (o + 2u + l > frl) {
++				break;
+ 			}
+-			wp.bss[k].ssid[n] = 0;
+-			break;
++			if ((o - 36u) + 2u + l <= max_ie) {
++				valid_ie = (o - 36u) + 2u + l;
++			}
++			if (id == 0 && wp.bss[k].ssid[0] == 0) {
++				unsigned n = MIN((unsigned)l, 32u);
++				for (unsigned i = 0; i < n; i++) {
++					uint8_t ch = fr[o + 2 + i];
++					wp.bss[k].ssid[i] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '?';
++				}
++				wp.bss[k].ssid[n] = 0;
++			}
++			o += 2u + l;
+ 		}
+-		o += 2u + l;
++		wp.bss[k].ie_len = (uint16_t)valid_ie;
++		memcpy(wp.bss[k].ie, fr + 36, valid_ie);
+ 	}
+ }
+ 
+@@ -4671,7 +4685,7 @@
+ 	if (plen > 64) {
+ 		plen = 64;
+ 	}
+-	memcpy(buf, "ew0", 3);
++	memcpy(buf, "en0", 4);
+ 	if (plen != 0) {
+ 		memcpy(buf + 16, payload, plen);
+ 	}
+@@ -4744,7 +4758,13 @@
+ 	uint32_t u32;
+ 	int16_t i16;
+ 	uint16_t u16;
+-	unsigned slen = strlen(wp.bss[k].ssid);
++	const char *ssid = wp.bss[k].ssid;
++	unsigned slen = strlen(ssid);
++
++	if (slen == 0 && (int)k == jn.bss && jn.connected && jn.ssid_len > 0) {
++		ssid = jn.ssid;
++		slen = MIN((unsigned)jn.ssid_len, 32u);
++	}
+ 
+ 	memset(out, 0, 1160);
+ 	u32 = 1; memcpy(out + 0, &u32, 4);
+@@ -4758,10 +4778,23 @@
+ 	u16 = wp.bss[k].cap; memcpy(out + 0x1a, &u16, 2);
+ 	memcpy(out + 0x1c, wp.bss[k].bssid, 6);
+ 	out[0x60] = (uint8_t)slen;
+-	memcpy(out + 0x61, wp.bss[k].ssid, MIN(slen, (unsigned)32));
+-	u16 = (uint16_t)MIN((unsigned)wp.bss[k].ie_len, (unsigned)(1160 - 0x8c));
++	memcpy(out + 0x61, ssid, MIN(slen, (unsigned)32));
++
++	uint32_t max_out_ie = MIN((uint32_t)wp.bss[k].ie_len, (uint32_t)(1160 - 0x8c));
++	uint32_t valid_out_ie = 0;
++	for (uint32_t o = 0; o + 2u <= max_out_ie; ) {
++		uint8_t l = wp.bss[k].ie[o + 1];
++		if (o + 2u + l > max_out_ie) {
++			break;
++		}
++		valid_out_ie = o + 2u + l;
++		o += 2u + l;
++	}
++	u16 = (uint16_t)valid_out_ie;
+ 	memcpy(out + 0x8a, &u16, 2);
+-	memcpy(out + 0x8c, wp.bss[k].ie, u16);
++	if (valid_out_ie > 0) {
++		memcpy(out + 0x8c, wp.bss[k].ie, valid_out_ie);
++	}
+ }
+ 
+ static int
+@@ -4960,18 +4993,37 @@
+ 		}
+ 		break;
+ 	}
+-	case 103:                                               /* CURRENT_NETWORK (get): the connected network, in the scan result record */
++	case 103: {                                             /* CURRENT_NETWORK (get): the connected network, in the scan result record */
+ 		if (!set) {
+-			if (!up || jn.bss >= wp.nbss) {
++			if (!up) {
+ 				err = ENOLINK;
+ 			} else {
+ 				uint8_t out[1160];
+ 
+-				ew_a80211_scanrec(out, jn.bss);
++				if (jn.bss >= 0 && (unsigned)jn.bss < wp.nbss) {
++					ew_a80211_scanrec(out, (unsigned)jn.bss);
++				} else {
++					memset(out, 0, sizeof(out));
++					uint32_t u32 = 1;
++					memcpy(out + 0, &u32, 4);
++					memcpy(out + 4, &u32, 4);
++				}
++				/* Ensure critical fields always match jn */
++				uint32_t ch = ew_a80211_channel(jn.mhz);
++				memcpy(out + 8, &ch, 4);
++				uint32_t flags = ew_a80211_chflags(jn.mhz);
++				memcpy(out + 12, &flags, 4);
++				memcpy(out + 0x1c, jn.bssid, 6);
++				if (jn.ssid_len > 0) {
++					unsigned slen = MIN((unsigned)jn.ssid_len, (unsigned)32);
++					out[0x60] = (uint8_t)slen;
++					memcpy(out + 0x61, jn.ssid, slen);
++				}
+ 				err = ew_a80211_out(rq, out, sizeof(out));
+ 			}
+ 		}
+ 		break;
++	}
+ 	case 25:                                                /* HOST_AP_MODE: wifid's last step of its start-up: tell it we are associated */
+ 	case 365:                                               /* DISPLAY_STATE */
+ 	case 383:                                               /* SET_PROPERTY: wifid pushes configuration plists; ignored */
+@@ -5108,7 +5160,7 @@
+ 	init.flags = IFNET_INIT_LEGACY;
+ 	init.uniqueid = "sweet-wlan";
+ 	init.uniqueid_len = sizeof("sweet-wlan") - 1;
+-	init.name = "ew";
++	init.name = "en";
+ 	init.unit = 0;
+ 	init.family = IFNET_FAMILY_ETHERNET;
+ 	init.type = IFT_ETHER;
+@@ -5138,8 +5190,8 @@
+ 		return;
+ 	}
+ 	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
+-	ev("EW: interface ew0 created");
+-	sweet_io80211_publish("ew0", wp_mac);
++	ev("EW: interface en0 created");
++	sweet_io80211_publish("en0", wp_mac);
+ }
+ 
+ static void
+@@ -5174,14 +5226,14 @@
+ 			struct sockaddr_in *o = (struct sockaddr_in *)&ifr.ifr_addr;
+ 
+ 			bzero(&ifr, sizeof(ifr));
+-			snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "ew0");
++			snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "en0");
+ 			o->sin_len = sizeof(*o);
+ 			o->sin_family = AF_INET;
+ 			memcpy(&o->sin_addr.s_addr, ew.cur_ip, 4);
+ 			(void)sock_ioctl(so, SIOCDIFADDR, &ifr);
+ 		}
+ 		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ew0");
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en0");
+ 		a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a); a->sin_family = AF_INET; a->sin_addr.s_addr = htonl(addr);
+ 		a = (struct sockaddr_in *)&ifra.ifra_mask;
+@@ -5197,7 +5249,7 @@
+ 	ifnet_set_flags(ew.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	ew_link_event(true);
+ 	ew_a80211_link_events();
+-	ev("EW: ew0 %u.%u.%u.%u %s (err %d)", ip[0], ip[1], ip[2], ip[3], err ? "NOT configured" : "up", err);
++	ev("EW: en0 %u.%u.%u.%u %s (err %d)", ip[0], ip[1], ip[2], ip[3], err ? "NOT configured" : "up", err);
+ }
+ 
+ /* a decrypted Ethernet frame from the AP to the stack */
+diff --git a/iokit/Kernel/arm/SweetWiFi.cpp b/iokit/Kernel/arm/SweetWiFi.cpp
+--- a/iokit/Kernel/arm/SweetWiFi.cpp
++++ b/iokit/Kernel/arm/SweetWiFi.cpp
+@@ -1,12 +1,14 @@
+ /*
+- * IO80211Interface stand-in for the Wi-Fi interface ew0 (bsd/dev/sweet_mpss.c).
++ * IO80211Interface stand-in for the Wi-Fi interface (bsd/dev/sweet_mpss.c).
+  *
+- * Apple's IO80211 library (Apple80211GetIfListCopy / Apple80211BindToInterface, used by wifid, MobileWiFi,
+- * and through them Settings) finds an interface by getifaddrs + SIOCGIFMEDIA (media type IEEE 802.11) and then
+- * looks up its IORegistry entry with IOServiceGetMatchingService({IOPropertyMatch: {IOInterfaceName: "ew0"}}),
+- * reading "IO80211InterfaceRole" ("Infrastructure"). With no IO80211Controller in the registry it falls back to
+- * plain SIOCGA80211/SIOCSA80211 ioctls on the interface, which sweet_mpss.c answers. So this service only has to
+- * exist, carry those properties, and be registered.
++ * SystemConfiguration's SCNetworkInterfaceCopyAll looks for services matching
++ * "IONetworkInterface", and checks if their parent conforms to "IO80211Controller"
++ * (or AirPortPCI / AirPortDriver). When both match, SC assigns type "IEEE80211".
++ *
++ * Apple's IO80211 library (Apple80211GetIfListCopy / Apple80211BindToInterface,
++ * used by wifid, MobileWiFi, and Settings) looks up the IORegistry entry with
++ * IOServiceGetMatchingService({IOPropertyMatch: {IOInterfaceName: ifname}}),
++ * reading "IO80211InterfaceRole" ("Infrastructure").
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -17,28 +19,50 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSString.h>
+ 
+-class IO80211Interface : public IOService {
+-	OSDeclareDefaultStructors(IO80211Interface);
++class IO80211Controller : public IOService {
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, IOService);
++
++class IONetworkInterface : public IOService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
+ };
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
+ 
+-OSDefineMetaClassAndStructors(IO80211Interface, IOService);
++class IO80211Interface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(IO80211Interface);
++};
++OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface);
+ 
+ extern "C" void
+ sweet_io80211_publish(const char *ifname, const uint8_t mac[6])
+ {
++	IO80211Controller *ctrl = OSTypeAlloc(IO80211Controller);
++	if (ctrl != NULL && ctrl->init()) {
++		ctrl->setName("wlan");
++		ctrl->attach(IOService::getPlatform());
++		ctrl->registerService();
++	}
++
+ 	IO80211Interface *iface = OSTypeAlloc(IO80211Interface);
+ 	OSNumber *n;
+ 	OSData *d;
+ 
+ 	if (iface == NULL || !iface->init()) {
+ 		OSSafeReleaseNULL(iface);
++		OSSafeReleaseNULL(ctrl);
+ 		return;
+ 	}
+-	iface->setName("ew0");
++	iface->setName(ifname);
+ 	iface->setProperty("IOInterfaceName", ifname);
+ 	iface->setProperty("BSD Name", ifname);
+ 	iface->setProperty("IO80211InterfaceRole", "Infrastructure");
+-	iface->setProperty("IOInterfaceNamePrefix", "ew");
++	iface->setProperty("IOInterfaceNamePrefix", "en");
+ 	n = OSNumber::withNumber(0ULL, 32);
+ 	iface->setProperty("IOInterfaceUnit", n);
+ 	OSSafeReleaseNULL(n);
+@@ -49,11 +73,16 @@
+ 	iface->setProperty("IOMACAddress", d);
+ 	OSSafeReleaseNULL(d);
+ 	iface->setProperty("IOPrimaryInterface", kOSBooleanTrue);
+-	if (iface->attach(IOService::getPlatform())) {
++
++	if (ctrl != NULL && iface->attach(ctrl)) {
++		iface->registerService();
++		IOLog("SWEET WIFI: IO80211Interface published for %s attached to IO80211Controller\n", ifname);
++	} else if (iface->attach(IOService::getPlatform())) {
+ 		iface->registerService();
+-		IOLog("SWEET WIFI: IO80211Interface published for %s, registry ID %#llx\n", ifname, iface->getRegistryEntryID());
++		IOLog("SWEET WIFI: IO80211Interface published for %s attached to platform\n", ifname);
+ 	}
+ 	OSSafeReleaseNULL(iface);
++	OSSafeReleaseNULL(ctrl);
+ }
+ #else
+ extern "C" void sweet_io80211_publish(const char *, const unsigned char *);
