@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c	2026-10-28 08:36:35.306146758 +0200
++++ b/bsd/dev/sweet_mpss.c	2026-10-28 08:36:35.293229238 +0200
+@@ -6610,6 +6610,7 @@
+ 	}
+ 	started = true;
+ 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
++	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
+ 	if (kernel_thread_start(mpss_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+diff --git a/bsd/dev/sweet_wlan_util.c b/bsd/dev/sweet_wlan_util.c
+--- a/bsd/dev/sweet_wlan_util.c	2026-10-28 08:36:35.306298252 +0200
++++ b/bsd/dev/sweet_wlan_util.c	2026-10-28 08:36:35.294794577 +0200
+@@ -382,6 +382,8 @@
+ 	return (size_t)(p - out);
+ }
+ 
++int swu_no_ht;                          /* boot-arg wlannoht=1: do not advertise HT in the association request */
++
+ /* association request: capabilities, listen interval, SSID, the AP's rates (up to 8 + extended), the RSN element if any, WMM if AP supports it, HT if AP supports it */
+ size_t
+ swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a)
+@@ -417,7 +419,7 @@
+ 	if (ext) {
+ 		p = put_ie(p, 50, ext + 2, ext[1]);
+ 	}
+-	if (ap_ht) {
++	if (ap_ht && !swu_no_ht) {
+ 		static const uint8_t ht_cap_ie[28] = {
+ 			45, 26,
+ 			0x2d, 0x01,             /* cap_info: 0x012d (LDPC, 20MHz, SM_PS disabled, Short GI 20, Rx STBC 1) */
+diff --git a/bsd/dev/sweet_wlan_util.h b/bsd/dev/sweet_wlan_util.h
+--- a/bsd/dev/sweet_wlan_util.h	2026-10-28 08:36:35.306322097 +0200
++++ b/bsd/dev/sweet_wlan_util.h	2026-10-28 08:36:35.296764357 +0200
+@@ -46,6 +46,7 @@
+ size_t swu_auth_req(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6]);
+ size_t swu_deauth(uint8_t *f, size_t size, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason);
+ size_t swu_build_rsn(uint8_t *out, uint8_t group_type);
++extern int swu_no_ht;
+ size_t swu_assoc_req(uint8_t *f, size_t size, const struct swu_assoc *a);
+ int swu_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], uint16_t *status);
+ int swu_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t me[6], struct swu_assoc_resp *r);

@@ -1,0 +1,121 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c	2026-10-28 13:26:43.328463042 +0200
++++ b/bsd/dev/sweet_mpss.c	2026-10-28 13:26:43.313765510 +0200
+@@ -25,6 +25,9 @@
+ #include <kern/thread.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
++
++extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++#define SWEET_WLAN_PRI 92       /* above the iOS start-up load: the host side has to answer the firmware's rings on time */
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <vm/vm_kern.h>
+@@ -108,6 +111,7 @@
+ static volatile bool g_modem_crashed;      /* the modem reported a crash: do not touch its memory any more */
+ static volatile bool g_wlan_crashed;       /* the WLAN protection domain crashed: the modem as a whole is restarted (it escalates the crash) */
+ static volatile bool g_wlan_thread_running;
++static volatile bool g_wlan_halt;          /* a restart is under way: the service thread must not touch the chip's registers (its rails go off) */
+ static char g_last_crash[128];
+ static bool g_crash_seen;
+ static size_t g_events_length;
+@@ -3007,9 +3011,13 @@
+ wp_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
+ {
+ 	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
+-	uint32_t srri = wp_ce(wp_cfg[r].ce)[0x44 / 4] & mask;
++	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed) ? 0 : (wp_ce(wp_cfg[r].ce)[0x44 / 4] & mask);   /* the registers are gone while a restart is under way */
+ 	uint8_t *buf = wp.pool + wp_cfg[r].bufs + (uint64_t)wr * WP_BUF;
+ 	struct wp_desc *d = wp_desc(r, wr);
++
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++		return false;
++	}
+ 	uint16_t l = (uint16_t)plen;
+ 
+ 	if (8 + plen > WP_BUF || ((srri - 1 - wr) & mask) == 0) {
+@@ -3738,9 +3746,13 @@
+ {
+ 	const unsigned r = 4;
+ 	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
+-	uint32_t srri = wp_ce(4)[0x44 / 4] & mask;
++	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed) ? 0 : (wp_ce(4)[0x44 / 4] & mask);
+ 	struct wp_desc *d;
+ 
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++		return false;
++	}
++
+ 	if (((srri - 1 - wr) & mask) < 2) {
+ 		return false;
+ 	}
+@@ -5221,6 +5233,9 @@
+ static void
+ wp_poll(void)
+ {
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++		return;
++	}
+ 	for (unsigned r = 0; r < WP_NR; r++) {
+ 		unsigned mask = wp_cfg[r].n - 1;
+ 
+@@ -5373,7 +5388,7 @@
+ 		if (g_wlan_crashed || g_modem_crashed) {
+ 			return;
+ 		}
+-		for (unsigned att = 0; att < 4 && !found && !g_wlan_crashed; att++) {
++		for (unsigned att = 0; att < 4 && !found && !g_wlan_crashed && !g_modem_crashed; att++) {
+ 			wp_scan();
+ 			wp_fault_check("scan");
+ 			if (!wp.scan_done) {
+@@ -5386,7 +5401,7 @@
+ 			if (jn.active) {
+ 				jn_cleanup();
+ 			}
+-			for (unsigned t = 0; t < 5000 && !g_wlan_crashed; t += 10) {
++			for (unsigned t = 0; t < 5000 && !g_wlan_crashed && !g_modem_crashed; t += 10) {
+ 				wp_poll();
+ 				sleep_ms(10);
+ 			}
+@@ -5544,7 +5559,8 @@
+ 	thread_t th;
+ 
+ 	g_wlan_regs = regs;
+-	if (kernel_thread_start(wlan_thread, NULL, &th) == KERN_SUCCESS) {
++	g_wlan_halt = false;
++	if (kernel_thread_start_priority(wlan_thread, NULL, SWEET_WLAN_PRI, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
+ 		ev("EW: cannot start the service thread");
+@@ -6502,7 +6518,8 @@
+ static void
+ mpss_restart_cleanup(void)
+ {
+-	for (unsigned t = 0; t < 3000 && g_wlan_thread_running; t += 10) {
++	g_wlan_halt = true;
++	for (unsigned t = 0; t < 8000 && g_wlan_thread_running; t += 10) {
+ 		sleep_ms(10);
+ 	}
+ 	memset(&g_glink, 0, sizeof(g_glink));
+@@ -6520,7 +6537,11 @@
+ 	g_events_length = 0;                    /* the 16 KB log was full: keep the story of this restart */
+ 	g_events[0] = 0;
+ 	if (g_wlan_probe >= 8) {
+-		wlan_rails_cycle();
++		if (g_wlan_thread_running) {
++			ev("EW: service thread still running: rails left on");      /* its next register access would fault with the rails off */
++		} else {
++			wlan_rails_cycle();
++		}
+ 	}
+ }
+ 
+@@ -6611,7 +6632,7 @@
+ 	started = true;
+ 	PE_parse_boot_argn("wlanprobe", &g_wlan_probe, sizeof(g_wlan_probe));
+ 	PE_parse_boot_argn("wlannoht", &swu_no_ht, sizeof(swu_no_ht));
+-	if (kernel_thread_start(mpss_thread, NULL, &thread) == KERN_SUCCESS) {
++	if (kernel_thread_start_priority(mpss_thread, NULL, SWEET_WLAN_PRI, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET MPSS: kernel_thread_start failed\n");
