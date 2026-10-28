@@ -29,14 +29,24 @@ while :; do
 				echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
 			fi
 
-			# Periodic ARP keepalive (every ~15 seconds: count % 5 == 0 with 3s sleep)
+			# Periodic ARP keepalive and health check (every ~15s)
 			count=$((count + 1))
 			if [ $((count % 5)) -eq 0 ]; then
-				ping -c 1 -W 1 "$router" >/dev/null 2>&1
+				if ! ping -c 1 -W 2 "$router" >/dev/null 2>&1; then
+					fail_count=$((fail_count + 1))
+					if [ "$fail_count" -ge 3 ]; then
+						echo "$(date +%T) router ping failed 3 times: auto-reconnecting wlan"
+						sysctl -w kern.sweet_wlan_kick=1 >/dev/null 2>&1
+						fail_count=0
+					fi
+				else
+					fail_count=0
+				fi
 			fi
 		fi
 	else
 		count=0
+		fail_count=0
 		if route -n get default 2>/dev/null | grep -q "interface: ew0"; then
 			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan -u >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
