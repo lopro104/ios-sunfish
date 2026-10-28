@@ -877,4 +877,6 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 - **FIX IMPLEMENTED (Patch 0150, committed `154288d`, boot image `shim/out/shim-local-0150-debounce.img`)**:
   - `sweet_keys.c`: added 3-sample 60 ms debouncer (`KEYS_DEBOUNCE_TICKS 3`) in `keys_thread`. Transient SPMI single-tick glitches (like the 21 ms `pon=0x2` spike) are discarded. Keys only trigger when sustained >= 60 ms.
   - `sweet_mpss.c`: turned `g_events` (16 KB) into a rolling window log: when room < 256 bytes, discards the oldest half up to newline via `memmove`, ensuring `sysctl kern.sweet_mpss_events` keeps logging indefinitely without truncating after 17 min.
-  - Built kernel `shim/out/kernel-0150` via Docker and packaged AVB-signed image `shim/out/shim-local-0150-debounce.img` (64 MiB). Ready for test boot when user is present.
+  - Built kernel `shim/out/kernel-0150` via Docker.
+  - `tools/mkadt.py`: added `wlan` node under `/arm-io/` (commit `40a050a`), satisfying `com.apple.wifid.plist`'s `_LimitLoadToDeviceTree: wlan\marconi-wifi` so `launchd` auto-loads `wifid` on boot.
+  - Packaged AVB-signed image `shim/out/shim-local-0150-debounce.img` (64 MiB, includes kernel-0150, sunfish.adt with wlan node, and sweetfb_fit=1). Ready for test boot when user is present.
