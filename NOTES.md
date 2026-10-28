@@ -800,6 +800,20 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - `sweet-wifi disconnect`: clears credentials and disconnects.
 - Integrated into `tools/jb-to-root.sh` for root image builds.
 
-
-
-
+## 2026-10-28 ~02:35 MILESTONE: SUBNET ROUTING, ARP RECOVERY, AND REMEMBERED PROFILES
+- **Subnet Route & ARP Fix (`tools/sweet-wlan-route.sh`)**:
+  - *Observation*: After ~20 minutes of operation, pings began returning `sendto: No route to host`.
+  - *Root Cause*: BSD Darwin routing table was missing an on-link subnet route for `ew0` (`192.168.1.0/24 link#8 UCSc ew0`). When the initial ARP entry expired after its 1200s timer, XNU had no subnet cloning route on `ew0` to re-resolve the gateway's ARP address, recursing on the default route into an unresolved state. Additionally, `ping -b ew0` had generated a conflicting scoped host route (`192.168.1.1/32 link#8 UCS ew0`).
+  - *Fix*:
+    - `sweet-wlan-route.sh`: explicitly anchors the on-link subnet route `route -n add -net "$subnet" -netmask "$mask" -interface ew0`.
+    - Added periodic keepalive ping to `$router` every 15 seconds, preventing the ARP entry from ever aging out.
+    - Removed `-b ew0` flag to prevent Darwin socket binding from injecting conflicting scoped host routes.
+  - *Verification*: `arp -an` shows `? (192.168.1.1) at 00:00:00:00:00:00 on ew0`. Pings to router `192.168.1.1` (3.3 ms) and internet `1.1.1.1` (4.6 ms) achieve 0.0% packet loss.
+- **Autonomous SSR Recovery Verified**:
+  - Observed full modem crash/restart cycle at ~23m uptime: modem restarted via PAS, re-ran TFTP/WLFW handshakes, re-associated to AP, received DHCP, and restored `ew0` interface in <20 seconds with zero kernel panic or user intervention.
+- **Enhanced `sweet-wifi` Manager**:
+  - `sweet-wifi saved`: lists all remembered Wi-Fi networks from `/fw/wlan/saved.conf`.
+  - `sweet-wifi forget <SSID>`: removes remembered networks.
+  - `sweet-wifi connect <SSID>`: connects using saved credentials without re-entering password.
+  - Automatic fallback: backups `/fw/wlan/net.conf` to `.bak` before connecting and automatically restores previous working configuration if connection times out.
+  - Auto-seeding: automatically seeds `/fw/wlan/saved.conf` from the active network on first run.
