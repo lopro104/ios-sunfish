@@ -1,0 +1,18 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: kern.sweet_torch writable by any user (Control Center flashlight in SpringBoard)
+
+---
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -442,6 +442,10 @@
+ 	sweet_torch_ma = 0;
+ }
+ 
+-SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++/*
++ * Writable by any user: Control Center's flashlight button is SpringBoard's (user mobile), through
++ * userland/torch/SweetTorch.m; the current is capped above whoever writes.
++ */
++SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_torch, "I", "sunfish rear torch: milliamps per LED (0 off, at most 200)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
