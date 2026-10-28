@@ -1,0 +1,118 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: an AppleARMBacklight stand-in (IODisplayParameters brightness) so CoreBrightness can work the panel brightness
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -224,6 +224,93 @@
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/*
++ * AppleARMBacklight, a stand-in (Pixel 4a): CoreBrightness (CBDisplayContaineriOS, Display.m) looks
++ * for a service of this class and reads its IODisplayParameters "brightness" {min, max, value};
++ * without one the brightness slider stays dead. A value set through setProperties goes to the
++ * panel as DCS 0x51 (sweet_fb_set_brightness, 4..1023). Everything set is logged (the first 64),
++ * to learn what else iOS wants of it.
++ */
++#define SWEET_BL_MAX            1024
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	uint32_t fValue;
++	void publish(void);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++extern "C" int sweet_fb_set_brightness(int level);
++
++void
++AppleARMBacklight::publish(void)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	if (params != NULL && brightness != NULL) {
++		OSNumber *n;
++		n = OSNumber::withNumber(0ULL, 32);
++		brightness->setObject("min", n);
++		OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber((unsigned long long)SWEET_BL_MAX, 32);
++		brightness->setObject("max", n);
++		OSSafeReleaseNULL(n);
++		n = OSNumber::withNumber((unsigned long long)fValue, 32);
++		brightness->setObject("value", n);
++		OSSafeReleaseNULL(n);
++		params->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(params);
++}
++
++static bool
++sweet_bl_number(OSObject *o, uint32_t *out)
++{
++	OSNumber *n = OSDynamicCast(OSNumber, o);
++	OSDictionary *d = OSDynamicCast(OSDictionary, o);
++	if (n == NULL && d != NULL) {
++		n = OSDynamicCast(OSNumber, d->getObject("value"));
++	}
++	if (n == NULL) {
++		return false;
++	}
++	*out = n->unsigned32BitValue();
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	static unsigned logged;
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	uint32_t value;
++	bool found = false;
++
++	if (logged < 64) {
++		logged++;
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		if (s != NULL && properties != NULL && properties->serialize(s)) {
++			IOLog("SWEET BL: setProperties %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	if (d != NULL) {
++		OSDictionary *params = OSDynamicCast(OSDictionary, d->getObject("IODisplayParameters"));
++		found = sweet_bl_number(params ? params->getObject("brightness") : d->getObject("brightness"), &value);
++	}
++	if (found) {
++		fValue = value > SWEET_BL_MAX ? SWEET_BL_MAX : value;
++		sweet_fb_set_brightness(4 + (int)((uint64_t)fValue * 1019 / SWEET_BL_MAX));
++		publish();
++	}
++	return kIOReturnSuccess;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -450,6 +537,17 @@
+ 		if (sweet_dsi != 0) {
+ 			IOLog("SWEET FB: DSI0 DSI_CTRL %#x (brightness: kern.sweet_brightness)\n",
+ 			    ((volatile uint32_t *)sweet_dsi)[SWEET_DSI_CTRL / 4]);
++			AppleARMBacklight *bl = OSTypeAlloc(AppleARMBacklight);
++			if (bl != NULL && bl->init()) {
++				bl->fValue = SWEET_BL_MAX;      /* (the boot loader leaves the panel bright) */
++				bl->publish();
++				bl->setName("backlight");
++				if (bl->attach(this)) {
++					bl->registerService();
++					IOLog("SWEET FB: AppleARMBacklight published (brightness slider)\n");
++				}
++			}
++			OSSafeReleaseNULL(bl);
+ 		}
+ 	}
+ 	OSSafeReleaseNULL(dtRoot);

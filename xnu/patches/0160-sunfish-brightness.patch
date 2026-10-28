@@ -4,7 +4,15 @@ Subject: [PATCH] sunfish: panel brightness (kern.sweet_brightness, DCS 0x51 via 
 ---
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -211,6 +211,7 @@
+@@ -40,6 +40,7 @@
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+@@ -211,6 +212,7 @@
  	void runJob(const SweetFBJob &job);
  
  	void cmdModeSetup(void);
@@ -12,8 +20,8 @@ Subject: [PATCH] sunfish: panel brightness (kern.sweet_brightness, DCS 0x51 via 
  	void kick(void);
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-@@ -611,6 +612,20 @@
- 	return false;
+@@ -314,6 +316,20 @@
+ 	OSSafeReleaseNULL(color);
  }
  
 +#define SWEET_DSI0_BASE         0x0AE94000ULL
@@ -30,23 +38,42 @@ Subject: [PATCH] sunfish: panel brightness (kern.sweet_brightness, DCS 0x51 via 
 +static vm_offset_t sweet_dsi;
 +static IOLock *sweet_dsi_lock;
 +
- void
- AppleCLCD::cmdModeSetup(void)
+ bool
+ AppleCLCD::start(IOService *provider)
  {
-@@ -620,6 +635,12 @@
- 	if (!fallback || !sweet_board_is("google,sunfish")) {
- 		return;
- 	}
-+	sweet_dsi_lock = IOLockAlloc();
-+	sweet_dsi = ml_io_map(SWEET_DSI0_BASE, 0x1000);
-+	if (sweet_dsi != 0) {
-+		IOLog("SWEET FB: DSI0 DSI_CTRL %#x (brightness: kern.sweet_brightness)\n",
-+		    ((volatile uint32_t *)sweet_dsi)[SWEET_DSI_CTRL / 4]);
+@@ -412,6 +428,31 @@
+ 	fMDP = 0;
+ 	fKickCTL = -1;
+ 	cmdModeSetup();
++	/*
++	 * The brightness (DSI0), on the Pixel 4a. Told by the device tree's root "/": the registry
++	 * root sweet_board_is() reads has no "compatible", so it never matches (and cmdModeSetup has
++	 * never run); that is left as it is, being untested the other way.
++	 */
++	IORegistryEntry *dtRoot = IORegistryEntry::fromPath("/", gIODTPlane);
++	OSData *dtCompat = dtRoot ? OSDynamicCast(OSData, dtRoot->getProperty("compatible")) : NULL;
++	bool sunfish = false;
++	if (dtCompat != NULL) {
++		const char *c = (const char *)dtCompat->getBytesNoCopy();
++		for (unsigned int i = 0, len = dtCompat->getLength(); i < len && !sunfish;) {
++			size_t n = strnlen(c + i, len - i);
++			sunfish = n == 14 && memcmp(c + i, "google,sunfish", 14) == 0;
++			i += (unsigned int)n + 1;
++		}
 +	}
- 	fMDP = ml_io_map(SWEET_MDP_BASE, SWEET_MDP_SIZE);
- 	if (fMDP == 0) {
- 		IOLog("SWEET FB: cannot map the MDP; no command-mode fallback\n");
-@@ -655,6 +676,77 @@
++	if (sunfish) {
++		sweet_dsi_lock = IOLockAlloc();
++		sweet_dsi = ml_io_map(SWEET_DSI0_BASE, 0x1000);
++		if (sweet_dsi != 0) {
++			IOLog("SWEET FB: DSI0 DSI_CTRL %#x (brightness: kern.sweet_brightness)\n",
++			    ((volatile uint32_t *)sweet_dsi)[SWEET_DSI_CTRL / 4]);
++		}
++	}
++	OSSafeReleaseNULL(dtRoot);
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -655,6 +696,77 @@
  	IOLog("SWEET FB: autorefresh did not take; kicking CTL %d with CTL_START after each frame\n", fKickCTL);
  }
  
@@ -124,7 +151,7 @@ Subject: [PATCH] sunfish: panel brightness (kern.sweet_brightness, DCS 0x51 via 
  void
  AppleCLCD::kick(void)
  {
-@@ -1203,8 +1295,20 @@
+@@ -1203,8 +1315,20 @@
  		}
  		break;
  	case kSweetFBSwapWait:
