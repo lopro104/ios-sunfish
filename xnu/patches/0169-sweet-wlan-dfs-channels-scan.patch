@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -3283,7 +3283,9 @@
+ static const uint8_t wp_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
+ static const uint16_t wp_chans[] = {
+ 	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
+-	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5745, 5765, 5785, 5805, 5825,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320,
++	5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680, 5700, 5720,     /* channels 100-144: DFS, passive only (home routers use them) */
++	5745, 5765, 5785, 5805, 5825,
+ };
+ #define WP_NCHAN        ((unsigned)(sizeof(wp_chans) / sizeof(wp_chans[0])))
+ 
+@@ -3499,7 +3501,7 @@
+ static bool
+ wp_scan_setup(void)
+ {
+-	uint8_t c[1024], vm[4] = { 0, 0, 0, 0 };
++	uint8_t c[2048], vm[4] = { 0, 0, 0, 0 };
+ 	uint32_t n, num = WP_NCHAN;
+ 
+ 	if (!wp_send(4, wp.htt_eid, vm, 4)) {
+@@ -3532,7 +3534,7 @@
+ 	}
+ 	for (unsigned k = 0; k < WP_NCHAN; k++) {
+ 		uint32_t ch[6];
+-		bool g5 = wp_chans[k] > 5000, dfs = wp_chans[k] >= 5260 && wp_chans[k] <= 5320;
++		bool g5 = wp_chans[k] > 5000, dfs = wp_chans[k] >= 5260 && wp_chans[k] <= 5720;
+ 
+ 		memset(ch, 0, sizeof(ch));
+ 		ch[0] = wp_chans[k];
