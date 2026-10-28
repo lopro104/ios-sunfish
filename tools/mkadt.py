@@ -212,6 +212,14 @@ def build(seed=None, qemu=False, highmem=False, device='sweet'):
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
+        ]),
+        # Wi-Fi node for launchd: com.apple.wifid.plist specifies
+        # _LimitLoadToDeviceTree: wlan\marconi-wifi. Without a wlan node,
+        # launchd ignores the daemon and wifid never starts.
+        node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('wlan,wcn3990') + cstr('wlan')),
         ])])
 
     fbcon = node('sweet-fbcon', [
