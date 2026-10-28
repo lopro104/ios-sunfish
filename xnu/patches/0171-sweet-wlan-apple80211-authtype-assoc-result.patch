@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4698,10 +4698,14 @@
+ ew_a80211_link_events(void)
+ {
+ 	uint8_t z[32] = { 0 };
++	uint8_t aev[16] = { 0 };
+ 
++	if (jn.connected && ew.up) {
++		memcpy(aev, jn.bssid, 6);
++	}
+ 	ew_a80211_event(2, z, 8);
+ 	ew_a80211_event(3, z, 0);
+-	ew_a80211_event(9, z, 8);
++	ew_a80211_event(9, aev, 16);
+ 	ew_a80211_event(4, z, 32);
+ }
+ 
+@@ -4822,19 +4826,48 @@
+ 			err = 0;
+ 		}
+ 		break;
+-	case 1: {                                               /* SSID: {version, ssid_len, ssid[32]} */
+-		uint32_t out[10] = { 0 };
+-
++	case 1: {                                               /* SSID: raw string bytes up to 32 */
+ 		if (!set) {
+-			out[0] = 1;
+-			if (up) {
+-				out[1] = jn.ssid_len;
+-				memcpy(&out[2], jn.ssid, MIN((size_t)jn.ssid_len, (size_t)32));
+-			}
++			size_t slen = up ? MIN((size_t)jn.ssid_len, (size_t)32) : 0;
++			rq->req_len = (uint32_t)slen;
++			err = ew_a80211_out(rq, jn.ssid, slen);
++		}
++		break;
++	}
++	case 2: {                                               /* AUTH_TYPE: 16 bytes {version, auth_lower, auth_upper, auth_upper_ext} */
++		if (!set) {
++			uint32_t out[4] = { 1, up ? 1 : 0, up ? 8 : 0, 0 };
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 6: {                                               /* PROTMODE: 12 bytes {version=1, mode=0, pad=0} */
++		if (!set) {
++			uint32_t out[3] = { 1, 0, 0 };
+ 			err = ew_a80211_out(rq, out, sizeof(out));
+ 		}
+ 		break;
+ 	}
++	case 5:                                                 /* POWERSAVE: 0 in req_val */
++	case 18:                                                /* INT_MIT: 0 in req_val */
++	case 21:                                                /* ASSOCIATE_RESULT: 0 in req_val (0 = success) */
++	case 26:                                                /* TX_POWER: in req_val (mW) */
++	case 57:                                                /* POWER_SAVE_LEVEL: in req_val */
++	case 353:                                               /* NSS (number of spatial streams) */
++	case 423:                                               /* COUNTRY_BAND_SUPPORT: bitmask (1=2.4G, 2=5G) */
++		if (!set) {
++			if (rq->req_type == 26) {
++				rq->req_val = 100;
++			} else if (rq->req_type == 353) {
++				rq->req_val = up ? 1 : 0;
++			} else if (rq->req_type == 423) {
++				rq->req_val = 3;
++			} else {
++				rq->req_val = 0;
++			}
++			err = 0;
++		}
++		break;
+ 	case 9: {                                               /* BSSID: 6 bytes, the bare ether_addr */
+ 		uint8_t out[6] = { 0 };
+ 
+@@ -4911,19 +4944,22 @@
+ 			err = 0;
+ 		}
+ 		break;
+-	case 11:                                                /* SCAN_RESULT (get): the next one, errno 5 after the last */
++	case 11: {                                              /* SCAN_RESULT (get): indexed by req_val */
+ 		if (!set) {
+-			if (g_a80211_cursor >= wp.nbss) {
+-				g_a80211_cursor = 0;                    /* a reader that starts again without a new SCAN_REQ gets the list again */
+-				err = EIO;
+-			} else {
++			uint32_t idx = rq->req_val;
++
++			if (idx < wp.nbss) {
+ 				uint8_t out[1160];
+ 
+-				ew_a80211_scanrec(out, g_a80211_cursor++);
++				ew_a80211_scanrec(out, idx);
++				rq->req_val = idx + 1;
+ 				err = ew_a80211_out(rq, out, sizeof(out));
++			} else {
++				err = EIO;
+ 			}
+ 		}
+ 		break;
++	}
+ 	case 103:                                               /* CURRENT_NETWORK (get): the connected network, in the scan result record */
+ 		if (!set) {
+ 			if (!up || jn.bss >= wp.nbss) {
+@@ -4973,6 +5009,27 @@
+ 			err = ew_a80211_out(rq, out, sizeof(out));
+ 		}
+ 		break;
++	}
++	case 106: {                                             /* RSSI_BOUNDS: 16 bytes {version=1, min=-100, max=-30, threshold=-75} */
++		if (!set) {
++			int32_t out[4] = { 1, -100, -30, -75 };
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 207: {                                             /* CHANNELS_INFO: {version, ..., count=0 at offset 12} */
++		if (!set) {
++			uint32_t out[4] = { 1, 0, 0, 0 };
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 387: {                                             /* COLOCATED_NETWORK_SCOPE_ID: 37 bytes */
++		if (!set) {
++			char out[37] = { 0 };
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
+ 	}
+ 	default:
+ 		break;
