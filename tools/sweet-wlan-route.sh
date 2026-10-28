@@ -29,6 +29,20 @@ while :; do
 				echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
 			fi
 
+			# IPv6: attach it and listen for router advertisements (the kernel only does that after SIOCLL_START + SIOCAUTOCONF_START,
+			# which IPConfiguration would do for a configd-managed service) and solicit one with rtsol (the kernel's own solicitation is
+			# not answered); then an unscoped default route via the advertising router (the kernel's own one is interface-scoped).
+			r6=$(ndp -r 2>/dev/null | sed -n 's/^\(fe80::[^ ]*%ew0\) if=ew0.*/\1/p' | head -1)
+			if [ "$v6started" != "$ip" ] || { [ -z "$r6" ] && [ $((count % 10)) -eq 9 ]; }; then
+				v6started=$ip
+				( sweet-autoconf6 ew0; sleep 2; rtsol ew0 & rp=$!; sleep 8; kill $rp ) >/dev/null 2>&1 &
+			fi
+			if [ -n "$r6" ] && ! route -n get -inet6 default 2>/dev/null | grep -q "interface: ew0"; then
+				route -n delete -inet6 default >/dev/null 2>&1
+				route -n add -inet6 default "$r6" >/dev/null 2>&1
+				echo "$(date +%T) IPv6 default route -> $r6 via ew0"
+			fi
+
 			# Periodic ARP keepalive and health check (every ~15s)
 			count=$((count + 1))
 			if [ $((count % 5)) -eq 0 ]; then
@@ -47,6 +61,10 @@ while :; do
 	else
 		count=0
 		fail_count=0
+		if [ -n "$v6started" ] && route -n get -inet6 default 2>/dev/null | grep -q "interface: ew0"; then
+			route -n delete -inet6 default >/dev/null 2>&1
+		fi
+		v6started=
 		if route -n get default 2>/dev/null | grep -q "interface: ew0"; then
 			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan -u >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
