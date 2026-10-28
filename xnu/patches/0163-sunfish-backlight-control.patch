@@ -1,0 +1,32 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: AppleARMBacklight stand-in gets "backlight-control" = true (what CoreBrightness matches); selector 18 back to 1
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -542,6 +542,11 @@
+ 			if (bl != NULL && bl->init()) {
+ 				bl->fValue = SWEET_BL_MAX;      /* (the boot loader leaves the panel bright) */
+ 				bl->publish();
++				/*
++				 * What CoreBrightness ([CBDisplayContaineriOS findBacklight]) matches on: IOPropertyMatch
++				 * {"backlight-control" = true}, then IOObjectConformsTo AppleARMBacklight.
++				 */
++				bl->setProperty("backlight-control", kOSBooleanTrue);
+ 				bl->setName("backlight");
+ 				if (bl->attach(this)) {
+ 					bl->registerService();
+@@ -1382,12 +1387,7 @@
+ 		outCount = 2;
+ 		break;
+ 	case kSweetFBIsMainDisplay:
+-		/*
+-		 * CoreBrightness looked up the display's service by registry ID 0x1 ("no matching container
+-		 * to registry ID 0x1", IORegistryEntryIDMatching) and 1 is what this answered: maybe it is the
+-		 * display's registry ID rather than a yes/no. The backlight stand-in's ID is not 0 either way.
+-		 */
+-		out[0] = sweet_bl_registry_id != 0 ? sweet_bl_registry_id : 1;
++		out[0] = 1;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:

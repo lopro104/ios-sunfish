@@ -1,0 +1,39 @@
+From: sunfish-display
+Subject: [PATCH] SweetFramebuffer: selector 18 answers the backlight stand-in registry ID (CoreBrightness looked up ID 0x1)
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -415,6 +415,7 @@
+ #define SWEET_DSI_TPG_FIFO_RST  0x1EC
+ 
+ static vm_offset_t sweet_dsi;
++static uint64_t sweet_bl_registry_id;   /* the AppleARMBacklight stand-in's, once published */
+ static IOLock *sweet_dsi_lock;
+ 
+ bool
+@@ -544,7 +545,9 @@
+ 				bl->setName("backlight");
+ 				if (bl->attach(this)) {
+ 					bl->registerService();
+-					IOLog("SWEET FB: AppleARMBacklight published (brightness slider)\n");
++					sweet_bl_registry_id = bl->getRegistryEntryID();
++					IOLog("SWEET FB: AppleARMBacklight published (brightness slider), registry ID %#llx\n",
++					    sweet_bl_registry_id);
+ 				}
+ 			}
+ 			OSSafeReleaseNULL(bl);
+@@ -1379,7 +1382,12 @@
+ 		outCount = 2;
+ 		break;
+ 	case kSweetFBIsMainDisplay:
+-		out[0] = 1;
++		/*
++		 * CoreBrightness looked up the display's service by registry ID 0x1 ("no matching container
++		 * to registry ID 0x1", IORegistryEntryIDMatching) and 1 is what this answered: maybe it is the
++		 * display's registry ID rather than a yes/no. The backlight stand-in's ID is not 0 either way.
++		 */
++		out[0] = sweet_bl_registry_id != 0 ? sweet_bl_registry_id : 1;
+ 		outCount = 1;
+ 		break;
+ 	case kSweetFBGetDotPitch:
