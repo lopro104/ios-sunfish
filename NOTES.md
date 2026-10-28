@@ -907,3 +907,7 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 ### 2026-10-28 HT retest on the fixed kernel (Claude)
 - Observed: `shim-local-0157-ht.img` (kernel with 0154, HT on, full ADT): joined with HT 1 (caps 0x1ac, 8 HT rates), 30/30 pings at 6 ms, but within ~6 minutes ew0 went "Network is down", a 300 x 1400-byte ping to the router got 0 replies, and the service loop printed no more "EW: N s" stats lines (so it was stuck or ended). No panic. This matches the first HT run (80% loss, WMI credits 0). The no-HT image (wlannoht=1) ran 33+ minutes clean.
 - Decision: HT stays OFF. Keep `wlannoht=1` in every cmdline until the HT-specific stall is understood (guess, unverified: A-MPDU/block-ack or TX rate-control interplay; the HT IE advertises A-MPDU factor 3 but the host never sets up block-ack).
+
+### 2026-10-28 Wi-Fi: lost DHCP ack left the link without address, patch 0159 (Claude)
+- Observed on 0161 (display session's image, no-HT): join OK, "NET: DHCP offer ...", then "NET: no DHCP ack" and the service sat in "service running" with tx 0 rx 0 for 9+ minutes, ew0 inactive, so everything ran over USB. Cause (read from code): jn_net_test returned after the first request timeout and the station loop never retried or rejoined.
+- Patch 0159 (`shim-local-0162-dhcp.img`): up to 3 DHCP requests (2 s each); if there is still no lease the station loop sets jn.kicked and joins again. Observed on 0162 boot: DHCP bound first time, Wi-Fi 15/15 pings; the retry path itself has not been exercised yet.

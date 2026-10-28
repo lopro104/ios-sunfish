@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c	2026-10-28 15:28:34.896192319 +0200
++++ b/bsd/dev/sweet_mpss.c	2026-10-28 15:28:34.884764932 +0200
+@@ -5009,11 +5009,13 @@
+ 	ev("NET: DHCP offer %u.%u.%u.%u from %u.%u.%u.%u, router %u.%u.%u.%u", nt.yiaddr[0], nt.yiaddr[1], nt.yiaddr[2], nt.yiaddr[3], nt.server[0],
+ 	    nt.server[1], nt.server[2], nt.server[3], nt.router[0], nt.router[1], nt.router[2], nt.router[3]);
+ 	nt.state = 3;
+-	nt_dhcp(3);
+-	t0 = nt_us();
+-	while (nt.state == 3 && nt_us() - t0 < 3000000) {
+-		wp_poll();
+-		sleep_ms(5);
++	for (tries = 0; tries < 3 && nt.state == 3; tries++) {   /* the ack can be lost: ask again, as a DHCP client does */
++		nt_dhcp(3);
++		t0 = nt_us();
++		while (nt.state == 3 && nt_us() - t0 < 2000000) {
++			wp_poll();
++			sleep_ms(5);
++		}
+ 	}
+ 	if (nt.state != 4) {
+ 		ev("NET: no DHCP ack");
+@@ -5416,6 +5418,10 @@
+ 		}
+ 		wp_fault_check("join done");
+ 		jn_net_test();                                  /* DHCP, then ew0 gets the address (service mode) */
++		if (nt.state != 4) {
++			ev("EW: no lease: joining again");      /* otherwise the link sits here for ever without an address */
++			jn.kicked = true;
++		}
+ 		ev("EW: service running");
+ 		next_mon = nt_us() + 5000000;
+ 		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
