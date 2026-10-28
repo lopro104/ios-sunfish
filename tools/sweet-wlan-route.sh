@@ -5,6 +5,10 @@
 export PATH=$PATH:/var/jb/usr/sbin:/var/jb/usr/bin:/var/jb/bin:/var/jb/sbin
 USB_ROUTER=192.168.7.1
 
+# SCNetworkInterfaceCopyAll* (wifid, MobileWiFi's server) waits for configd's InterfaceNamer plugin, which does not run here, to say that IOKit is
+# quiet; without this key wifid blocks and SpringBoard waits for it at boot (stuck on the Apple logo)
+sweet-ifnamer >/dev/null 2>&1
+
 # mDNSResponder asks its DNS servers through ue0 (the interface of the only network service sweet-net publishes), so ue0 keeps a scoped
 # default route over USB (the PC's NAT) for DNS; the data goes over the default route, which is Wi-Fi while it is up.
 route -n add -ifscope ue0 default "$USB_ROUTER" >/dev/null 2>&1
