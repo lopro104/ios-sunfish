@@ -823,3 +823,29 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   1. The "x" (delete badge) on app icons when long-pressing wallpaper to edit the homescreen (icon jiggle mode).
   2. The lockscreen/notification center clock when viewing notifications.
 - **Context**: Root cause likely in QuartzCore blur/vibrancy shader blending or surface format conversion in Mesa freedreno / `eagl` texture blits. Recorded for future display/GPU triage; not being touched now per user instruction.
+
+## 2026-10-28 ~03:20 MILESTONE: 802.11n HT HIGH-SPEED RATES (>54 Mbps) (patch 0149, shim-local-0149-ht.img)
+- Context: Step 15 of Wi-Fi roadmap ("802.11n HT High-Speed Rates (>54 Mbps Throughput)"). Previously, peer association registered legacy 802.11a/g OFDM rates only (link rate 54 Mbps max).
+- Studied Linux `ath10k` (`drivers/net/wireless/ath/ath10k/wmi-tlv.c` and `mac.c`):
+  - Formatted 26-byte HT Capabilities Information Element (IE 45): `cap_info` = `0x012d` (LDPC, 20 MHz, SM_PS disabled, Short GI 20 MHz, Rx STBC 1), `ampdu_params` = `0x1b` (64k factor, 8 us density), `mcs` = MCS 0..7 (`0xFF` in `rx_mask[0]`).
+  - Peer association command (`WMI_PEER_ASSOC_CMDID`): requires `WMI_PEER_HT` (0x1000) in flags, `WMI_RC_HT_FLAG` (0x08) in rate_caps, max MPDU 65535, `phy_mode = 5` (`MODE_11NG_HT20`), and an 8-byte TLV (tag 17) containing MCS 0..7.
+- Implementation (patch `0149-sweet-wlan-ht-rates.patch`):
+  - `sweet_wlan_util.h`: added `bool ht`, `uint16_t ht_caps`, `uint8_t ht_ampdu` to `struct swu_assoc_resp`.
+  - `sweet_wlan_util.c` (`swu_assoc_req`): dynamically detects IE 45 in AP beacon and appends the 28-byte HT Capabilities IE.
+  - `sweet_wlan_util.c` (`swu_assoc_resp`): parses AP IE 45 into `r->ht`, `r->ht_caps`, `r->ht_ampdu`.
+  - `sweet_mpss.c` (`jn_peer_assoc`): when `jn.ar.ht` is set, programs `a[5] |= 0x1000` (`WMI_PEER_HT`), `a[8] = ht_caps`, `a[9] = 65535`, `a[11] |= 0x08` (`WMI_RC_HT_FLAG`), `a[14] = 5` (`MODE_11NG_HT20`), and passes `ht_rates = {0, 1, 2, 3, 4, 5, 6, 7}` (MCS 0..7) in the second tag 17 TLV.
+- Verification:
+  - Compiled in Docker (`FRESH=0 tools/xnu-docker/build.sh`), packaged with `mkpayload.py`, and generated AVB-signed image `shim/out/shim-local-0149-ht.img` (64 MiB).
+  - Committed patch `xnu/patches/0149-sweet-wlan-ht-rates.patch` (`fbff8bd`). Left device running current stable kernel to avoid disruption while user is away; image ready for test boot.
+
+## 2026-10-28 ~03:30 MILESTONE: LINUX ath10k vs ANDROID vs iOS 16.7 HAL DEEP STUDY & DIAGNOSTICS
+- Documented complete architecture comparison in `research/wifi/HAL_AND_ARCHITECTURE.md`.
+- Live diagnostic tool `userland/net/sweet-apple80211-test.c` (built with Theos and verified on phone, commit `67a8139`):
+  1. `Apple80211Open`: succeeds with valid handle (`0x10580a000`), confirming userland framework initializes on this device.
+  2. `WiFiManagerClientCreate`: succeeds with valid manager (`0x104507f10`).
+  3. `Apple80211GetIfListCopy` and `BindToInterface(ew0)`: return `-3903` (`kApple80211ErrorNotFound`) because Apple's private framework queries IORegistry for `IO80211Interface`. In our XNU kernel, `ew0` was attached via BSD raw `ifnet_attach`, bypassing IOKit's `IO80211Interface`.
+  4. `wifid`: launchd ignores `/System/Library/LaunchDaemons/com.apple.wifid.plist` because `sunfish.adt` lacks a `wlan` node (`_LimitLoadToDeviceTree: wlan\marconi-wifi`). When run manually, it starts, initializes `ThreeBars.sqlite` database, and reports `PPM Error:No matching driver found` because no `IO80211Interface` exists in IORegistry.
+- Strategy for iOS Settings.app UI integration:
+  - Path A: Add dummy `wlan` node to `tools/mkadt.py` + IOKit class `Sweet80211Interface : public IOService` in XNU registering `IO80211Interface` with `"BSD Name" = "ew0"` and socket ioctl handlers (`SIOCGA80211` / `SIOCSA80211`).
+  - Path B (Zero risk, instant): Build a native iOS Settings PreferenceBundle (`/Library/PreferenceBundles/SweetWiFi.bundle`) that embeds `sweet-wifi` directly into Settings.app without relying on Apple's closed-source `wifid`.
+
