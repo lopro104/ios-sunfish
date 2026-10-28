@@ -1,0 +1,100 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -2872,6 +2872,7 @@
+ 	uint8_t *pool;
+ 	uint64_t pa;
+ 	uint32_t wr[WP_NR], sw[WP_NR];
++	uint8_t pend[WP_NR];                            /* destination ring slots consumed but not yet posted again (see wp_repost4) */
+ 	uint8_t seq[8], wmi_eid, htt_eid, mac[6];
+ 	bool htc_ready, got_conn, svc_ready, svc_avail, wmi_ready, ack_rssi, ext_addr;
+ 	uint8_t conn_st, conn_eid;
+@@ -2949,6 +2950,29 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * A destination ring descriptor is 16 bytes and the CE hardware writes the received length into it, but the cache line is 64 bytes and
++ * wp_sync cleans whole lines: posting one slot wrote back stale copies of the three neighbouring slots, and a message the hardware had
++ * completed in the meantime was wiped (the ring then waited for it for ever: no HTT rx indications or TX completions any more, while WMI on
++ * its own, quiet ring went on). So slots are posted four at a time, a whole aligned line of slots the hardware does not own.
++ */
++static void
++wp_repost4(unsigned r)
++{
++	unsigned wr = wp.wr[r];
++
++	for (unsigned j = 0; j < 4; j++) {
++		struct wp_desc *d = wp_desc(r, wr + j);
++
++		d->addr = (wp.pa + wp_cfg[r].bufs + (uint64_t)(wr + j) * WP_BUF) & 0x1fffffffffull;
++		d->nbytes = 0;
++	}
++	wp_sync(wp_desc(r, wr), 64);
++	wp.wr[r] = (wr + 4) & (wp_cfg[r].n - 1);
++	wp_ce(wp_cfg[r].ce)[0x40 / 4] = wp.wr[r];
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ /* ath10k_ce_init_pipe for the four host rings; false if memory is missing */
+ static bool
+ wp_rings(void)
+@@ -2990,7 +3014,8 @@
+ 			ce[4] = (ce[4] & ~0x1fu) | ((uint32_t)(rpa >> 32) & 0x1f);
+ 			ce[5] = n;
+ 			ce[0x18 / 4] = ce[0x18 / 4] & ~(1u << 18);
+-			for (unsigned k = 0; k < n - 1; k++) {
++			/* a ring that starts on a line boundary keeps one line back, so that every later post is a whole free line */
++			for (unsigned k = 0, cnt = (wp.wr[r] & 3) == 0 ? n - 4 : n - 1; k < cnt; k++) {
+ 				wp_repost(r);
+ 			}
+ 		}
+@@ -3860,6 +3885,13 @@
+ 	}
+ 	fr = wp.pool + JN_TXFR_OFF + (uint64_t)id * 2048;
+ 	n = swu_eth_to_nwifi(eth, len, jn.bssid, fr, 2048);
++	{
++		/* what kind of frame this is, for the history ring: class (1 arp, 2 udp, 3 tcp, 4 icmp, 5 ipv6, 6 other), multicast bit, length */
++		uint16_t et = (uint16_t)((eth[12] << 8) | eth[13]);
++		uint32_t cls = et == 0x0806 ? 1u : et == 0x86dd ? 5u : (et == 0x0800 && len >= 24) ? (eth[23] == 17 ? 2u : eth[23] == 6 ? 3u : eth[23] == 1 ? 4u : 6u) : 6u;
++
++		wp_hist(0x50000000u | (cls << 20) | ((eth[0] & 1u) << 16) | (uint32_t)MIN(len, (size_t)0xffff));
++	}
+ 	if (n == 0) {
+ 		jn_txid_free((unsigned)id);
+ 		return 22;
+@@ -4292,6 +4324,7 @@
+ 	if (!(att & (1u << 31)) || (att & ((1u << 30) | (1u << 29) | (1u << 3) | (1u << 27) | (1u << 17) | (1u << 16))) ||
+ 	    mlen > WP_HTT_BUFSZ - JN_RXDESC) {
+ 		jn.rx_drop++;
++		wp_hist(0x70000000u | ((att >> 24) << 16) | (att & 0xffffu));      /* dropped: the rx_attention bits */
+ 		return;
+ 	}
+ 	n = swu_nwifi_to_eth(buf + JN_RXDESC, mlen, eth, sizeof(eth));
+@@ -4306,6 +4339,12 @@
+ 		ev("JOIN: EAPOL %zu bytes -> %d (supplicant state %d)", n - 14, e, jn.wpa.state);
+ 		return;
+ 	}
++	{
++		uint16_t et = (uint16_t)((eth[12] << 8) | eth[13]);
++		uint32_t cls = et == 0x0806 ? 1u : et == 0x86dd ? 5u : (et == 0x0800 && n >= 24) ? (eth[23] == 17 ? 2u : eth[23] == 6 ? 3u : eth[23] == 1 ? 4u : 6u) : 6u;
++
++		wp_hist(0x60000000u | (cls << 20) | ((eth[0] & 1u) << 16) | (uint32_t)MIN(n, (size_t)0xffff));
++	}
+ 	jn.rx_frames++;
+ 	if (jn.rx_logged < 3) {
+ 		jn.rx_logged++;
+@@ -5282,7 +5321,12 @@
+ 			wp_sync(buf, MIN((uint32_t)nb, WP_BUF));
+ 			wp_rx(wp_cfg[r].ce, buf, MIN((uint32_t)nb, WP_BUF));
+ 			wp.sw[r] = (wp.sw[r] + 1) & mask;
+-			wp_repost(r);
++			if ((wp.wr[r] & 3) != 0) {
++				wp_repost(r);                   /* not on a line boundary: the old way */
++			} else if (++wp.pend[r] == 4) {
++				wp.pend[r] = 0;
++				wp_repost4(r);
++			}
+ 		}
+ 	}
+ }
