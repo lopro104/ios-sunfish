@@ -1,0 +1,181 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: panel brightness (kern.sweet_brightness, DCS 0x51 via the DSI0 command FIFO); log unhandled framebuffer selectors and setProperties
+
+---
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -211,6 +211,7 @@
+ 	void runJob(const SweetFBJob &job);
+ 
+ 	void cmdModeSetup(void);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ 	void kick(void);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -611,6 +612,20 @@
+ 	return false;
+ }
+ 
++#define SWEET_DSI0_BASE         0x0AE94000ULL
++#define SWEET_DSI_CTRL          0x004
++#define SWEET_DSI_DMA_CTRL      0x03C
++#define SWEET_DSI_DMA_LENGTH    0x04C
++#define SWEET_DSI_DMA_TRIGGER   0x090
++#define SWEET_DSI_INT_CTRL      0x110
++#define SWEET_DSI_INT_KEEP      0xA222AA02u     /* the enables and the error mask, no other status bit */
++#define SWEET_DSI_TPG_CTRL      0x15C
++#define SWEET_DSI_TPG_DMA_INIT  0x17C
++#define SWEET_DSI_TPG_FIFO_RST  0x1EC
++
++static vm_offset_t sweet_dsi;
++static IOLock *sweet_dsi_lock;
++
+ void
+ AppleCLCD::cmdModeSetup(void)
+ {
+@@ -620,6 +635,12 @@
+ 	if (!fallback || !sweet_board_is("google,sunfish")) {
+ 		return;
+ 	}
++	sweet_dsi_lock = IOLockAlloc();
++	sweet_dsi = ml_io_map(SWEET_DSI0_BASE, 0x1000);
++	if (sweet_dsi != 0) {
++		IOLog("SWEET FB: DSI0 DSI_CTRL %#x (brightness: kern.sweet_brightness)\n",
++		    ((volatile uint32_t *)sweet_dsi)[SWEET_DSI_CTRL / 4]);
++	}
+ 	fMDP = ml_io_map(SWEET_MDP_BASE, SWEET_MDP_SIZE);
+ 	if (fMDP == 0) {
+ 		IOLog("SWEET FB: cannot map the MDP; no command-mode fallback\n");
+@@ -655,6 +676,77 @@
+ 	IOLog("SWEET FB: autorefresh did not take; kicking CTL %d with CTL_START after each frame\n", fKickCTL);
+ }
+ 
++/*
++ * The panel's brightness (Pixel 4a, docs/SUNFISH-BACKLIGHT.md): DCS 0x51 with a 10-bit level, high
++ * byte first, sent as a DCS long write through DSI0's command FIFO (no memory, no SMMU), as Linux's
++ * dsi_ctrl_hw_cmn_kickoff_fifo_command does. kern.sweet_brightness (bsd/dev/sweet_sample.c) calls
++ * sweet_fb_set_brightness(4..1023). Nothing is sent unless the controller is on in command mode.
++ */
++extern "C" int sweet_fb_set_brightness(int level);
++
++extern "C" int
++sweet_fb_set_brightness(int level)
++{
++	if (sweet_dsi == 0 || sweet_dsi_lock == NULL) {
++		return ENODEV;
++	}
++	level = level < 4 ? 4 : level > 1023 ? 1023 : level;
++	volatile uint32_t *r = (volatile uint32_t *)sweet_dsi;
++	IOLockLock(sweet_dsi_lock);
++	uint32_t ctrl = r[SWEET_DSI_CTRL / 4];
++	if ((ctrl & 0x5u) != 0x5u) {
++		IOLockUnlock(sweet_dsi_lock);
++		IOLog("SWEET FB: brightness: DSI0 not on in command mode (DSI_CTRL %#x); nothing sent\n", ctrl);
++		return ENXIO;
++	}
++	r[SWEET_DSI_INT_CTRL / 4] = (r[SWEET_DSI_INT_CTRL / 4] & SWEET_DSI_INT_KEEP) | 1u;
++	r[SWEET_DSI_TPG_CTRL / 4] = 0x00030006u;
++	r[SWEET_DSI_TPG_DMA_INIT / 4] = 0xC0390003u;    /* long write, DT 0x39, 3 bytes, last command */
++	r[SWEET_DSI_TPG_DMA_INIT / 4] = 0xFF000051u | ((uint32_t)level & 0xffu) << 16 | ((uint32_t)level >> 8) << 8;
++	uint32_t dma = r[SWEET_DSI_DMA_CTRL / 4];
++	r[SWEET_DSI_DMA_CTRL / 4] = (dma & ~(1u << 31 | 1u << 30 | 1u << 26)) | 1u << 28;
++	r[SWEET_DSI_DMA_LENGTH / 4] = 8;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	r[SWEET_DSI_DMA_TRIGGER / 4] = 1;
++	bool done = false;
++	for (unsigned i = 0; i < 500 && !done; i++) {
++		done = (r[SWEET_DSI_INT_CTRL / 4] & 1u) != 0;
++		if (!done) {
++			IODelay(100);
++		}
++	}
++	r[SWEET_DSI_INT_CTRL / 4] = (r[SWEET_DSI_INT_CTRL / 4] & SWEET_DSI_INT_KEEP) | 1u;
++	r[SWEET_DSI_TPG_CTRL / 4] = 0;
++	r[SWEET_DSI_TPG_FIFO_RST / 4] = 1;
++	IODelay(1);
++	r[SWEET_DSI_TPG_FIFO_RST / 4] = 0;
++	r[SWEET_DSI_DMA_CTRL / 4] = dma;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLockUnlock(sweet_dsi_lock);
++	IOLog("SWEET FB: brightness %d %s\n", level, done ? "sent" : "NOT acknowledged (50 ms)");
++	return done ? 0 : ETIMEDOUT;
++}
++
++/*
++ * What iOS sets on the framebuffer (CoreBrightness and others may say the brightness this way):
++ * logged, the first 64 times, and taken.
++ */
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	static unsigned logged;
++
++	if (logged < 64) {
++		logged++;
++		OSSerialize *s = OSSerialize::withCapacity(512);
++		if (s != NULL && properties != NULL && properties->serialize(s)) {
++			IOLog("SWEET FB: setProperties %.400s\n", s->text());
++		}
++		OSSafeReleaseNULL(s);
++	}
++	return kIOReturnSuccess;
++}
++
+ void
+ AppleCLCD::kick(void)
+ {
+@@ -1203,8 +1295,20 @@
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
+-	default:
+ 		break;
++	default: {
++		/* what the driver does not do yet, for finding what iOS asks (the brightness, ...) */
++		static unsigned logged;
++		if (logged < 400) {
++			logged++;
++			IOLog("SWEET FB: selector %u not handled: %u scalars %#llx %#llx %#llx %#llx, struct in %u, out %u/%u\n",
++			    selector, args->scalarInputCount,
++			    args->scalarInputCount > 0 ? args->scalarInput[0] : 0, args->scalarInputCount > 1 ? args->scalarInput[1] : 0,
++			    args->scalarInputCount > 2 ? args->scalarInput[2] : 0, args->scalarInputCount > 3 ? args->scalarInput[3] : 0,
++			    args->structureInputSize, args->scalarOutputCount, args->structureOutputSize);
++		}
++		break;
++	}
+ 	}
+ 
+ 	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -104,6 +104,30 @@
+  * (SweetFramebuffer.cpp; touch follows, SweetHID.cpp). Boot-arg sweetfb_fit sets it at start.
+  */
+ int sweet_fb_fit = 0;
++/* the panel's brightness, 4 to 1023 (iokit/Kernel/arm/SweetFramebuffer.cpp, DCS 0x51); -1: not set by us */
++extern int sweet_fb_set_brightness(int level);
++static int sweet_fb_brightness = -1;
++
++static int
++sysctl_sweet_brightness(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int value = sweet_fb_brightness;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	value = value < 4 ? 4 : value > 1023 ? 1023 : value;
++	error = sweet_fb_set_brightness(value);
++	if (error == 0) {
++		sweet_fb_brightness = value;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_brightness, "I", "panel brightness, 4 to 1023 (DCS 0x51 over DSI0)");
++
+ SYSCTL_INT(_kern, OID_AUTO, sweetfb_fit, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_fit, 0,
+     "the presented display shrunk to fit the panel, whole");
+ /* What the display showed (SweetFramebuffer.cpp counts them), for measuring the frame rate. */
