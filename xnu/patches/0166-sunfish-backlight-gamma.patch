@@ -1,0 +1,37 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-28 19:40:21.929875541 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-28 19:40:21.938798455 +0200
+@@ -283,6 +283,25 @@
+ 	return true;
+ }
+ 
++/*
++ * CoreBrightness sends the slider position as it is (half way is ~512), and the panel's DCS 0x51
++ * is linear in light, so a straight map puts all the visible change at the bottom of the slider.
++ * Map through gamma 2.2 instead: 4 + 1019 * (value / 1024)^2.2, in 16 interpolated steps.
++ */
++static int
++sweet_bl_level(uint32_t value)
++{
++	static const uint16_t curve[17] = {
++		4, 6, 15, 30, 52, 83, 122, 169, 226, 291, 366, 451, 545, 649, 764, 888, 1023,
++	};
++	uint32_t i = value / 64, f = value % 64;
++
++	if (i >= 16) {
++		return curve[16];
++	}
++	return curve[i] + (int)((curve[i + 1] - curve[i]) * f / 64);
++}
++
+ IOReturn
+ AppleARMBacklight::setProperties(OSObject *properties)
+ {
+@@ -305,7 +324,7 @@
+ 	}
+ 	if (found) {
+ 		fValue = value > SWEET_BL_MAX ? SWEET_BL_MAX : value;
+-		sweet_fb_set_brightness(4 + (int)((uint64_t)fValue * 1019 / SWEET_BL_MAX));
++		sweet_fb_set_brightness(sweet_bl_level(fValue));
+ 		publish();
+ 	}
+ 	return kIOReturnSuccess;
