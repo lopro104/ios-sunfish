@@ -66,7 +66,7 @@ cmd_status(void)
 	}
 
 	char ip[64] = {0}, mask[64] = {0}, router[64] = {0}, dns[64] = {0}, ssid[64] = {0};
-	if (sscanf(buf, "%63s %63s %63s %63s %63s", ip, mask, router, dns, ssid) < 4) {
+	if (sscanf(buf, "%63s %63s %63s %63s %63[^\n]", ip, mask, router, dns, ssid) < 4) {
 		printf("Wi-Fi status: Connecting (%s)...\n", buf);
 		return 0;
 	}
@@ -334,7 +334,7 @@ cmd_connect(const char *ssid, const char *pass)
 		size_t len = sizeof(buf) - 1;
 		if (sysctlbyname("kern.sweet_wlan_info", buf, &len, NULL, 0) == 0 && len > 0) {
 			char cur_ip[64] = {0}, cur_mask[64] = {0}, cur_router[64] = {0}, cur_dns[64] = {0}, cur_ssid[64] = {0};
-			if (sscanf(buf, "%63s %63s %63s %63s %63s", cur_ip, cur_mask, cur_router, cur_dns, cur_ssid) >= 4) {
+			if (sscanf(buf, "%63s %63s %63s %63s %63[^\n]", cur_ip, cur_mask, cur_router, cur_dns, cur_ssid) >= 4) {
 				if (strcmp(cur_ssid, ssid) == 0) {
 					printf("\nSuccessfully connected to \"%s\"!\n", ssid);
 					printf("IP: %s, Gateway: %s, DNS: %s\n", cur_ip, cur_router, cur_dns);

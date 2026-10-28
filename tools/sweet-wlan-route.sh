@@ -21,7 +21,8 @@ while :; do
 			subnet="${ip%.*}.0"
 			route -n add -net "$subnet" -netmask "${mask:-255.255.255.0}" -interface ew0 >/dev/null 2>&1
 
-			if ! route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+			# (also when the default route is on ew0 but points at the previous network's router)
+			if ! route -n get default 2>/dev/null | grep -q "interface: ew0" || ! route -n get default 2>/dev/null | grep -q "gateway: $router\$"; then
 				ping -c 1 -W 1 "$router" >/dev/null 2>&1
 				[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
 				route -n delete default >/dev/null 2>&1
@@ -35,7 +36,7 @@ while :; do
 			r6=$(ndp -r 2>/dev/null | sed -n 's/^\(fe80::[^ ]*%ew0\) if=ew0.*/\1/p' | head -1)
 			if [ "$v6started" != "$ip" ] || { [ -z "$r6" ] && [ $((count % 10)) -eq 9 ]; }; then
 				v6started=$ip
-				( sweet-autoconf6 ew0; sleep 2; rtsol ew0 & rp=$!; sleep 8; kill $rp ) >/dev/null 2>&1 &
+				( sweet-autoconf6 ew0 stop; ndp -R; ndp -P; route -n delete -inet6 default; sweet-autoconf6 ew0; sleep 2; rtsol ew0 & rp=$!; sleep 8; kill $rp ) >/dev/null 2>&1 &
 			fi
 			if [ -n "$r6" ] && ! route -n get -inet6 default 2>/dev/null | grep -q "interface: ew0"; then
 				route -n delete -inet6 default >/dev/null 2>&1

@@ -134,7 +134,7 @@ get_wlan_info(char *ip, char *mask, char *router, char *dns, char *ssid)
 	if (len == 0 || buf[0] == 0) {
 		return -1;
 	}
-	if (sscanf(buf, "%63s %63s %63s %63s %63s", ip, mask, router, dns, ssid) < 4) {
+	if (sscanf(buf, "%63s %63s %63s %63s %63[^\n]", ip, mask, router, dns, ssid) < 4) {
 		return -1;
 	}
 	return 0;
