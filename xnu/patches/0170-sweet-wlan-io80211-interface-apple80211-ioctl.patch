@@ -11,7 +11,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  static errno_t
  ew_if_output(ifnet_t ifp, mbuf_t m)
  {
-@@ -4642,19 +4645,71 @@
+@@ -4642,19 +4645,290 @@
  	return 0;
  }
  
@@ -31,6 +31,54 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +#define SWEET_SIOCSA80211       _IOW('i', 200, struct sweet_a80211req)
 +#define SWEET_SIOCGA80211       _IOWR('i', 201, struct sweet_a80211req)
 +
++/* Apple80211 events: kernel events vendor Apple (1), class 6, subclass 1; event code, then the interface name (16 bytes) and a payload */
++static void
++ew_a80211_event(uint32_t code, const void *payload, size_t plen)
++{
++	struct kev_msg km;
++	uint8_t buf[16 + 64] = { 0 };
++
++	if (plen > 64) {
++		plen = 64;
++	}
++	memcpy(buf, "ew0", 3);
++	if (plen != 0) {
++		memcpy(buf + 16, payload, plen);
++	}
++	memset(&km, 0, sizeof(km));
++	km.vendor_code = 1;
++	km.kev_class = 6;
++	km.kev_subclass = 1;
++	km.event_code = code;
++	km.dv[0].data_length = (uint32_t)(16 + plen);
++	km.dv[0].data_ptr = buf;
++	(void)kev_post_msg(&km);
++}
++
++static uint32_t g_a80211_cursor;                        /* the next scan result to hand out */
++
++static volatile uint32_t g_a80211_power = 1;           /* what Settings' Wi-Fi switch says (the radio itself stays on) */
++
++/* copy a reply of n bytes (as much as the caller has room for) out to the request's buffer */
++static int
++ew_a80211_out(const struct sweet_a80211req *rq, const void *buf, size_t n)
++{
++	return copyout(buf, (user_addr_t)rq->req_data, MIN((size_t)rq->req_len, n));
++}
++
++static uint32_t
++ew_a80211_channel(uint16_t mhz)
++{
++	return mhz > 5000 ? (uint32_t)(mhz - 5000) / 5 : mhz == 2484 ? 14 : (uint32_t)(mhz - 2407) / 5;
++}
++
++/* apple80211_channel flags (itlwm's apple80211_var.h): 20 MHz 0x2, 40 MHz 0x4, 2.4 GHz 0x8, 5 GHz 0x10, passive 0x40, DFS 0x80 */
++static uint32_t
++ew_a80211_chflags(uint16_t mhz)
++{
++	return 0x2 | (mhz > 5000 ? 0x10u : 0x8u);
++}
++
 +static int
 +ew_a80211(bool set, struct sweet_a80211req *rq)
 +{
@@ -38,13 +86,184 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	static unsigned nseen;
 +	uint32_t key = rq->req_type | (set ? 0x80000000u : 0);
 +	int err = EOPNOTSUPP;
++	bool up = jn.connected && ew.up;
 +
++	if (rq->req_data == 0 && rq->req_len != 0) {
++		return EINVAL;
++	}
 +	switch (rq->req_type) {
 +	case 12: {                                              /* CARD_CAPABILITIES: 13 bytes, a bitmap */
 +		uint8_t caps[13] = { 0 };
 +
-+		if (!set && rq->req_len >= sizeof(caps)) {
-+			err = copyout(caps, (user_addr_t)rq->req_data, sizeof(caps));
++		if (!set) {
++			err = ew_a80211_out(rq, caps, sizeof(caps));
++		}
++		break;
++	}
++	case 19: {                                              /* POWER: {version, num_radios, power_state[4]} */
++		if (set) {
++			uint32_t in[6] = { 0 };
++
++			err = copyin((user_addr_t)rq->req_data, in, MIN((size_t)rq->req_len, sizeof(in)));
++			if (err == 0) {
++				g_a80211_power = in[2];
++			}
++		} else {
++			uint32_t out[6] = { 1, 1, g_a80211_power, 0, 0, 0 };
++
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 13:                                                /* STATE: the value is returned in req_val: 0 init, 1 scan, 2 auth, 3 assoc, 4 run */
++		if (!set) {
++			rq->req_val = up ? 4 : 1;
++			err = 0;
++		}
++		break;
++	case 1: {                                               /* SSID: {version, ssid_len, ssid[32]} */
++		uint32_t out[10] = { 0 };
++
++		if (!set) {
++			out[0] = 1;
++			if (up) {
++				out[1] = jn.ssid_len;
++				memcpy(&out[2], jn.ssid, MIN((size_t)jn.ssid_len, (size_t)32));
++			}
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 9: {                                               /* BSSID: 6 bytes, the bare ether_addr */
++		uint8_t out[6] = { 0 };
++
++		if (!set) {
++			if (up) {
++				memcpy(out, jn.bssid, 6);
++			}
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 4: {                                               /* CHANNEL: {version, {version, channel, flags}} */
++		uint32_t out[4] = { 1, 1, up ? ew_a80211_channel(jn.mhz) : 0, up ? ew_a80211_chflags(jn.mhz) : 0 };
++
++		if (!set) {
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 16:                                                /* RSSI / NOISE: {version, num_radios, unit, ctl[4], ctl_agr, ext[4], ext_agr} (found with markers) */
++	case 17: {
++		int32_t out[13] = { 0 };
++		int32_t v = rq->req_type == 16 ? (up ? wp.bss[jn.bss].rssi : -100) : -95;
++
++		if (!set) {
++			out[0] = 1;
++			out[1] = 1;
++			out[2] = 0;                                     /* unit: dBm */
++			out[3] = v;
++			out[7] = v;
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 14: {                                              /* PHY_MODE: {version, supported modes, active mode}: 11a 1, 11b 2, 11g 4, 11n 8 */
++		uint32_t out[3] = { 1, 0xf, up ? (jn.mhz > 5000 ? 0x9u : 0xcu) : 0 };
++
++		if (!set) {
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 15:                                                /* OP_MODE: in req_val: 1 station */
++		if (!set) {
++			rq->req_val = 1;
++			err = 0;
++		}
++		break;
++	case 8:                                                 /* RATE: in req_val, Mbit/s */
++		if (!set) {
++			rq->req_val = up ? 54 : 0;
++			err = 0;
++		}
++		break;
++	case 51: {                                              /* COUNTRY_CODE: {version, cc[4]} */
++		uint8_t out[8] = { 1, 0, 0, 0, 'B', 'G', 0, 0 };
++
++		if (!set) {
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 43:                                                /* DRIVER_VERSION / HARDWARE_VERSION: 256 bytes, a C string from offset 0 */
++	case 44: {
++		char out[256] = { 0 };
++
++		if (!set) {
++			strlcpy(out, rq->req_type == 43 ? "SweetWLAN 1.0 (WCN3990)" : "WCN3990", sizeof(out));
++			err = ew_a80211_out(rq, out, sizeof(out));
++		}
++		break;
++	}
++	case 10:                                                /* SCAN_REQ (set): start over with the results; SCAN_DONE (event 10) */
++		if (set) {
++			g_a80211_cursor = 0;
++			ew_a80211_event(10, NULL, 0);
++			err = 0;
++		}
++		break;
++	case 11:                                                /* SCAN_RESULT (get): the next one, errno 5 after the last */
++		if (!set) {
++			if (g_a80211_cursor >= wp.nbss) {
++				err = EIO;
++			} else {
++				/*
++				 * apple80211_scan_result, 1160 bytes (found from the loads in __addScanResultToList): version 0, channel
++				 * {version, channel, flags} at 4, noise/snr/rssi int16 at 0x12/0x14/0x16, beacon interval 0x18, capabilities 0x1a,
++				 * BSSID 0x1c, rate count 0x22, SSID length 0x60 and bytes 0x61, age 0x84, flags 0x88, IE length (u16) 0x8a, IEs 0x8c.
++				 */
++				uint8_t out[1160] = { 0 };
++				unsigned k = g_a80211_cursor++;
++				uint32_t u32;
++				int16_t i16;
++				uint16_t u16;
++				unsigned slen = strlen(wp.bss[k].ssid);
++
++				u32 = 1; memcpy(out + 0, &u32, 4);
++				memcpy(out + 4, &u32, 4);
++				u32 = ew_a80211_channel(wp.bss[k].mhz); memcpy(out + 8, &u32, 4);
++				u32 = ew_a80211_chflags(wp.bss[k].mhz); memcpy(out + 12, &u32, 4);
++				i16 = -95; memcpy(out + 0x12, &i16, 2);
++				i16 = (int16_t)(wp.bss[k].rssi + 95); memcpy(out + 0x14, &i16, 2);
++				i16 = wp.bss[k].rssi; memcpy(out + 0x16, &i16, 2);
++				u16 = wp.bss[k].bint; memcpy(out + 0x18, &u16, 2);
++				u16 = wp.bss[k].cap; memcpy(out + 0x1a, &u16, 2);
++				memcpy(out + 0x1c, wp.bss[k].bssid, 6);
++				out[0x60] = (uint8_t)slen;
++				memcpy(out + 0x61, wp.bss[k].ssid, MIN(slen, (unsigned)32));
++				u16 = (uint16_t)MIN((unsigned)wp.bss[k].ie_len, (unsigned)(sizeof(out) - 0x8c));
++				memcpy(out + 0x8a, &u16, 2);
++				memcpy(out + 0x8c, wp.bss[k].ie, u16);
++				err = ew_a80211_out(rq, out, sizeof(out));
++			}
++		}
++		break;
++	case 27: {                                              /* SUPPORTED_CHANNELS: {version, count, channels[count] of {version, channel, flags}} */
++		static const uint16_t chans[] = {
++			2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++			5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5600, 5620, 5640, 5660, 5680,
++			5700, 5720, 5745, 5765, 5785, 5805, 5825,
++		};
++		uint32_t out[2 + 3 * 64] = { 1, (uint32_t)(sizeof(chans) / sizeof(chans[0])) };
++
++		if (!set) {
++			for (unsigned k = 0; k < sizeof(chans) / sizeof(chans[0]); k++) {
++				out[2 + 3 * k] = 1;
++				out[3 + 3 * k] = ew_a80211_channel(chans[k]);
++				out[4 + 3 * k] = ew_a80211_chflags(chans[k]);
++			}
++			err = ew_a80211_out(rq, out, sizeof(out));
 +		}
 +		break;
 +	}
@@ -85,7 +304,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		ifmr->ifm_mask = 0;
  		ifmr->ifm_status = IFM_AVALID | (ew.up ? IFM_ACTIVE : 0);
  		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
-@@ -4731,6 +4786,7 @@
+@@ -4731,6 +5005,7 @@
  	}
  	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
  	ev("EW: interface ew0 created");
