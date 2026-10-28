@@ -11,7 +11,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  static errno_t
  ew_if_output(ifnet_t ifp, mbuf_t m)
  {
-@@ -4642,19 +4645,344 @@
+@@ -4642,19 +4645,367 @@
  	return 0;
  }
  
@@ -53,6 +53,26 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	km.dv[0].data_length = (uint32_t)(16 + plen);
 +	km.dv[0].data_ptr = buf;
 +	(void)kev_post_msg(&km);
++}
++
++/* the events a station driver posts when it associates: SSID, BSSID, association done {status, reason}, link changed {is_link_down, ...} */
++static void
++ew_a80211_link_down(void)
++{
++	uint32_t d[8] = { 1, 0, 0, 0, 0, 0, 0, 0 };            /* LINK_CHANGED: is_link_down = 1 */
++
++	ew_a80211_event(4, d, 32);
++}
++
++static void
++ew_a80211_link_events(void)
++{
++	uint8_t z[32] = { 0 };
++
++	ew_a80211_event(2, z, 8);
++	ew_a80211_event(3, z, 0);
++	ew_a80211_event(9, z, 8);
++	ew_a80211_event(4, z, 32);
 +}
 +
 +static uint32_t g_a80211_cursor;                        /* the next scan result to hand out */
@@ -286,11 +306,14 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +			}
 +		}
 +		break;
-+	case 25:                                                /* HOST_AP_MODE */
++	case 25:                                                /* HOST_AP_MODE: wifid's last step of its start-up: tell it we are associated */
 +	case 365:                                               /* DISPLAY_STATE */
 +	case 383:                                               /* SET_PROPERTY: wifid pushes configuration plists; ignored */
 +		if (set) {
 +			err = 0;
++			if (rq->req_type == 25 && up) {
++				ew_a80211_link_events();
++			}
 +		}
 +		break;
 +	case 51:                                                /* COUNTRY_CODE: get {3 bytes}, set {version, cc[4]} */
@@ -358,7 +381,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		ifmr->ifm_mask = 0;
  		ifmr->ifm_status = IFM_AVALID | (ew.up ? IFM_ACTIVE : 0);
  		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
-@@ -4731,6 +5059,7 @@
+@@ -4731,6 +5082,7 @@
  	}
  	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
  	ev("EW: interface ew0 created");
@@ -366,6 +389,49 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  }
  
  static void
+@@ -4787,6 +5139,7 @@
+ 	ew.up = true;
+ 	ifnet_set_flags(ew.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	ew_link_event(true);
++	ew_a80211_link_events();
+ 	ev("EW: ew0 %u.%u.%u.%u %s (err %d)", ip[0], ip[1], ip[2], ip[3], err ? "NOT configured" : "up", err);
+ }
+ 
+@@ -4847,6 +5200,26 @@
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_vparam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_wlan_vparam, "I", "set a Wi-Fi vdev parameter");
+ 
++/* kern.sweet_wlan_event = N: post Apple80211 event N (payload sizes as the library expects: 2 and 9 eight bytes, 4 thirty-two, else none); 0 = the set of association events */
++static int
++sysctl_wlan_event SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, err = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (err == 0 && req->newptr != USER_ADDR_NULL) {
++		uint8_t z[32] = { 0 };
++
++		if (v == 0) {
++			ew_a80211_link_events();
++		} else if (v > 0) {
++			ew_a80211_event((uint32_t)v, z, v == 2 || v == 9 ? 8 : v == 4 ? 32 : 0);
++		}
++	}
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_event, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_wlan_event, "I", "post an Apple80211 event");
++
+ /* kern.sweet_wlan_kick=1: behave as if the AP had kicked us (tests the rejoin path) */
+ static int
+ sysctl_wlan_kick SYSCTL_HANDLER_ARGS
+@@ -5556,6 +5929,7 @@
+ 			ew.up = false;
+ 			ifnet_set_flags(ew.ifp, 0, IFF_RUNNING);
+ 			ew_link_event(false);
++			ew_a80211_link_down();
+ 		}
+ 		if (g_wlan_crashed || g_modem_crashed) {
+ 			wp_hist_dump();
 diff --git a/iokit/Kernel/arm/SweetWiFi.cpp b/iokit/Kernel/arm/SweetWiFi.cpp
 new file mode 100644
 --- /dev/null
