@@ -1,0 +1,183 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: panic end: torch off; boot-arg panic_reboot_ms resets to fastboot
+
+At the end of a panic (all three exits of debug.c) the rear torch is turned off.
+With panic_reboot_ms=N (default 0: the panic screen stays for a photo) the
+phone resets N ms later through PSCI SYSTEM_RESET, with the IMEM restart
+reason 0x77665500 (Linux msm-poweroff, "reboot bootloader") so it lands in
+fastboot. Torch writes are now read back.
+---
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -87,6 +87,10 @@
+ #if defined(__arm64__)
+ #include <arm64/sweet_early.h>
+ #endif
++#if defined(SWEET)
++/* iokit/Kernel/arm/SweetPlatformExpert.cpp: torch off; with boot-arg panic_reboot_ms, a reset to fastboot */
++extern void sweet_panic_end(void);
++#endif
+ #include <IOKit/IOBSD.h>
+ 
+ #if !(MACH_KDP && CONFIG_KDP_INTERACTIVE_DEBUGGING)
+@@ -765,6 +769,9 @@
+ 		PE_update_panicheader_nestedpanic();
+ 		paniclog_flush();
+ 
++#if defined(SWEET)
++		sweet_panic_end();
++#endif
+ 		if (!panicDebugging) {
+ 			// note that this will also send kPEPanicEnd
+ 			kdp_machine_reboot_type(kPEPanicRestartCPU, panic_options_mask);
+@@ -781,6 +788,9 @@
+ 	// a chipreset as quickly as possible, hopefully something in the panic log is salvageable, since we flushed it during Stage 1.
+ 	//
+ 	if (CPUDEBUGGERCOUNT == max_debugger_entry_count + 1) {
++#if defined(SWEET)
++		sweet_panic_end();
++#endif
+ 		if (!panicDebugging) {
+ 			// note that:
+ 			// - this code path should be audited for prints, as that is a common cause of nested panics
+@@ -1455,6 +1465,9 @@
+ 
+ #endif /* CONFIG_KDP_INTERACTIVE_DEBUGGING */
+ 
++#if defined(SWEET)
++	sweet_panic_end();
++#endif
+ 	if (!panicDebugging) {
+ 		kdp_machine_reboot_type(kPEPanicRestartCPU, debugger_panic_options);
+ 	}
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,10 +10,15 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++extern "C" void sweet_torch_panic_off(void);
++extern "C" void sweet_panic_end(void);
+ /* bsd/dev/sweet_ufs.c */
+ extern "C" int sweet_ufs_reboot_to_bootloader(void);
+ 
+@@ -54,6 +59,44 @@
+  * sweet_ufs_reboot_to_bootloader), where the next test image is booted from; boot-arg
+  * sweet_reboot=normal restarts normally. Panics keep their screen (no reset), for the photo.
+  */
++/*
++ * The end of a panic (osfmk/kern/debug.c, once the panic screen and the log are done): the torch
++ * off, and with boot-arg panic_reboot_ms=N (default 0: the screen stays, for the photo) a reset N
++ * ms later. The reset goes to fastboot, as a reboot does, but without the bootloader message in
++ * misc (no UFS from a panic): the bootloader's IMEM restart reason (sdmmagpie.dtsi
++ * qcom,msm-imem-restart_reason at 0x146aa65c; 0x77665500 is what Linux msm-poweroff writes for
++ * "reboot bootloader"), mapped at boot so a panic needs no mapping.
++ */
++static uint32_t sweet_panic_reboot_ms;
++static volatile uint32_t *sweet_restart_reason;
++
++#define SWEET_IMEM_PA           0x146aa000ULL
++#define SWEET_IMEM_RESTART      0x65c
++#define SWEET_RESTART_FASTBOOT  0x77665500u
++
++extern "C" void
++sweet_panic_end(void)
++{
++	static bool done;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	sweet_torch_panic_off();
++	if (sweet_panic_reboot_ms == 0 || sweet_restart_reason == NULL) {
++		return;
++	}
++	uint64_t wait = 0;
++	nanoseconds_to_absolutetime((uint64_t)sweet_panic_reboot_ms * NSEC_PER_MSEC, &wait);
++	uint64_t until = mach_absolute_time() + wait;
++	while (mach_absolute_time() < until) {
++	}
++	*sweet_restart_reason = SWEET_RESTART_FASTBOOT;
++	__asm__ volatile("dsb sy" ::: "memory");
++	sweet_psci_call(SWEET_PSCI_SYSTEM_RESET);
++}
++
+ int
+ SweetPlatformExpert::haltRestart(unsigned int type)
+ {
+@@ -90,6 +133,14 @@
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
+ 
++	if (PE_parse_boot_argn("panic_reboot_ms", &sweet_panic_reboot_ms, sizeof(sweet_panic_reboot_ms)) &&
++	    sweet_panic_reboot_ms != 0) {
++		vm_offset_t imem = ml_io_map(SWEET_IMEM_PA, 0x1000);
++		sweet_restart_reason = imem ? (volatile uint32_t *)(imem + SWEET_IMEM_RESTART) : NULL;
++		IOLog("SWEET: a panic resets to fastboot after %u ms (boot-arg panic_reboot_ms)%s\n",
++		    sweet_panic_reboot_ms, imem ? "" : ": IMEM not mapped, it will not");
++	}
++
+ 	/*
+ 	 * The calendar. IOKitInitializeTime() waits up to 30 s for an "IORTC"
+ 	 * resource before it asks this platform expert for the time; nothing
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -338,15 +338,22 @@
+ 	return false;
+ }
+ 
++/* A read-modify-write, read back: the module's registers are all plain storage. */
+ static int
+ torch_update(unsigned reg, uint8_t mask, uint8_t val)
+ {
+-	uint8_t old;
++	uint8_t old, now;
++	uint8_t want;
+ 
+ 	if (sweet_spmi_read(TORCH_SID, TORCH_BASE + reg, &old) != 0) {
+ 		return -1;
+ 	}
+-	return sweet_spmi_write(TORCH_SID, TORCH_BASE + reg, (uint8_t)((old & ~mask) | (val & mask)));
++	want = (uint8_t)((old & ~mask) | (val & mask));
++	if (sweet_spmi_write(TORCH_SID, TORCH_BASE + reg, want) != 0 ||
++	    sweet_spmi_read(TORCH_SID, TORCH_BASE + reg, &now) != 0 || now != want) {
++		return -1;
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -416,6 +423,25 @@
+ 	return 0;
+ }
+ 
++/*
++ * From the end of a panic (SweetPlatformExpert.cpp sweet_panic_end): the light off, so a hung
++ * phone does not keep it on. The other processors are stopped; if the panic came with the SPMI
++ * lock held, the light is left alone rather than waited for.
++ */
++void sweet_torch_panic_off(void);
++
++void
++sweet_torch_panic_off(void)
++{
++	if (sweet_torch_ma == 0 || !sp_ready || !IOLockTryLock(sp_lock)) {
++		return;
++	}
++	IOLockUnlock(sp_lock);
++	torch_update(0x4c, TORCH_LEDS, 0);
++	torch_update(0x46, 0x80, 0);
++	sweet_torch_ma = 0;
++}
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_torch, "I", "sunfish rear torch: milliamps per LED (0 off, at most 200)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
