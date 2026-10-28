@@ -895,3 +895,8 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 - Cause (observed): `shim/out/sunfish.adt` had been replaced at 03:49 by the minimal mkadt.py output (13 KB). The working images carry a 93,748-byte ADT (same size class as `sunfish-p3.adt`). Which nodes of the big one the GPU needs was not bisected.
 - Fix: `shim/out/sunfish.adt` is now the 93,748-byte ADT (extracted from payload-0148.bin; the minimal one is `shim/out/sunfish-mkadt-0350.adt`; both git-ignored). Do not regenerate it with mkadt.py; the earlier "wlan node for wifid" change (40a050a) only exists in the minimal ADT and is therefore not in effect.
 - Also in 0153/0154: priority 92 Wi-Fi/modem threads (not the cause of this regression).
+
+### 2026-10-28 Wi-Fi: panic with wp.regs == 0, patch 0154 (Claude)
+- Observed (photo): Kernel data abort at pc wp_poll+0x164 (the inlined wp_repost register store `wp_ce(ce)[0x40/4]`), via wp_scan <- wlan_station_loop <- wlan_thread, with x9 = 0x241000, i.e. the register base was 0. wp.regs is only zero after `memset(&wp, 0, ...)` in the restart path of wlfw_wmi_bringup.
+- Cause (inferred, not seen directly): a second WLAN service thread started (second "firmware ready" after the first modem restart) and cleared wp under the first one, which was scanning.
+- Patch 0154 (`shim-local-0156-onethread.img`): wlan_start_thread refuses to start while a service thread runs (compare-and-swap on g_wlan_thread_running); wp_poll, wp_send and jn_ce4_send2 do nothing while wp.regs is NULL. Result: 33+ minutes up, GPU up, Wi-Fi 20/20 pings, no crash, no panic. Earlier crashes came within ~1 minute of boot, so this is a meaningful soak, not proof.

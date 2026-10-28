@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c	2026-10-28 14:23:56.611744322 +0200
++++ b/bsd/dev/sweet_mpss.c	2026-10-28 14:23:56.600704225 +0200
+@@ -110,7 +110,7 @@
+ static char g_events[16384];
+ static volatile bool g_modem_crashed;      /* the modem reported a crash: do not touch its memory any more */
+ static volatile bool g_wlan_crashed;       /* the WLAN protection domain crashed: the modem as a whole is restarted (it escalates the crash) */
+-static volatile bool g_wlan_thread_running;
++static volatile uint32_t g_wlan_thread_running;   /* set by wlan_start_thread (compare-and-swap), so a second start cannot run a second service thread */
+ static volatile bool g_wlan_halt;          /* a restart is under way: the service thread must not touch the chip's registers (its rails go off) */
+ static char g_last_crash[128];
+ static bool g_crash_seen;
+@@ -3011,11 +3011,11 @@
+ wp_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
+ {
+ 	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
+-	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed) ? 0 : (wp_ce(wp_cfg[r].ce)[0x44 / 4] & mask);   /* the registers are gone while a restart is under way */
++	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed || wp.regs == NULL) ? 0 : (wp_ce(wp_cfg[r].ce)[0x44 / 4] & mask);   /* the registers are gone while a restart is under way */
+ 	uint8_t *buf = wp.pool + wp_cfg[r].bufs + (uint64_t)wr * WP_BUF;
+ 	struct wp_desc *d = wp_desc(r, wr);
+ 
+-	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed || wp.regs == NULL) {
+ 		return false;
+ 	}
+ 	uint16_t l = (uint16_t)plen;
+@@ -3746,10 +3746,10 @@
+ {
+ 	const unsigned r = 4;
+ 	unsigned mask = wp_cfg[r].n - 1, wr = wp.wr[r];
+-	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed) ? 0 : (wp_ce(4)[0x44 / 4] & mask);
++	uint32_t srri = (g_wlan_halt || g_wlan_crashed || g_modem_crashed || wp.regs == NULL) ? 0 : (wp_ce(4)[0x44 / 4] & mask);
+ 	struct wp_desc *d;
+ 
+-	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed || wp.regs == NULL) {
+ 		return false;
+ 	}
+ 
+@@ -5233,7 +5233,7 @@
+ static void
+ wp_poll(void)
+ {
+-	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed) {
++	if (g_wlan_halt || g_wlan_crashed || g_modem_crashed || wp.regs == NULL) {
+ 		return;
+ 	}
+ 	for (unsigned r = 0; r < WP_NR; r++) {
+@@ -5546,9 +5546,8 @@
+ wlan_thread(void *arg, wait_result_t wr)
+ {
+ #pragma unused(arg, wr)
+-	g_wlan_thread_running = true;
+ 	wlfw_wmi_bringup(g_wlan_regs);
+-	g_wlan_thread_running = false;
++	g_wlan_thread_running = 0;
+ 	ev("EW: service thread ended");
+ 	thread_terminate(current_thread());
+ }
+@@ -5558,11 +5557,16 @@
+ {
+ 	thread_t th;
+ 
++	if (!os_atomic_cmpxchg(&g_wlan_thread_running, 0, 1, relaxed)) {
++		ev("EW: the service thread is still running: not starting a second one");   /* two threads share wp: one clears it under the other */
++		return;
++	}
+ 	g_wlan_regs = regs;
+ 	g_wlan_halt = false;
+ 	if (kernel_thread_start_priority(wlan_thread, NULL, SWEET_WLAN_PRI, &th) == KERN_SUCCESS) {
+ 		thread_deallocate(th);
+ 	} else {
++		g_wlan_thread_running = 0;
+ 		ev("EW: cannot start the service thread");
+ 	}
+ }
