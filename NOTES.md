@@ -874,6 +874,7 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
     `key=2` (Volume Down) fired `down=1` and `down=0` within ~21 ms without any physical touch on the phone.
   - **Why screen wakes & volume HUD appears**: iOS receives `kHIDUsage_Csmr_VolumeDecrement` (or `kHIDUsage_Csmr_Power`), which wakes the display from sleep and renders the native volume slider HUD.
   - **Why Auto-Lock (30s) does not sleep**: Every HID key event dispatches to `IOHIDEventSystem` / backboardd, which calls `IOPMrootDomain::reportUserActivity()`, resetting the idle timer (confirmed via `ioreg -r -c IOPMrootDomain`: `"System Idle Seconds" = 3`). Because phantom key events recur and reset the activity countdown, the 30-second idle timer never reaches expiration.
-- **Proposed Future Fix**:
-  - Add 2-to-3 sample debounce in `keys_thread` before emitting key transitions (`sweet_keys.c` requires ~40–60 ms sustained state).
-  - Add `sweetkeys=0` boot-arg option to disable polled keys during testing if desired.
+- **FIX IMPLEMENTED (Patch 0150, committed `154288d`, boot image `shim/out/shim-local-0150-debounce.img`)**:
+  - `sweet_keys.c`: added 3-sample 60 ms debouncer (`KEYS_DEBOUNCE_TICKS 3`) in `keys_thread`. Transient SPMI single-tick glitches (like the 21 ms `pon=0x2` spike) are discarded. Keys only trigger when sustained >= 60 ms.
+  - `sweet_mpss.c`: turned `g_events` (16 KB) into a rolling window log: when room < 256 bytes, discards the oldest half up to newline via `memmove`, ensuring `sysctl kern.sweet_mpss_events` keeps logging indefinitely without truncating after 17 min.
+  - Built kernel `shim/out/kernel-0150` via Docker and packaged AVB-signed image `shim/out/shim-local-0150-debounce.img` (64 MiB). Ready for test boot when user is present.
