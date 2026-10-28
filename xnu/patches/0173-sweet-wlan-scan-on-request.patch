@@ -5,7 +5,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		char ssid[33];
  		uint16_t cap, bint, ie_len;
  		uint8_t ie[512];
-+		uint8_t seen;                           /* heard during the scan in progress (see wp_bss_prune) */
++		uint8_t seen, missed;                   /* heard during the scan in progress / scans in a row it was not heard in (see wp_bss_prune) */
  	} bss[48];
  	struct {
  		uint32_t req_id, len;
@@ -17,22 +17,24 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  			if (rxmhz == bssmhz) {
  				wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
  			}
-@@ -3400,6 +3402,7 @@
+@@ -3400,6 +3402,8 @@
  		return;
  	}
  	k = wp.nbss++;
 +	wp.bss[k].seen = 1;
++	wp.bss[k].missed = 0;
  	memcpy(wp.bss[k].bssid, fr + 16, 6);
  	wp.bss[k].mhz = bssmhz;
  	wp.bss[k].rssi = (int8_t)MAX(-128, MIN(127, (int)hd[1] - 95));
-@@ -4675,6 +4678,41 @@
+@@ -4675,6 +4679,44 @@
  #define SWEET_SIOCSA80211       _IOW('i', 200, struct sweet_a80211req)
  #define SWEET_SIOCGA80211       _IOWR('i', 201, struct sweet_a80211req)
  
 +/*
 + * SCAN_REQ from wifid / Settings (pull to refresh, the Wi-Fi page open): the service loop runs a real scan (the radio leaves the home channel
 + * for a few seconds), at most once every 20 s; in between the cache answers at once. After a scan the networks that were not heard are dropped
-+ * (the cache would otherwise keep them for ever), keeping the one we are connected to, and jn.bss is found again.
++ * (the cache would otherwise keep them for ever) once they were missed in three scans in a row, keeping the one we are connected to,
++ * and jn.bss is found again.
 + */
 +static volatile uint32_t g_scan_req;
 +static uint64_t g_last_scan_us;
@@ -47,7 +49,9 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
 +	for (unsigned k = 0; k < wp.nbss; k++) {
 +		bool mine = jn.connected && memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0;
 +
-+		if (!wp.bss[k].seen && !mine) {
++		if (wp.bss[k].seen) {
++			wp.bss[k].missed = 0;
++		} else if (!mine && ++wp.bss[k].missed >= 3) {    /* a weak network is not heard in every 3 s scan: gone after three misses in a row */
 +			continue;
 +		}
 +		if (mine) {
@@ -67,7 +71,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  /* Apple80211 events: kernel events vendor Apple (1), class 6, subclass 1; event code, then the interface name (16 bytes) and a payload */
  static void
  ew_a80211_event(uint32_t code, const void *payload, size_t plen)
-@@ -4723,7 +4761,6 @@
+@@ -4723,7 +4765,6 @@
  	ew_a80211_event(4, z, 32);
  }
  
@@ -75,7 +79,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  
  static volatile uint32_t g_a80211_power = 1;           /* what Settings' Wi-Fi switch says (the radio itself stays on) */
  
-@@ -4972,9 +5009,12 @@
+@@ -4972,9 +5013,12 @@
  			if (nscan++ < 40) {
  				ev("A80211: scan request #%u (%u networks cached)", nscan, wp.nbss);
  			}
@@ -90,7 +94,7 @@ diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
  		}
  		break;
  	case 11: {                                              /* SCAN_RESULT (get): indexed by req_val */
-@@ -6008,6 +6048,17 @@
+@@ -6008,6 +6052,17 @@
  				g_vparam = 0;
  				ev("EW: vdev param %#x = %#x: %s", vp >> 24, vp & 0xffffff, jn_vdev_param(vp >> 24, vp & 0xffffff, "vparam") ? "sent" : "failed");
  			}
