@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -3329,6 +3329,16 @@
+ 	if (jn.active && jn_mgmt(fr, frl)) {
+ 		return;
+ 	}
++	if (jn.active && frl >= 36 && fr[0] != 0x80 && fr[0] != 0x50) {
++		static unsigned nmg;
++
++		/* frames the host does not answer (block-ack action frames, ...): note the first few, to see what the AP expects */
++		if (nmg < 24 && memcmp(fr + 16, jn.bssid, 6) == 0) {
++			nmg++;
++			ev("MGMT rx fc %02x%02x len %u: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", fr[0], fr[1], frl, fr[24], fr[25], fr[26], fr[27],
++			    fr[28], fr[29], fr[30], fr[31], fr[32], fr[33], fr[34], fr[35]);
++		}
++	}
+ 	if (frl < 36 || (fr[0] != 0x80 && fr[0] != 0x50)) {
+ 		return;
+ 	}
+@@ -4075,9 +4085,14 @@
+ 	uint8_t c[128];
+ 	uint32_t v[18], n;
+ 	bool g5 = jn.mhz > 4900, dfs = jn.mhz >= 5260 && jn.mhz <= 5720;
+-	uint32_t mode = g5 ? 0u : 1u;                           /* 11A / 11G: no HT yet */
+-	uint32_t ch[6] = { jn.mhz, jn.mhz, 0, mode | (dfs ? (1u << 10) : 0), 0u | (40u << 8) | (40u << 16), 0u | (40u << 8) };
++	uint32_t mode = g5 ? 0u : 1u;                           /* 11A / 11G */
++	uint32_t ch[6];
+ 
++	if (!swu_no_ht && swu_ie_find(wp.bss[jn.bss].ie, wp.bss[jn.bss].ie_len, 45) != NULL) {
++		mode = g5 ? 4u : 5u;                            /* MODE_11NA_HT20 / MODE_11NG_HT20: the peer is associated as an HT peer */
++	}
++	ch[0] = jn.mhz; ch[1] = jn.mhz; ch[2] = 0; ch[3] = mode | (dfs ? (1u << 10) : 0);
++	ch[4] = 0u | (40u << 8) | (40u << 16); ch[5] = 0u | (40u << 8);
+ 	memset(v, 0, sizeof(v));
+ 	n = wp_cmd(c, 0x5003, 88, v, 72);
+ 	wp_tlv(c, &n, 80, ch, 24);
+@@ -4251,11 +4266,14 @@
+ 	}
+ }
+ 
++static uint32_t g_rx_msgs, g_rx_ent, g_rx_reposts, g_rx_bad;     /* in-order indications, buffers in them, buffers reposted, indications dropped as malformed */
++
+ static void
+ jn_rx_repost(uint64_t pa)
+ {
+ 	uint64_t *ring = (uint64_t *)(wp.pool + WP_HTT_RXRING);
+ 
++	g_rx_reposts++;
+ 	*(volatile uint32_t *)(wp.pool + (pa - wp.pa) + 4) = 0;                 /* rx_attention */
+ 	wp_sync(wp.pool + (pa - wp.pa), 64);
+ 	ring[wp.rx_idx] = pa;
+@@ -4357,7 +4375,10 @@
+ 		uint16_t cnt;
+ 
+ 		memcpy(&cnt, pl + 6, 2);
++		g_rx_msgs++;
++		g_rx_ent += cnt;
+ 		if (8u + 12u * cnt > plen) {
++			g_rx_bad++;
+ 			return true;
+ 		}
+ 		for (unsigned k = 0; k < cnt; k++) {
+@@ -4370,6 +4391,7 @@
+ 			pa &= 0x1fffffffffull;
+ 			if (pa < wp.pa + WP_HTT_RXBUF || pa >= wp.pa + WP_POOL || ((pa - wp.pa - WP_HTT_RXBUF) % WP_HTT_BUFSZ) != 0) {
+ 				ev("JOIN: in-order indication with an unknown buffer %#llx", pa);
++				g_rx_bad++;
+ 				return true;
+ 			}
+ 			buf = wp.pool + (pa - wp.pa);
+@@ -5059,7 +5081,7 @@
+ /* the last few things the firmware sent and we sent it, dumped when it crashes (to see what it was doing) */
+ static struct {
+ 	uint32_t t_ms, key;
+-} g_hist[40];
++} g_hist[160];
+ static unsigned g_hist_n;
+ 
+ static void
+@@ -5067,20 +5089,23 @@
+ {
+ 	uint64_t abs, ns;
+ 
++	if (key == 0x10007001u) {                       /* beacons and probe responses: ten a second, they would fill the ring */
++		return;
++	}
+ 	clock_get_uptime(&abs);
+ 	absolutetime_to_nanoseconds(abs, &ns);
+-	g_hist[g_hist_n++ % 40].t_ms = (uint32_t)(ns / 1000000);
+-	g_hist[(g_hist_n - 1) % 40].key = key;
++	g_hist[g_hist_n++ % 160].t_ms = (uint32_t)(ns / 1000000);
++	g_hist[(g_hist_n - 1) % 160].key = key;
+ }
+ 
+ static void
+ wp_hist_dump(void)
+ {
+ 	char line[200];
+-	unsigned n = MIN(g_hist_n, 40u), lp = 0;
++	unsigned n = MIN(g_hist_n, 160u), lp = 0;
+ 
+ 	for (unsigned i = 0; i < n; i++) {
+-		unsigned k = (g_hist_n - n + i) % 40;
++		unsigned k = (g_hist_n - n + i) % 160;
+ 
+ 		lp += (unsigned)snprintf(line + lp, sizeof(line) - lp, " %u:%x", g_hist[k].t_ms % 100000, g_hist[k].key);
+ 		if (lp > 170 || i == n - 1) {
+@@ -5382,6 +5407,7 @@
+ {
+ 	uint64_t started = nt_us();
+ 	unsigned lines = 0;
++	bool hist_done = false;
+ 
+ 	for (;;) {
+ 		bool found = false;
+@@ -5442,9 +5468,14 @@
+ 					ev("EW: global fault sgfsr %#x", sg);
+ 					g_smmu[0x48 / 4] = sg;
+ 				}
++				if (jn.tx_inflight >= 4 && !hist_done) {
++					hist_done = true;
++					ev("EW: %u TX frames not completed (rx ring: msgs %u bufs %u reposted %u bad %u idx %u): message history follows", jn.tx_inflight, g_rx_msgs, g_rx_ent, g_rx_reposts, g_rx_bad, wp.rx_idx);
++					wp_hist_dump();
++				}
+ 				if (lines % 6 == 0) {
+-					ev("EW: %llu s: tx %llu rx %llu drop %llu/%llu echo %u/%u credits %u inflight %u", (nt_us() - started) / 1000000, ew.tx_frames, ew.rx_frames,
+-					    ew.tx_drop, ew.rx_drop, wp.echo_ok, wp.echo_sent, wp.wmi_credits, jn.tx_inflight);
++					ev("EW: %llu s: tx %llu rx %llu drop %llu/%llu echo %u/%u credits %u inflight %u rxring msgs %u bufs %u reposted %u bad %u idx %u", (nt_us() - started) / 1000000, ew.tx_frames, ew.rx_frames,
++					    ew.tx_drop, ew.rx_drop, wp.echo_ok, wp.echo_sent, wp.wmi_credits, jn.tx_inflight, g_rx_msgs, g_rx_ent, g_rx_reposts, g_rx_bad, wp.rx_idx);
+ 				}
+ 			}
+ 		}
