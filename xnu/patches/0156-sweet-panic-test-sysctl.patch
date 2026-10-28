@@ -1,0 +1,37 @@
+From: sunfish-display
+Subject: [PATCH] sweet: kern.sweet_panic_test=24301 panics on purpose (tests panic_reboot_ms), only with boot-arg sweet_panic_test=1
+
+---
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -246,3 +246,30 @@
+ 		thread_deallocate(thread);
+ 	}
+ }
++
++/*
++ * A panic on purpose, for testing what follows one (boot-arg panic_reboot_ms, the torch going
++ * off): `sysctl kern.sweet_panic_test=24301` as root, on a boot with boot-arg sweet_panic_test=1.
++ * Any other number, or a boot without that boot-arg, is refused.
++ */
++#define SWEET_PANIC_TEST_MAGIC  24301
++
++static int
++sysctl_sweet_panic_test(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int value = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int allowed = 0;
++	if (value != SWEET_PANIC_TEST_MAGIC ||
++	    !PE_parse_boot_argn("sweet_panic_test", &allowed, sizeof(allowed)) || allowed != 1) {
++		return EINVAL;
++	}
++	panic("sweet_panic_test: a test panic asked for with sysctl kern.sweet_panic_test");
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_panic_test, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_panic_test, "I", "write 24301 to panic on purpose (tests)");
