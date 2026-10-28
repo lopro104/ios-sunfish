@@ -1,0 +1,175 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4620,6 +4620,9 @@
+ 	uint8_t cur_ip[4];
+ } ew;
+ 
++/* iokit/Kernel/arm/SweetWiFi.cpp: the IORegistry entry Apple's IO80211 library looks for */
++extern void sweet_io80211_publish(const char *ifname, const uint8_t mac[6]);
++
+ static errno_t
+ ew_if_output(ifnet_t ifp, mbuf_t m)
+ {
+@@ -4642,19 +4645,71 @@
+ 	return 0;
+ }
+ 
++/*
++ * Apple80211 ioctls on ew0 (SIOCSA80211 / SIOCGA80211, struct apple80211req): what Apple's IO80211 library (wifid, MobileWiFi,
++ * Settings) uses when there is no IO80211Controller in IOKit. Request types are listed in research/wifi/apple80211_ioc_table.txt.
++ * Everything not handled yet is logged (first 120 distinct type/direction pairs) so that wifid shows what it wants.
++ */
++struct sweet_a80211req {
++	char req_if_name[16];
++	uint32_t req_type;
++	uint32_t req_val;
++	uint32_t req_len;
++	uint32_t req_pad;
++	uint64_t req_data;
++};
++#define SWEET_SIOCSA80211       _IOW('i', 200, struct sweet_a80211req)
++#define SWEET_SIOCGA80211       _IOWR('i', 201, struct sweet_a80211req)
++
++static int
++ew_a80211(bool set, struct sweet_a80211req *rq)
++{
++	static uint32_t seen[128];
++	static unsigned nseen;
++	uint32_t key = rq->req_type | (set ? 0x80000000u : 0);
++	int err = EOPNOTSUPP;
++
++	switch (rq->req_type) {
++	case 12: {                                              /* CARD_CAPABILITIES: 13 bytes, a bitmap */
++		uint8_t caps[13] = { 0 };
++
++		if (!set && rq->req_len >= sizeof(caps)) {
++			err = copyout(caps, (user_addr_t)rq->req_data, sizeof(caps));
++		}
++		break;
++	}
++	default:
++		break;
++	}
++	{
++		unsigned i;
++
++		for (i = 0; i < nseen && seen[i] != key; i++) {
++		}
++		if (i == nseen && nseen < 128) {
++			seen[nseen++] = key;
++			ev("A80211: %s type %u len %u val %u -> %d", set ? "set" : "get", rq->req_type, rq->req_len, rq->req_val, err);
++		}
++	}
++	return err;
++}
++
+ static errno_t
+ ew_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ {
+ 	switch (cmd) {
++	case SWEET_SIOCSA80211:
++	case SWEET_SIOCGA80211:
++		return ew_a80211(cmd == SWEET_SIOCSA80211, (struct sweet_a80211req *)data);
+ 	case SIOCGIFMEDIA32:
+ 	case SIOCGIFMEDIA64: {
+ 		struct ifmediareq *ifmr = (struct ifmediareq *)data;
+ 		user_addr_t list = (cmd == SIOCGIFMEDIA64) ? ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+-		int media = IFM_ETHER | IFM_AUTO;
++		int media = IFM_IEEE80211 | IFM_AUTO;                   /* Apple80211GetIfListCopy lists only media type IEEE 802.11 */
+ 
+ 		ifmr->ifm_current = media;
+-		ifmr->ifm_active = ew.up ? (IFM_ETHER | IFM_100_TX | IFM_FDX) : media;
++		ifmr->ifm_active = ew.up ? (IFM_IEEE80211 | 8 /* IFM_IEEE80211_11N */) : media;
+ 		ifmr->ifm_mask = 0;
+ 		ifmr->ifm_status = IFM_AVALID | (ew.up ? IFM_ACTIVE : 0);
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+@@ -4731,6 +4786,7 @@
+ 	}
+ 	ifnet_set_lladdr(ew.ifp, wp_mac, ETHER_ADDR_LEN);
+ 	ev("EW: interface ew0 created");
++	sweet_io80211_publish("ew0", wp_mac);
+ }
+ 
+ static void
+diff --git a/iokit/Kernel/arm/SweetWiFi.cpp b/iokit/Kernel/arm/SweetWiFi.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetWiFi.cpp
+@@ -0,0 +1,64 @@
++/*
++ * IO80211Interface stand-in for the Wi-Fi interface ew0 (bsd/dev/sweet_mpss.c).
++ *
++ * Apple's IO80211 library (Apple80211GetIfListCopy / Apple80211BindToInterface, used by wifid, MobileWiFi,
++ * and through them Settings) finds an interface by getifaddrs + SIOCGIFMEDIA (media type IEEE 802.11) and then
++ * looks up its IORegistry entry with IOServiceGetMatchingService({IOPropertyMatch: {IOInterfaceName: "ew0"}}),
++ * reading "IO80211InterfaceRole" ("Infrastructure"). With no IO80211Controller in the registry it falls back to
++ * plain SIOCGA80211/SIOCSA80211 ioctls on the interface, which sweet_mpss.c answers. So this service only has to
++ * exist, carry those properties, and be registered.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++
++class IO80211Interface : public IOService {
++	OSDeclareDefaultStructors(IO80211Interface);
++};
++
++OSDefineMetaClassAndStructors(IO80211Interface, IOService);
++
++extern "C" void
++sweet_io80211_publish(const char *ifname, const uint8_t mac[6])
++{
++	IO80211Interface *iface = OSTypeAlloc(IO80211Interface);
++	OSNumber *n;
++	OSData *d;
++
++	if (iface == NULL || !iface->init()) {
++		OSSafeReleaseNULL(iface);
++		return;
++	}
++	iface->setName("ew0");
++	iface->setProperty("IOInterfaceName", ifname);
++	iface->setProperty("BSD Name", ifname);
++	iface->setProperty("IO80211InterfaceRole", "Infrastructure");
++	iface->setProperty("IOInterfaceNamePrefix", "ew");
++	n = OSNumber::withNumber(0ULL, 32);
++	iface->setProperty("IOInterfaceUnit", n);
++	OSSafeReleaseNULL(n);
++	n = OSNumber::withNumber(6ULL, 32);                     /* IFT_ETHER */
++	iface->setProperty("IOInterfaceType", n);
++	OSSafeReleaseNULL(n);
++	d = OSData::withBytes(mac, 6);
++	iface->setProperty("IOMACAddress", d);
++	OSSafeReleaseNULL(d);
++	iface->setProperty("IOPrimaryInterface", kOSBooleanTrue);
++	if (iface->attach(IOService::getPlatform())) {
++		iface->registerService();
++		IOLog("SWEET WIFI: IO80211Interface published for %s, registry ID %#llx\n", ifname, iface->getRegistryEntryID());
++	}
++	OSSafeReleaseNULL(iface);
++}
++#else
++extern "C" void sweet_io80211_publish(const char *, const unsigned char *);
++extern "C" void
++sweet_io80211_publish(const char *, const unsigned char *)
++{
++}
++#endif
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetWiFi.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
