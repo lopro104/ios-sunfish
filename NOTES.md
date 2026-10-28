@@ -859,3 +859,21 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 - Verified PreferenceLoader integration in Settings.app. Captured full-resolution screen dumps via `sweet-shot` on device (`logs/shot-wifi.png`, `logs/shot-wifi2.png`) showing Settings.app running smoothly in dark mode.
 - Driver diagnostic observation: `g_events` buffer in `sweet_mpss.c` (16 KB) fills after ~17.5 min (1052s) and stops recording because `ev()` drops lines when remaining space < 128 bytes. The next patch cycle should make this buffer circular or add a reset sysctl.
 - Committed in `dbe89e4`. Phone uptime >1h 30m, 0% packet loss to router and internet. Ready for 04:00 agent transition.
+
+## 2026-10-28 UI / Input Observation: Phantom Button Presses (Volume HUD / Random Wake) & Auto-Lock Idle Timer
+- **User Observation**:
+  - The phone randomly turns its screen on.
+  - Every now and then, the volume slider HUD appears on screen unexpectedly.
+  - The phone does not turn itself off automatically, even when Auto-Lock is set to 30 seconds.
+- **Root Cause Analysis (verified from kernel source & live dmesg)**:
+  - In `bsd/dev/sweet_keys.c`, `keys_thread` polls the PMIC registers (PM6150 PON peripheral `0x0810` for Power and VolDown, PM6150L GPIO `0xc110` for VolUp) every 20 ms via SPMI `EXT_READL`.
+  - **No software debouncing**: Any single noisy read or transient glitch immediately toggles `state[k]` and dispatches a key event to iOS via `sweet_hid_key()`.
+  - **Live Proof in dmesg** (captured at ~5520s uptime):
+    `[ 5520.725060]: SWEET KEYS: key=2 down=1 pon=0x2 gpio4:c110=0x1`
+    `[ 5520.746445]: SWEET KEYS: key=2 down=0 pon=0 gpio4:c110=0x1`
+    `key=2` (Volume Down) fired `down=1` and `down=0` within ~21 ms without any physical touch on the phone.
+  - **Why screen wakes & volume HUD appears**: iOS receives `kHIDUsage_Csmr_VolumeDecrement` (or `kHIDUsage_Csmr_Power`), which wakes the display from sleep and renders the native volume slider HUD.
+  - **Why Auto-Lock (30s) does not sleep**: Every HID key event dispatches to `IOHIDEventSystem` / backboardd, which calls `IOPMrootDomain::reportUserActivity()`, resetting the idle timer (confirmed via `ioreg -r -c IOPMrootDomain`: `"System Idle Seconds" = 3`). Because phantom key events recur and reset the activity countdown, the 30-second idle timer never reaches expiration.
+- **Proposed Future Fix**:
+  - Add 2-to-3 sample debounce in `keys_thread` before emitting key transitions (`sweet_keys.c` requires ~40–60 ms sustained state).
+  - Add `sweetkeys=0` boot-arg option to disable polled keys during testing if desired.
