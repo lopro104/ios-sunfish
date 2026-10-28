@@ -1,0 +1,58 @@
+From: sunfish-display
+Subject: [PATCH] SweetFramebuffer: time present() (kern.sweetfb_present_us / max)
+
+Measure time spent in present() CPU copy to verify scrolling ~46 fps bottleneck.
+---
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -117,6 +117,14 @@
+ SYSCTL_UINT(_kern, OID_AUTO, sweetfb_shown_late, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_stat[3], 0,
+     "of those, shown before the GPU was done, after 3 vsyncs (sweetfb_gpuwait)");
+ 
++/* Time spent copying layers into the panel memory in AppleCLCD::present() */
++unsigned int sweet_fb_present_us;
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_present_us, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_present_us, 0,
++    "microseconds spent in the last display present() copy");
++unsigned int sweet_fb_present_max_us;
++SYSCTL_UINT(_kern, OID_AUTO, sweetfb_present_max_us, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_fb_present_max_us, 0,
++    "maximum microseconds spent in display present() copy");
++
+ static int
+ sweet_prof_find(proc_t p, __unused void *arg)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -60,6 +60,8 @@
+ extern "C" int sweet_fb_gpu_waits;      /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_gpuwait */
+ extern "C" int sweet_fb_fit;            /* bsd/dev/sweet_sample.c: sysctl kern.sweetfb_fit */
+ extern "C" unsigned int sweet_fb_stat[4];       /* kern.sweetfb_shown, _retry, _older, _late */
++extern "C" unsigned int sweet_fb_present_us;
++extern "C" unsigned int sweet_fb_present_max_us;
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -798,6 +800,7 @@
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
++	uint64_t t0 = mach_absolute_time();
+ 	uint32_t mask = get32(rec, 0x104);
+ 
+ 
+@@ -921,6 +924,14 @@
+ 		}
+ 		s->release();
+ 	}
++	uint64_t dt = mach_absolute_time() - t0;
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(dt, &ns);
++	unsigned int us = (unsigned int)(ns / 1000);
++	sweet_fb_present_us = us;
++	if (us > sweet_fb_present_max_us) {
++		sweet_fb_present_max_us = us;
++	}
+ }
+ 
+ bool

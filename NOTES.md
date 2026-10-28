@@ -780,4 +780,15 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - Created native DynamicStore helper publishing `State:/Network/Service/sweet-wlan/{IPv4,DNS}` and `Setup:/Network/Service/sweet-wlan/{IPv4,Interface}`.
   - Deployed to `/var/jb/usr/bin/sweet-wlan`.
   - Global default route set to `192.168.1.1` on `ew0`, scoped route on `ue0` for DNS fallback. Native DNS (`google.com -> 192.178.25.238`) and global internet ping verified (RTT ~6 ms).
+  - Automated via launchd daemon `com.sweet.wlan` and `tools/sweet-wlan-route.sh` with ARP priming on `ew0`.
+
+## 2026-10-28 ~02:10 MILESTONE: DISPLAY present() CPU COPY PROFILED: 2.7–7.5 ms (patch 0148, shim-local-0148-present.img)
+- Context: Display handoff requested Step 1 ("time present() with mach_absolute_time around it, expose as sysctl to verify ~46 fps bottleneck").
+- Implementation (patch `0148-sweet-fb-present-time.patch`):
+  - `sweet_sample.c`: added sysctls `kern.sweetfb_present_us` and `kern.sweetfb_present_max_us`.
+  - `SweetFramebuffer.cpp` (`AppleCLCD::present`): timed layer blit and fit scaling via `mach_absolute_time()` converted to microseconds via `absolutetime_to_nanoseconds()`.
+- Measured on phone:
+  - `kern.sweetfb_present_us`: 2754 us (2.75 ms) for partial/light layers, up to 7534 us (7.53 ms) for full-screen blits.
+  - Significance: Confirms the display session's hypothesis: at 60 Hz (16.66 ms frame budget), the 10 MB CPU copy alone consumes 30% to 45% of the total frame budget. Combined with Mesa draw time (~8-12 ms), this explains why scrolling is capped at ~41–46 fps. Eliminating the CPU copy ("GPU to panel" or direct MDP scanout) will unlock true 60 fps scrolling.
+
 

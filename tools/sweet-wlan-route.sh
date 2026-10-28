@@ -14,6 +14,7 @@ while :; do
 		set -- $(sysctl -n kern.sweet_wlan_info 2>/dev/null)
 		router=$3
 		if [ -n "$router" ] && ! route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+			ping -b ew0 -c 1 -W 1 "$router" >/dev/null 2>&1
 			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
 			route -n add default "$router" >/dev/null 2>&1
