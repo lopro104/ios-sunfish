@@ -26,7 +26,8 @@ extern Boolean SCDynamicStoreRemoveValue(SCDynamicStoreRef, CFStringRef key);
 extern int SCError(void);
 extern const char *SCErrorString(int);
 
-#define SERVICE "sweet-wlan"
+#define SERVICE "4CD8DB21-0AC8-40A5-83C6-094D249CFE68"
+#define IFNAME "en0"
 
 static CFArrayRef
 strings(int n, const char *const *v)
@@ -63,7 +64,7 @@ publish_service(SCDynamicStoreRef store, const char *ip, const char *mask, const
 		CFSTR("InterfaceName"), CFSTR("ConfigMethod")
 	};
 	const void *ipv4_values[] = {
-		addresses, masks, router_str, CFSTR("ew0"), CFSTR("DHCP")
+		addresses, masks, router_str, CFSTR(IFNAME), CFSTR("DHCP")
 	};
 	CFDictionaryRef ipv4 = dict(5, ipv4_keys, ipv4_values);
 
@@ -75,22 +76,37 @@ publish_service(SCDynamicStoreRef store, const char *ip, const char *mask, const
 		CFSTR("DeviceName"), CFSTR("Type"), CFSTR("Hardware"), CFSTR("UserDefinedName")
 	};
 	const void *if_values[] = {
-		CFSTR("ew0"), CFSTR("Ethernet"), CFSTR("AirPort"), CFSTR("Wi-Fi (sweet)")
+		CFSTR(IFNAME), CFSTR("Ethernet"), CFSTR("AirPort"), CFSTR("Wi-Fi")
 	};
 	CFDictionaryRef ifd = dict(4, if_keys, if_values);
+
+	const void *glob_keys[] = {
+		CFSTR("PrimaryInterface"), CFSTR("PrimaryService"), CFSTR("Router")
+	};
+	const void *glob_values[] = {
+		CFSTR(IFNAME), CFSTR(SERVICE), router_str
+	};
+	CFDictionaryRef glob = dict(3, glob_keys, glob_values);
 
 	const void *keys[] = {
 		CFSTR("State:/Network/Service/" SERVICE "/IPv4"),
 		CFSTR("State:/Network/Service/" SERVICE "/DNS"),
+		CFSTR("State:/Network/Interface/" IFNAME "/IPv4"),
+		CFSTR("State:/Network/Interface/" IFNAME "/DNS"),
+		CFSTR("State:/Network/Global/IPv4"),
 		CFSTR("Setup:/Network/Service/" SERVICE "/IPv4"),
 		CFSTR("Setup:/Network/Service/" SERVICE "/Interface"),
 	};
-	const void *values[] = { ipv4, dnsd, ipv4, ifd };
-	CFDictionaryRef set = dict(4, keys, values);
+	const void *values[] = { ipv4, dnsd, ipv4, dnsd, glob, ipv4, ifd };
+	CFDictionaryRef set = dict(7, keys, values);
 
 	Boolean ok = SCDynamicStoreSetMultiple(store, set, NULL, NULL);
 
+	/* Clear IPConfigurationBusy so callers don't wait */
+	SCDynamicStoreRemoveValue(store, CFSTR("State:/Network/Interface/" IFNAME "/IPConfigurationBusy"));
+
 	CFRelease(set);
+	CFRelease(glob);
 	CFRelease(ifd);
 	CFRelease(dnsd);
 	CFRelease(ipv4);
@@ -103,7 +119,7 @@ publish_service(SCDynamicStoreRef store, const char *ip, const char *mask, const
 		fprintf(stderr, "sweet-wlan: SCDynamicStoreSetMultiple failed: %s\n", SCErrorString(SCError()));
 		return -1;
 	}
-	printf("sweet-wlan: published service %s (ew0 %s, router %s, DNS %s)\n", SERVICE, ip, router, dns);
+	printf("sweet-wlan: published service %s (" IFNAME " %s, router %s, DNS %s)\n", SERVICE, ip, router, dns);
 	return 0;
 }
 
@@ -113,10 +129,13 @@ unpublish_service(SCDynamicStoreRef store)
 	const void *keys[] = {
 		CFSTR("State:/Network/Service/" SERVICE "/IPv4"),
 		CFSTR("State:/Network/Service/" SERVICE "/DNS"),
+		CFSTR("State:/Network/Interface/" IFNAME "/IPv4"),
+		CFSTR("State:/Network/Interface/" IFNAME "/DNS"),
+		CFSTR("State:/Network/Global/IPv4"),
 		CFSTR("Setup:/Network/Service/" SERVICE "/IPv4"),
 		CFSTR("Setup:/Network/Service/" SERVICE "/Interface"),
 	};
-	CFArrayRef remove = CFArrayCreate(NULL, keys, 4, &kCFTypeArrayCallBacks);
+	CFArrayRef remove = CFArrayCreate(NULL, keys, 7, &kCFTypeArrayCallBacks);
 	SCDynamicStoreSetMultiple(store, NULL, remove, NULL);
 	CFRelease(remove);
 	printf("sweet-wlan: unpublished service %s\n", SERVICE);

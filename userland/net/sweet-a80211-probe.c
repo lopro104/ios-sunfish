@@ -50,8 +50,8 @@ main(int argc, char **argv)
 	}
 	rc = Open(&h);
 	printf("Open -> %d\n", rc);
-	rc = Bind(h, CFSTR("ew0"));
-	printf("Bind ew0 -> %d\n", rc);
+	rc = Bind(h, CFSTR("en0"));
+	printf("Bind en0 -> %d\n", rc);
 	if (GetPower) {
 		unsigned char on = 99;
 

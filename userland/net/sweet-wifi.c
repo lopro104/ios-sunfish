@@ -71,7 +71,7 @@ cmd_status(void)
 		return 0;
 	}
 
-	printf("Interface:   ew0\n");
+	printf("Interface:   en0\n");
 	printf("Status:      Connected\n");
 	printf("SSID:        %s\n", ssid[0] ? ssid : "(unknown)");
 	printf("IP Address:  %s\n", ip);

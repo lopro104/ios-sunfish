@@ -1030,3 +1030,26 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 - **Next steps**:
   1. Dynamic rescan on `SCAN_REQ` (run `wp_scan()` in background worker thread and post `SCAN_DONE` event 10 upon completion so pull-to-refresh works in Settings).
   2. Association from Settings UI (`ASSOCIATE` 20 / `DISASSOCIATE` 22): parse PSK/PMK in `apple80211_assoc_req` from `wifid` and trigger `jn_join()`.
+
+## 2026-10-29 ~01:05 Wi-Fi milestone: SETTINGS.APP BLUE CHECKMARK WORKING (Spinner Solved, en0, IO80211Controller Hierarchy)
+- **Settings Wi-Fi Spinner Completely Solved (Milestone 0173)**:
+  - Disassembled `WiFiKit` (`-[WFNetworkListController _updateCurrentNetworkIPState]` at `0x1f57700c8`): checks `[ipMonitor hasValidIPAddress]`. If `NO` -> state 1 (SPINNER / JOINING). If `YES` -> state 2 (BLUE CONNECTED CHECKMARK).
+  - Reverse engineering `-[WFIPMonitor __wifiServiceID]` revealed two critical Apple constraints:
+    1. **Hardcoded Substr "en" Requirement**: `0x1f57b09fc: [bsdName rangeOfString:@"en"]`. If BSD name does not contain `"en"`, `WiFiKit` logs `"%s: skipping non-Infra WiFi service bsdName='%@'"` and rejects the interface as peer-to-peer! The previous kernel name `"ew0"` caused instant rejection. Renamed to `"en0"`.
+    2. **IO80211Controller Parent Requirement**: SystemConfiguration `_processNetworkInterface` (`0x19064a750`) checks `IOObjectConformsTo(parent, "IO80211Controller")` for interface type 6 (Ethernet). When matched, SC marks interface type as `"IEEE80211"`, satisfying `CFEqual(type, kSCNetworkInterfaceTypeIEEE80211)`.
+  - In `tools/xnu-docker/work/xnu/iokit/Kernel/arm/SweetWiFi.cpp`: defined `IO80211Controller`, `IONetworkInterface`, `IOEthernetInterface`, and `IO80211Interface`. Allocates controller, registers service, attaches `IO80211Interface` with prefix `"en"`.
+  - In `tools/xnu-docker/work/xnu/bsd/dev/sweet_mpss.c`: changed interface creation to `init.name = "en"` (`en0`), Apple80211 event interface name to `"en0"`, and ioctl calls to `en0`.
+  - In `scratch/gen_sc_plists.py`: generated `NetworkInterfaces.plist` (`en0`, `SCNetworkInterfaceType = IEEE80211`) and `preferences.plist` (`serviceID = 4CD8DB21-0AC8-40A5-83C6-094D249CFE68`, `DeviceName = en0`, `Hardware = AirPort`, `Type = Ethernet`). Deployed to `/private/var/preferences/SystemConfiguration/`.
+  - In `userland/net/sweet-wlan.c`: updated `#define SERVICE "4CD8DB21-0AC8-40A5-83C6-094D249CFE68"`, `#define IFNAME "en0"`, published IPv4/DNS under both service UUID and interface `en0`, published `State:/Network/Global/IPv4`, cleared `IPConfigurationBusy`.
+  - In `tools/sweet-wlan-route.sh`: updated all `ew0` to `en0`.
+  - In `userland/net/sweet-a80211-probe.c`: updated bind to `en0`.
+- **Hardware Verification (on `shim/out/shim-local-0193-en0.img`)**:
+  - `test_sc` confirms:
+    `SCNetworkInterfaceCopyAll`: found `[0] bsd=en0, type=IEEE80211, name=Wi-Fi`.
+    `SCPreferences`: `serviceID=4CD8DB21-0AC8-40A5-83C6-094D249CFE68 -> bsd=en0, type=IEEE80211`.
+  - `sweet-wlan` published `4CD8DB21-0AC8-40A5-83C6-094D249CFE68`.
+  - Opened Settings > Wi-Fi: **SPINNER IS GONE. Connected network (`<HOME-WIFI>`) shows the BLUE CONNECTED CHECKMARK, Lock icon, 3-bar signal icon, and blue (i) info button!**
+  - Captured on-device screenshot: `logs/shot-check.png` (and `logs/shot-check.bin`).
+  - Internet latency over Wi-Fi (`en0`): IPv4 ping 1.1.1.1 = 5.5 ms (0% loss), IPv6 ping6 2001:4860:4860::8888 = 6.0 ms (0% loss).
+- **Handoff for Claude**: Details in `research/wifi/HANDOFF.md`.
+

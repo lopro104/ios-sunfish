@@ -1,6 +1,6 @@
 #!/bin/sh
-# Keep the phone's default route on Wi-Fi (ew0) while the Wi-Fi link is up, and on the USB network (ue0, 192.168.7.1) otherwise.
-# The kernel publishes the lease in `sysctl kern.sweet_wlan_info` ("ip mask router dns ssid"); the link state is ew0's RUNNING flag.
+# Keep the phone's default route on Wi-Fi (en0) while the Wi-Fi link is up, and on the USB network (ue0, 192.168.7.1) otherwise.
+# The kernel publishes the lease in `sysctl kern.sweet_wlan_info` ("ip mask router dns ssid"); the link state is en0's RUNNING flag.
 # Run it on the phone (nohup /var/jb/bin/sh sweet-wlan-route.sh &). The USB subnet stays on-link, so SSH keeps working either way.
 export PATH=$PATH:/var/jb/usr/sbin:/var/jb/usr/bin:/var/jb/bin:/var/jb/sbin
 USB_ROUTER=192.168.7.1
@@ -15,37 +15,37 @@ route -n add -ifscope ue0 default "$USB_ROUTER" >/dev/null 2>&1
 
 count=0
 while :; do
-	if ifconfig ew0 2>/dev/null | grep -q RUNNING; then
+	if ifconfig en0 2>/dev/null | grep -q RUNNING; then
 		set -- $(sysctl -n kern.sweet_wlan_info 2>/dev/null)
 		ip=$1
 		mask=$2
 		router=$3
 		if [ -n "$router" ]; then
-			# Ensure on-link subnet route exists for ew0
+			# Ensure on-link subnet route exists for en0
 			subnet="${ip%.*}.0"
-			route -n add -net "$subnet" -netmask "${mask:-255.255.255.0}" -interface ew0 >/dev/null 2>&1
+			route -n add -net "$subnet" -netmask "${mask:-255.255.255.0}" -interface en0 >/dev/null 2>&1
 
-			# (also when the default route is on ew0 but points at the previous network's router)
-			if ! route -n get default 2>/dev/null | grep -q "interface: ew0" || ! route -n get default 2>/dev/null | grep -q "gateway: $router\$"; then
+			# (also when the default route is on en0 but points at the previous network's router)
+			if ! route -n get default 2>/dev/null | grep -q "interface: en0" || ! route -n get default 2>/dev/null | grep -q "gateway: $router\$"; then
 				ping -c 1 -W 1 "$router" >/dev/null 2>&1
 				[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
 				route -n delete default >/dev/null 2>&1
 				route -n add default "$router" >/dev/null 2>&1
-				echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
+				echo "$(date +%T) default route -> $router via en0 (sweet-wlan published)"
 			fi
 
 			# IPv6: attach it and listen for router advertisements (the kernel only does that after SIOCLL_START + SIOCAUTOCONF_START,
 			# which IPConfiguration would do for a configd-managed service) and solicit one with rtsol (the kernel's own solicitation is
 			# not answered); then an unscoped default route via the advertising router (the kernel's own one is interface-scoped).
-			r6=$(ndp -r 2>/dev/null | sed -n 's/^\(fe80::[^ ]*%ew0\) if=ew0.*/\1/p' | head -1)
+			r6=$(ndp -r 2>/dev/null | sed -n 's/^\(fe80::[^ ]*%en0\) if=en0.*/\1/p' | head -1)
 			if [ "$v6started" != "$ip" ] || { [ -z "$r6" ] && [ $((count % 10)) -eq 9 ]; }; then
 				v6started=$ip
-				( sweet-autoconf6 ew0 stop; ndp -R; ndp -P; route -n delete -inet6 default; sweet-autoconf6 ew0; sleep 2; rtsol ew0 & rp=$!; sleep 8; kill $rp ) >/dev/null 2>&1 &
+				( sweet-autoconf6 en0 stop; ndp -R; ndp -P; route -n delete -inet6 default; sweet-autoconf6 en0; sleep 2; rtsol en0 & rp=$!; sleep 8; kill $rp ) >/dev/null 2>&1 &
 			fi
-			if [ -n "$r6" ] && ! route -n get -inet6 default 2>/dev/null | grep -q "interface: ew0"; then
+			if [ -n "$r6" ] && ! route -n get -inet6 default 2>/dev/null | grep -q "interface: en0"; then
 				route -n delete -inet6 default >/dev/null 2>&1
 				route -n add -inet6 default "$r6" >/dev/null 2>&1
-				echo "$(date +%T) IPv6 default route -> $r6 via ew0"
+				echo "$(date +%T) IPv6 default route -> $r6 via en0"
 			fi
 
 			# Periodic ARP keepalive and health check (every ~15s)
@@ -66,11 +66,11 @@ while :; do
 	else
 		count=0
 		fail_count=0
-		if [ -n "$v6started" ] && route -n get -inet6 default 2>/dev/null | grep -q "interface: ew0"; then
+		if [ -n "$v6started" ] && route -n get -inet6 default 2>/dev/null | grep -q "interface: en0"; then
 			route -n delete -inet6 default >/dev/null 2>&1
 		fi
 		v6started=
-		if route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+		if route -n get default 2>/dev/null | grep -q "interface: en0"; then
 			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan -u >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
 			route -n add default "$USB_ROUTER" >/dev/null 2>&1

@@ -43,11 +43,11 @@ int main(int argc, char **argv) {
                 }
 
                 if (Apple80211BindToInterface) {
-                    CFStringRef ew0 = CFStringCreateWithCString(kCFAllocatorDefault, "ew0", kCFStringEncodingUTF8);
-                    ret = Apple80211BindToInterface(handle, ew0);
+                    CFStringRef en0 = CFStringCreateWithCString(kCFAllocatorDefault, "en0", kCFStringEncodingUTF8);
+                    ret = Apple80211BindToInterface(handle, en0);
                     const char *bindErr = Apple80211ReturnToString ? Apple80211ReturnToString(ret) : "unknown";
-                    printf("Apple80211BindToInterface(ew0) -> %d (%s)\n", ret, bindErr);
-                    CFRelease(ew0);
+                    printf("Apple80211BindToInterface(en0) -> %d (%s)\n", ret, bindErr);
+                    CFRelease(en0);
                 }
                 if (Apple80211Close) {
                     Apple80211Close(handle);
