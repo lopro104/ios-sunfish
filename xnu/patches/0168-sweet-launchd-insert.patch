@@ -1,0 +1,49 @@
+--- a/bsd/kern/kern_exec.c	2026-10-28 20:48:14.426377552 +0200
++++ b/bsd/kern/kern_exec.c	2026-10-28 20:48:14.436199872 +0200
+@@ -6897,12 +6897,45 @@
+ 		}
+ 	}
+ 
++	user_addr_t envp = USER_ADDR_NULL;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * Boot-arg launchd_insert=PATH: start launchd with DYLD_INSERT_LIBRARIES=PATH, the way a
++	 * jailbreak's loader does, so that a launchd hook (ElleKit's pspawn.dylib) can pass tweak
++	 * injection on to everything launchd spawns. Not set: launchd starts with no environment.
++	 */
++	char insert_path[256];
++	if (PE_parse_boot_argn("launchd_insert", insert_path, sizeof(insert_path)) && insert_path[0] != '\0') {
++		char insert_env[300];
++		snprintf(insert_env, sizeof(insert_env), "DYLD_INSERT_LIBRARIES=%s", insert_path);
++		size_t env_length = strlen(insert_env) + 1;
++		user_addr_t env0 = USER_ADDR_ALIGN(scratch_addr + 3 * sizeof(user64_addr_t), sizeof(user_addr_t));
++		envp = USER_ADDR_ALIGN(env0 + env_length, sizeof(user_addr_t));
++		error = copyout(insert_env, env0, env_length);
++		if (!error) {
++			if (proc_is64bit(p)) {
++				user64_addr_t env64bit[2] = { env0, USER_ADDR_NULL };
++				error = copyout(env64bit, envp, sizeof(env64bit));
++			} else {
++				user32_addr_t env32bit[2] = { (user32_addr_t)env0, 0 };
++				error = copyout(env32bit, envp, sizeof(env32bit));
++			}
++		}
++		if (error) {
++			printf("load_init_program: launchd_insert copyout failed %d\n", error);
++			envp = USER_ADDR_NULL;
++		} else {
++			printf("load_init_program: %s with %s\n", path, insert_env);
++		}
++	}
++#endif
++
+ 	/*
+ 	 * Set up argument block for fake call to execve.
+ 	 */
+ 	init_exec_args.fname = argv0;
+ 	init_exec_args.argp = scratch_addr;
+-	init_exec_args.envp = USER_ADDR_NULL;
++	init_exec_args.envp = envp;
+ 
+ 	/*
+ 	 * So that init task is set with uid,gid 0 token
