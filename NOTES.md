@@ -1053,3 +1053,9 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - Internet latency over Wi-Fi (`en0`): IPv4 ping 1.1.1.1 = 5.5 ms (0% loss), IPv6 ping6 2001:4860:4860::8888 = 6.0 ms (0% loss).
 - **Handoff for Claude**: Details in `research/wifi/HANDOFF.md`.
 
+
+## 2026-10-29 Wi-Fi: real rescan on SCAN_REQ, patch 0173 (Claude)
+- Patches 0170-0171 (Antigravity) and 0172 (en0 + IO80211Controller parent; I wrote the patch file from the source tree, commit 4cbf1db) are in. Settings > Wi-Fi shows the blue checkmark for the connected network (Antigravity, 0173 milestone above).
+- Patch 0173: `SCAN_REQ` (10) from wifid sets `g_scan_req` when the link is up and the last scan is at least 20 s old; the connected service loop then runs `wp_scan()` (about 3 s, the radio leaves the home channel), drops the BSS entries not heard in that scan (`wp.bss[].seen`, `wp_bss_prune()`, keeping the connected one and re-finding `jn.bss`), and posts SCAN_DONE (event 10). Otherwise the cache answers at once and the event is posted immediately.
+- Observed on `shim-local-0194-rescan.img` (kernel-0179-rescan, cmdline of 0193-en0): join-time scan 26 BSS in 3 s; first request from Settings 258 s after boot: scan completed, 28 BSS heard, 18 kept, `EW: scan on request: 18 networks`; the user sees their network (checkmark) plus one other network in the list. Most neighbours are at -85..-95 dBm and wifid's `WiFiScanResultsPreparer` ("prominent filtering") hides weak ones; not verified that this is the reason.
+- Next: ASSOCIATE (20) / DISASSOCIATE (22) from Settings, per the handoff.
