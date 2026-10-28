@@ -1,0 +1,62 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4152,7 +4152,7 @@
+ 		}
+ 		for (unsigned k = 0; k < jn.ar.nrates; k++) {
+ 			if ((jn.ar.rates[k] & 0x7f) == ours[r]) {
+-				legacy[nl++] = (uint8_t)(ours[r] | (r < 4 ? 0x80 : 0));
++				legacy[nl++] = (uint8_t)(ours[r] | (ours[r] == 11 ? 0x80 : 0));      /* ath10k_mac_bitrate_to_rate: bit 7 only on 5.5 Mbit/s, it is not the 802.11 basic-rate flag */
+ 				break;
+ 			}
+ 		}
+@@ -4177,7 +4177,12 @@
+ 	if (jn.ar.ht) {
+ 		a[14] = g5 ? 4 : 5;                             /* MODE_11NA_HT20 (4) / MODE_11NG_HT20 (5) */
+ 	} else {
+-		a[14] = g5 ? 0 : ((nl > 4 || (nl && !(legacy[0] & 0x80))) ? 1 : 2);   /* 11A / 11G / 11B */
++		{
++			unsigned r0 = nl ? (legacy[0] & 0x7fu) : 0;
++			bool first_cck = r0 == 2 || r0 == 4 || r0 == 11 || r0 == 22;
++
++			a[14] = g5 ? 0 : ((nl > 4 || (nl && !first_cck)) ? 1 : 2);   /* 11A / 11G / 11B */
++		}
+ 	}
+ 	a[17] = nl;
+ 	a[18] = n_ht;
+@@ -4824,6 +4829,22 @@
+ 	return SYSCTL_OUT(req, ew.info, strlen(ew.info) + 1);
+ }
+ 
++/* kern.sweet_wlan_vparam = (vdev param id << 24) | value: set a WMI vdev parameter on the running station (e.g. 0x1b000004 = fixed rate OFDM 24 Mbit/s, 0x1b000207 = HT MCS 7, 0x1b000000 = back to rate control) */
++static volatile uint32_t g_vparam;
++
++static int
++sysctl_wlan_vparam SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int v = 0, err = sysctl_handle_int(oidp, &v, 0, req);
++
++	if (err == 0 && req->newptr != USER_ADDR_NULL && (uint32_t)v >> 24 != 0) {
++		g_vparam = (uint32_t)v;
++	}
++	return err;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_wlan_vparam, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_wlan_vparam, "I", "set a Wi-Fi vdev parameter");
++
+ /* kern.sweet_wlan_kick=1: behave as if the AP had kicked us (tests the rejoin path) */
+ static int
+ sysctl_wlan_kick SYSCTL_HANDLER_ARGS
+@@ -5497,6 +5518,12 @@
+ 		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
+ 			wp_poll();
+ 			wlan_tx_pump();
++			if (g_vparam != 0) {
++				uint32_t vp = g_vparam;
++
++				g_vparam = 0;
++				ev("EW: vdev param %#x = %#x: %s", vp >> 24, vp & 0xffffff, jn_vdev_param(vp >> 24, vp & 0xffffff, "vparam") ? "sent" : "failed");
++			}
+ 			sleep_ms(2);
+ 			if (nt_us() >= next_mon) {
+ 				uint8_t c[16];
