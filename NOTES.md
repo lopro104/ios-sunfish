@@ -849,3 +849,13 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - Path A: Add dummy `wlan` node to `tools/mkadt.py` + IOKit class `Sweet80211Interface : public IOService` in XNU registering `IO80211Interface` with `"BSD Name" = "ew0"` and socket ioctl handlers (`SIOCGA80211` / `SIOCSA80211`).
   - Path B (Zero risk, instant): Build a native iOS Settings PreferenceBundle (`/Library/PreferenceBundles/SweetWiFi.bundle`) that embeds `sweet-wifi` directly into Settings.app without relying on Apple's closed-source `wifid`.
 
+## 2026-10-28 ~03:50 MILESTONE: NATIVE iOS SETTINGS.APP PREFERENCE BUNDLE (SweetWiFi.bundle)
+- Implemented native GUI preference bundle under `userland/preferences/SweetWiFi/`:
+  - `SweetWiFiRootListController.m`: provides live connection status (SSID, IP, netmask, gateway), "Scan Nearby Networks" button with dynamically populated list of discovered APs and dBm signal strength, "Reconnect / Kick Link", and hardware/chipset info (WCN3990 Hexagon DSP).
+  - `entry.plist`: declares PreferenceLoader entry (`PSLinkCell`, title "Wi-Fi (WCN3990)").
+  - `Info.plist`: declares bundle `com.sweet.wifi.preferences`.
+  - `build.sh`: automated build script targeting `iPhoneOS14.5.sdk` with ARC and native Preferences headers, working around Theos Clang 10 module issues on Linux.
+- Packaged, signed with `ldid -S`, and deployed to `/var/jb/Library/PreferenceBundles/SweetWiFi.bundle/` and `/var/jb/Library/PreferenceLoader/Preferences/SweetWiFi.plist`.
+- Verified PreferenceLoader integration in Settings.app. Captured full-resolution screen dumps via `sweet-shot` on device (`logs/shot-wifi.png`, `logs/shot-wifi2.png`) showing Settings.app running smoothly in dark mode.
+- Driver diagnostic observation: `g_events` buffer in `sweet_mpss.c` (16 KB) fills after ~17.5 min (1052s) and stops recording because `ev()` drops lines when remaining space < 128 bytes. The next patch cycle should make this buffer circular or add a reset sysctl.
+- Committed in `dbe89e4`. Phone uptime >1h 30m, 0% packet loss to router and internet. Ready for 04:00 agent transition.
