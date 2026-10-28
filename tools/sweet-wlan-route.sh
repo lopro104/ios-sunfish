@@ -9,18 +9,34 @@ USB_ROUTER=192.168.7.1
 # default route over USB (the PC's NAT) for DNS; the data goes over the default route, which is Wi-Fi while it is up.
 route -n add -ifscope ue0 default "$USB_ROUTER" >/dev/null 2>&1
 
+count=0
 while :; do
 	if ifconfig ew0 2>/dev/null | grep -q RUNNING; then
 		set -- $(sysctl -n kern.sweet_wlan_info 2>/dev/null)
+		ip=$1
+		mask=$2
 		router=$3
-		if [ -n "$router" ] && ! route -n get default 2>/dev/null | grep -q "interface: ew0"; then
-			ping -b ew0 -c 1 -W 1 "$router" >/dev/null 2>&1
-			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
-			route -n delete default >/dev/null 2>&1
-			route -n add default "$router" >/dev/null 2>&1
-			echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
+		if [ -n "$router" ]; then
+			# Ensure on-link subnet route exists for ew0
+			subnet="${ip%.*}.0"
+			route -n add -net "$subnet" -netmask "${mask:-255.255.255.0}" -interface ew0 >/dev/null 2>&1
+
+			if ! route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+				ping -c 1 -W 1 "$router" >/dev/null 2>&1
+				[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
+				route -n delete default >/dev/null 2>&1
+				route -n add default "$router" >/dev/null 2>&1
+				echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
+			fi
+
+			# Periodic ARP keepalive (every ~15 seconds: count % 5 == 0 with 3s sleep)
+			count=$((count + 1))
+			if [ $((count % 5)) -eq 0 ]; then
+				ping -c 1 -W 1 "$router" >/dev/null 2>&1
+			fi
 		fi
 	else
+		count=0
 		if route -n get default 2>/dev/null | grep -q "interface: ew0"; then
 			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan -u >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
