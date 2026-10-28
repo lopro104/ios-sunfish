@@ -34,6 +34,8 @@ NET=${SWEET_NET:-$HERE/mesa/out/out/sweet-net}
 [ -f "$NET" ] && sudo install -o 0 -g 0 -m 0755 "$NET" "$R/private/var/jb/usr/bin/sweet-net" || echo "warning: no $NET: com.sweet.net will not find sweet-net" >&2
 WLAN=${SWEET_WLAN:-$HERE/userland/net/sweet-wlan}
 [ -f "$WLAN" ] && sudo install -o 0 -g 0 -m 0755 "$WLAN" "$R/private/var/jb/usr/bin/sweet-wlan" || true
+WIFI=${SWEET_WIFI:-$HERE/userland/net/sweet-wifi}
+[ -f "$WIFI" ] && sudo install -o 0 -g 0 -m 0755 "$WIFI" "$R/private/var/jb/usr/bin/sweet-wifi" || true
 [ -f "$HERE/tools/sweet-wlan-route.sh" ] && sudo install -o 0 -g 0 -m 0755 "$HERE/tools/sweet-wlan-route.sh" "$R/private/var/root/sweet-wlan-route.sh" || true
 
 [ -f "$HERE/jb/ssh_host_ed25519_key" ] || ssh-keygen -q -t ed25519 -N '' -C ios-sunfish -f "$HERE/jb/ssh_host_ed25519_key"

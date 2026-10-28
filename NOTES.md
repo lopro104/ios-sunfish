@@ -791,4 +791,15 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - `kern.sweetfb_present_us`: 2754 us (2.75 ms) for partial/light layers, up to 7534 us (7.53 ms) for full-screen blits.
   - Significance: Confirms the display session's hypothesis: at 60 Hz (16.66 ms frame budget), the 10 MB CPU copy alone consumes 30% to 45% of the total frame budget. Combined with Mesa draw time (~8-12 ms), this explains why scrolling is capped at ~41–46 fps. Eliminating the CPU copy ("GPU to panel" or direct MDP scanout) will unlock true 60 fps scrolling.
 
+## 2026-10-28 ~02:20 MILESTONE: USER-SPACE WI-FI MANAGER (sweet-wifi): STATUS, SCAN & CONNECT
+- Created `userland/net/sweet-wifi.c` (built with Theos toolchain and installed to `/var/jb/usr/bin/sweet-wifi` on phone).
+- Features:
+  - `sweet-wifi status`: displays active interface `ew0`, SSID, IP, netmask, gateway, and DNS.
+  - `sweet-wifi scan`: lists all visible BSSID access points with frequency, channel number, RSSI in dBm, and SSID.
+  - `sweet-wifi connect <SSID> <PASSWORD>`: computes 256-bit WPA2 PMK on-device via Apple CommonCrypto (`CCKeyDerivationPBKDF`), updates `/fw/wlan/net.conf`, triggers reconnect via `sysctl kern.sweet_wlan_kick=1`, and polls until connection is established.
+  - `sweet-wifi disconnect`: clears credentials and disconnects.
+- Integrated into `tools/jb-to-root.sh` for root image builds.
+
+
+
 
