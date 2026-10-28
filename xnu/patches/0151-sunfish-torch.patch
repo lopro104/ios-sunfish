@@ -1,0 +1,193 @@
+From: sunfish-display
+Subject: [PATCH] sunfish: rear torch over SPMI (PM6150L flash LED, sysctl kern.sweet_torch)
+
+kern.sweet_torch=MA turns LED1+LED2 on at MA mA each (13-200, 0 off), the
+way downstream leds-qpnp-flash-v2 drives the camera torch (software strobe,
+safety timer off). Writes are limited to SID 5 0xd340-0xd34e and refused when
+the APID is not owned by the apps EE. google,sunfish only.
+---
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -8,8 +8,10 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <pexpert/device_tree.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -89,14 +91,20 @@
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+ 	/* Restrict access to the battery blocks, the sunfish touch switch
+-	 * (PM6150 GPIO4), the RTC (0x60) and the ADC5 (0x31); keys retain their own lanes. */
++	 * (PM6150 GPIO4), the RTC (0x60), the ADC5 (0x31) and the sunfish flash LED module
++	 * (PM6150L, SID 5, 0xd3); keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	if (sid == 5 && peripheral == 0xd3) {
++		/* the torch (below) */
++	} else if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48 && peripheral != 0xc3 &&
+ 	    peripheral != 0x60 && peripheral != 0x31)) {
+ 		return -1;
+ 	}
++	if (!sp_ready || !out) {
++		return -1;
++	}
+ 	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+@@ -131,14 +139,17 @@
+ /*
+  * SUNFISH: the in-cell FTM5 touch IC sits behind a load switch on PM6150
+  * GPIO4 (downstream pinctrl touch_power_default: output high), and the
+- * battery's temperature is a conversion of the PM6150's ADC5 (below). Those
++ * battery's temperature is a conversion of the PM6150's ADC5 (below). The
++ * rear torch is the PM6150L flash LED module (SID 5, 0xd340-0xd34e). Those
+  * are the only PMIC registers any SWEET driver writes; the address check
+  * keeps every other peripheral read-only.
+  */
+ int
+ sweet_spmi_write(unsigned sid, unsigned addr, uint8_t val)
+ {
+-	if (!sp_ready || sid != 0 || !((addr >= 0xc340u && addr <= 0xc346u) || (addr >= 0x3142u && addr <= 0x3147u))) {
++	bool ok = (sid == 0 && ((addr >= 0xc340u && addr <= 0xc346u) || (addr >= 0x3142u && addr <= 0x3147u))) ||
++	    (sid == 5 && addr >= 0xd340u && addr <= 0xd34eu);
++	if (!sp_ready || !ok) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);
+@@ -283,4 +294,128 @@
+ 	}
+ 	return -1;
+ }
++
++/*
++ * SUNFISH rear torch: PM6150L flash LED module at SID 5, 0xd300 (downstream
++ * pm6150l.dtsi qcom,leds@d300, driver leds-qpnp-flash-v2.c). The camera's
++ * torch is LED1 + LED2 together (sm7150-sunfish-camera-sensor.dtsi:
++ * torch-source = torch0 + torch1, switch2 mask 3), software strobe.
++ *
++ *   sysctl kern.sweet_torch=MA   on at MA milliamps per LED (13-200), 0 off
++ *
++ * Per LED n (0, 1) the registers are base + n: SAFETY_TMR 0x40 (0x13 =
++ * timer off, as the driver's torch), TGR_CURRENT 0x43 (mA / 12.5 - 1 at the
++ * 12.5 mA IRES step), STROBE_CTRL 0x49 (bit 2 clear = software strobe),
++ * HDRM_PRGM 0x4d (0x84: 325 mV headroom, 100 mV window). Module wide: IRES
++ * 0x47 (index 0 = 12.5 mA for both), MOD_CTRL 0x46 bit 7, EN_LED_CTRL 0x4c.
++ */
++#define TORCH_SID       5u
++#define TORCH_BASE      0xd300u
++#define TORCH_MAX_MA    200
++#define TORCH_LEDS      0x03u
++
++static int sweet_torch_ma;
++
++static bool
++torch_board_sunfish(void)
++{
++	static const char want[] = "google,sunfish";
++	DTEntry root;
++	char const *compat;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", (void const **)&compat, &size) != kSuccess) {
++		return false;
++	}
++	for (unsigned int i = 0; i < size;) {
++		size_t len = strnlen(compat + i, size - i);
++		if (len == sizeof(want) - 1 && memcmp(compat + i, want, len) == 0) {
++			return true;
++		}
++		i += (unsigned int)len + 1u;
++	}
++	return false;
++}
++
++static int
++torch_update(unsigned reg, uint8_t mask, uint8_t val)
++{
++	uint8_t old;
++
++	if (sweet_spmi_read(TORCH_SID, TORCH_BASE + reg, &old) != 0) {
++		return -1;
++	}
++	return sweet_spmi_write(TORCH_SID, TORCH_BASE + reg, (uint8_t)((old & ~mask) | (val & mask)));
++}
++
++static int
++torch_set(int ma)
++{
++	uint8_t type = 0, subtype = 0, status = 0;
++	int err = 0;
++
++	if (ma <= 0) {
++		err |= torch_update(0x4c, TORCH_LEDS, 0);
++		err |= torch_update(0x46, 0x80, 0);
++		for (unsigned n = 0; n < 2; n++) {
++			err |= torch_update(0x43 + n, 0x7f, 0);
++		}
++		printf("SWEET TORCH: off%s\n", err ? " (an SPMI write failed)" : "");
++		return err ? -1 : 0;
++	}
++	if (ma < 13) {
++		ma = 13;
++	}
++	if (ma > TORCH_MAX_MA) {
++		ma = TORCH_MAX_MA;
++	}
++	uint8_t code = (uint8_t)((ma * 1000 + 6250) / 12500 - 1);
++	sweet_spmi_read(TORCH_SID, TORCH_BASE + 0x04, &type);
++	sweet_spmi_read(TORCH_SID, TORCH_BASE + 0x05, &subtype);
++	err |= torch_update(0x47, 0x7f, 0);
++	for (unsigned n = 0; n < 2; n++) {
++		err |= sweet_spmi_write(TORCH_SID, TORCH_BASE + 0x4d + n, 0x84);
++		err |= sweet_spmi_write(TORCH_SID, TORCH_BASE + 0x40 + n, 0x13);
++		err |= torch_update(0x49 + n, 0x04, 0);
++		err |= torch_update(0x43 + n, 0x7f, code);
++	}
++	err |= torch_update(0x46, 0x80, 0x80);
++	err |= torch_update(0x4c, TORCH_LEDS, TORCH_LEDS);
++	delay(2000);
++	sweet_spmi_read(TORCH_SID, TORCH_BASE + 0x10, &status);
++	printf("SWEET TORCH: on, %d mA per LED (code %u), module type %#x/%#x, INT_RT_STS %#x%s\n",
++	    ma, code, type, subtype, status, err ? " (an SPMI write failed)" : "");
++	if (err) {
++		torch_set(0);
++		return -1;
++	}
++	return 0;
++}
++
++static int
++sysctl_sweet_torch(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int value = sweet_torch_ma;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	if (!torch_board_sunfish() || sweet_spmi_init() != 0) {
++		return ENODEV;
++	}
++	if (value < 0) {
++		value = 0;
++	}
++	if (torch_set(value) != 0) {
++		sweet_torch_ma = 0;
++		return EIO;
++	}
++	sweet_torch_ma = value > TORCH_MAX_MA ? TORCH_MAX_MA : value;
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_torch, "I", "sunfish rear torch: milliamps per LED (0 off, at most 200)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
