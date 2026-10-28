@@ -144,11 +144,16 @@ int
 main(int argc, char *argv[])
 {
 	bool monitor = false;
+	bool unpublish = false;
 	char ip[64] = {0}, mask[64] = {0}, router[64] = {0}, dns[64] = {0}, ssid[64] = {0};
+
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--monitor") == 0) {
 			monitor = true;
+		} else if (strcmp(argv[i], "-u") == 0 || strcmp(argv[i], "--unpublish") == 0) {
+			unpublish = true;
 		} else if (ip[0] == 0) {
 			strncpy(ip, argv[i], sizeof(ip) - 1);
 		} else if (mask[0] == 0) {
@@ -164,6 +169,11 @@ main(int argc, char *argv[])
 	if (store == NULL) {
 		fprintf(stderr, "sweet-wlan: cannot connect to dynamic store: %s\n", SCErrorString(SCError()));
 		return 1;
+	}
+
+	if (unpublish) {
+		unpublish_service(store);
+		return 0;
 	}
 
 	if (!monitor) {

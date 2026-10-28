@@ -32,6 +32,9 @@ sudo chmod 4755 "$R/Applications/Sileo.app/giveMeRoot"
 # sweet-net (userland/net, built by the mesa CI job into mesa/out/out) for the com.sweet.net job.
 NET=${SWEET_NET:-$HERE/mesa/out/out/sweet-net}
 [ -f "$NET" ] && sudo install -o 0 -g 0 -m 0755 "$NET" "$R/private/var/jb/usr/bin/sweet-net" || echo "warning: no $NET: com.sweet.net will not find sweet-net" >&2
+WLAN=${SWEET_WLAN:-$HERE/userland/net/sweet-wlan}
+[ -f "$WLAN" ] && sudo install -o 0 -g 0 -m 0755 "$WLAN" "$R/private/var/jb/usr/bin/sweet-wlan" || true
+[ -f "$HERE/tools/sweet-wlan-route.sh" ] && sudo install -o 0 -g 0 -m 0755 "$HERE/tools/sweet-wlan-route.sh" "$R/private/var/root/sweet-wlan-route.sh" || true
 
 [ -f "$HERE/jb/ssh_host_ed25519_key" ] || ssh-keygen -q -t ed25519 -N '' -C ios-sunfish -f "$HERE/jb/ssh_host_ed25519_key"
 sudo install -d -o 0 -g 0 -m 0700 "$R/private/var/root/.ssh"
@@ -44,7 +47,7 @@ path = sys.argv[1]
 st = os.stat(path)
 plist = plistlib.load(open(path, 'rb'))
 jobs = plist['LaunchDaemons']
-for k in [k for k, j in jobs.items() if j.get('Label') in ('com.sweet.gputest', 'com.sweet.jbprep', 'com.sweet.sshd', 'com.sweet.net')]:
+for k in [k for k, j in jobs.items() if j.get('Label') in ('com.sweet.gputest', 'com.sweet.jbprep', 'com.sweet.sshd', 'com.sweet.net', 'com.sweet.wlan')]:
     del jobs[k]
 jobs['/System/Library/LaunchDaemons/com.sweet.jbprep.plist'] = {
     'Label': 'com.sweet.jbprep',
@@ -67,10 +70,16 @@ jobs['/System/Library/LaunchDaemons/com.sweet.net.plist'] = {
     'ProgramArguments': ['/var/jb/usr/bin/sweet-net'],
     'RunAtLoad': True, 'UserName': 'root',
 }
+# The Wi-Fi network routing and DynamicStore service sync.
+jobs['/System/Library/LaunchDaemons/com.sweet.wlan.plist'] = {
+    'Label': 'com.sweet.wlan',
+    'ProgramArguments': ['/var/jb/bin/sh', '/var/root/sweet-wlan-route.sh'],
+    'RunAtLoad': True, 'KeepAlive': True, 'UserName': 'root',
+}
 plistlib.dump(plist, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
 os.chown(path, st.st_uid, st.st_gid)
 os.chmod(path, st.st_mode & 0o7777)
-print(f'launchd.plist: {len(jobs)} jobs, com.sweet.jbprep, com.sweet.sshd and com.sweet.net in')
+print(f'launchd.plist: {len(jobs)} jobs, com.sweet.jbprep, com.sweet.sshd, com.sweet.net, and com.sweet.wlan in')
 EOF
 
 sudo find "$R/private/var/mobile/Containers/Data/InternalDaemon" -name 'com.apple.LaunchServices-*.csstore' -print -delete 2>/dev/null || true

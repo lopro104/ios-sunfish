@@ -14,15 +14,17 @@ while :; do
 		set -- $(sysctl -n kern.sweet_wlan_info 2>/dev/null)
 		router=$3
 		if [ -n "$router" ] && ! route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
 			route -n add default "$router" >/dev/null 2>&1
-			echo "$(date +%T) default route -> $router via ew0"
+			echo "$(date +%T) default route -> $router via ew0 (sweet-wlan published)"
 		fi
 	else
 		if route -n get default 2>/dev/null | grep -q "interface: ew0"; then
+			[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan -u >/dev/null 2>&1
 			route -n delete default >/dev/null 2>&1
 			route -n add default "$USB_ROUTER" >/dev/null 2>&1
-			echo "$(date +%T) Wi-Fi down: default route -> $USB_ROUTER via ue0"
+			echo "$(date +%T) Wi-Fi down: default route -> $USB_ROUTER via ue0 (sweet-wlan unpublished)"
 		fi
 	fi
 	sleep 3
