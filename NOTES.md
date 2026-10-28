@@ -929,3 +929,8 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
 - Patch 0165: destination rings are posted four slots at a time (`wp_repost4`: one whole aligned line of free slots, one register write), the initial post is n-4 slots so the write index stays line-aligned.
 - Observed on `shim-local-0176-ht-cl4.img` (HT on, kernel 0170): 17+ minutes, 7700 rx frames, 0 stalls, 0 link losses (before: a stall every 0.5-10 minutes). Not yet a multi-hour soak.
 - Also in this patch: TX/RX frame classes in the history ring (HIST keys 0x5/0x6/0x7).
+
+### 2026-10-28 Wi-Fi: soak and repeatability after 0165 (Claude)
+- Observed on `shim-local-0176-ht-cl4.img` (HT on): 35 min up, 10.7k rx frames, 0% loss to the router, no stall, no crash, no restart. 8 forced rejoins (`sysctl kern.sweet_wlan_kick=1`, 15 s apart): router pingable again after 2-4 s each time.
+- Observed: two reboots of the same image: router pingable ~19-20 s after `fastboot boot`; in the following 150 s no "err_qdi" firmware crash in the console log and no "restarting the WLAN service" event. So the first-minute WLAN restart seen on every boot before 0165 did not occur in these two boots (it was probably the same CE ring race; two boots is not proof).
+- Not done: multi-hour soak, DHCP retry path (needs a lost ack), 5 GHz / other security types, power save with the screen off, IPv6, Settings integration (Antigravity's steps 16-18).
