@@ -817,3 +817,9 @@ tools/sweet-wlan-route.sh (new) makes the phone's default route follow Wi-Fi (ru
   - `sweet-wifi connect <SSID>`: connects using saved credentials without re-entering password.
   - Automatic fallback: backups `/fw/wlan/net.conf` to `.bak` before connecting and automatically restores previous working configuration if connection times out.
   - Auto-seeding: automatically seeds `/fw/wlan/saved.conf` from the active network on first run.
+
+## 2026-10-28 Display / UI Observation: Blurred Elements Flashing Artifact (Green)
+- **Observation (User report)**: Sometimes blurred UI elements flash weird colors (such as green). Specifically observed only on:
+  1. The "x" (delete badge) on app icons when long-pressing wallpaper to edit the homescreen (icon jiggle mode).
+  2. The lockscreen/notification center clock when viewing notifications.
+- **Context**: Root cause likely in QuartzCore blur/vibrancy shader blending or surface format conversion in Mesa freedreno / `eagl` texture blits. Recorded for future display/GPU triage; not being touched now per user instruction.
