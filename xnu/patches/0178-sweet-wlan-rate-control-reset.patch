@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -6013,6 +6013,8 @@
+ 	uint64_t started = nt_us();
+ 	unsigned lines = 0;
+ 	bool hist_done = false;
++	unsigned rc_phase = 0;
++	uint64_t rc_next = nt_us() + 3000000, rc_at = 0;
+ 
+ 	for (;;) {
+ 		bool found = false;
+@@ -6064,6 +6066,20 @@
+ 				g_vparam = 0;
+ 				ev("EW: vdev param %#x = %#x: %s", vp >> 24, vp & 0xffffff, jn_vdev_param(vp >> 24, vp & 0xffffff, "vparam") ? "sent" : "failed");
+ 			}
++			/*
++			 * The firmware's rate control starts at a poor TX rate on some links (5 GHz: 4.5 Mbit/s for hours where 13 is possible) and does
++			 * not climb by itself; forcing a fixed OFDM rate for a second and then handing the vdev back to rate control restarts it.
++			 * Once 3 s after the link comes up and then every 5 minutes (it costs a second at 24 Mbit/s).
++			 */
++			if (rc_phase == 0 && nt_us() >= rc_next) {
++				(void)jn_vdev_param(0x1b, 4, "rate control reset");             /* WMI_VDEV_PARAM_FIXED_RATE = OFDM 24 Mbit/s */
++				rc_phase = 1;
++				rc_at = nt_us() + 1000000;
++				rc_next = nt_us() + 300000000ull;
++			} else if (rc_phase == 1 && nt_us() >= rc_at) {
++				(void)jn_vdev_param(0x1b, 0, "rate control back");              /* 0 = rate control */
++				rc_phase = 0;
++			}
+ 			if (g_scan_req != 0) {
+ 				g_scan_req = 0;
+ 				for (unsigned k = 0; k < wp.nbss; k++) {
