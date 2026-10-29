@@ -1,0 +1,28 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 02:33:53.725290358 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 02:33:53.735195085 +0200
+@@ -142,6 +142,12 @@
+  * is found and then passed over by Metal (_MTLRegisterDevices), which leaves
+  * the renderers as they were. A real GPU driver (sweetgpu) must replace this
+  * stub, not add a second service: Metal wants exactly one.
++ *
++ * With boot-arg sweetmetal=1 it names a plugin: MetalPluginName "SweetMetal"
++ * (/System/Library/Extensions/SweetMetal.bundle, userland/gpu/SweetMetal.mm)
++ * and MetalPluginClassName "SweetMetalDevice", whose -initWithAcceleratorPort:
++ * gives the Adreno (UniXNU's Metal frontend over Turnip and SweetGPU's
++ * NativeAdreno service) to the processes it lists and nil to every other one.
+  */
+ class IOAcceleratorES : public IOService {
+ 	OSDeclareDefaultStructors(IOAcceleratorES);
+@@ -459,6 +465,12 @@
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		uint32_t metal = 0;
++		if (PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0) {
++			accel->setProperty("MetalPluginName", "SweetMetal");
++			accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
++			IOLog("SWEET FB: IOAcceleratorES names the Metal plugin SweetMetal (sweetmetal=1)\n");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+ 			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
