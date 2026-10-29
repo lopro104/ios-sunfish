@@ -1,0 +1,27 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4906,9 +4906,9 @@
+ 		static uint8_t nset[512];
+ 
+ 		if (rq->req_type < sizeof(nset) && nset[rq->req_type] < 3) {
+-			uint8_t d[96];
+-			char hex[96 * 2 + 1];
+-			size_t n = MIN((size_t)rq->req_len, sizeof(d));
++			uint8_t d[320];
++			char hex[320 * 2 + 1];
++			size_t n = MIN((size_t)rq->req_len, rq->req_type == 20 ? sizeof(d) : (size_t)96);
+ 
+ 			nset[rq->req_type]++;
+ 			if (n != 0 && copyin((user_addr_t)rq->req_data, d, n) == 0) {
+@@ -5196,6 +5196,11 @@
+ 		}
+ 		break;
+ 	}
++	case 22:                                                /* DISASSOCIATE (set): wifid sends it before every join; accepted without leaving the network (ASSOCIATE 20 is only logged so far) */
++		if (set) {
++			err = 0;
++		}
++		break;
+ 	case 207: {                                             /* CHANNELS_INFO: {version, ..., count=0 at offset 12} */
+ 		if (!set) {
+ 			uint32_t out[4] = { 1, 0, 0, 0 };
