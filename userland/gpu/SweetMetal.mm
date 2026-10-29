@@ -134,6 +134,23 @@ beside(const char *name, char *path, size_t size)
 		}
 	}
 	setenv("TU_DEBUG", options, 0);
+	/*
+	 * The file sync_commit beside this executable: the render server's command buffers are waited for in
+	 * commit (frontend patch), until completed ("1", or an empty file) or until submitted ("2").
+	 */
+	if (beside("sync_commit", file, sizeof(file))) {
+		char mode[8] = "1";
+		FILE *f = fopen(file, "r");
+		if (f != NULL) {
+			if (fgets(mode, sizeof(mode), f) == NULL || (mode[0] != '1' && mode[0] != '2')) {
+				strlcpy(mode, "1", sizeof(mode));
+			}
+			mode[1] = 0;
+			fclose(f);
+		}
+		setenv("SWEETMETAL_SYNC_COMMIT", mode, 0);
+		os_log(sweet_log(), "SweetMetal: SWEETMETAL_SYNC_COMMIT=%{public}s", mode);
+	}
 	os_log(sweet_log(), "SweetMetal: TU_DEBUG=%{public}s", getenv("TU_DEBUG"));
 	/*
 	 * The runtime refuses to open without a writable shader-cache directory. backboardd runs as mobile:

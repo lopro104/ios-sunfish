@@ -15,7 +15,33 @@
    case 3:case 29:case 33:return 4;
    case 4:case 30:case 34:return 8;
    case 6:case 32:case 36:return 16;
-@@ -1859,7 +1863,7 @@
+@@ -1018,7 +1022,11 @@
+ // waited for the GPU of the frame before it (interval = GPU time + encode time). The handlers of the server's own render buffers run at submission
+ // instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
+ // (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
+-static bool earlyOn() {return false;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
++static bool earlyOn() {return false;}
++// SWEETMETAL_SYNC_COMMIT (set by SweetMetal.bundle from its file sync_commit): a command buffer made by the render server's thread is,
++// in commit, waited for until completed (1) or until submitted to the GPU (2), so Core Animation's swap that follows never names a
++// frame whose work the kernel has not seen yet (sunfish: the display copy showed tiles of frames being drawn; 1 fixed it, slowly).
++static int syncCommit() {static int on=-1;if(on<0){const char *v=getenv("SWEETMETAL_SYNC_COMMIT");on=v?atoi(v):0;}return on;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
+ static bool onRenderServerThread() {
+  char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
+  return !strncmp(name,"com.apple.coreanimation",23);
+@@ -1189,7 +1197,11 @@
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
+   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
+-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {[self fireEarly];return;}
++     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
++   if(earlyEligible && syncCommit()==1)nmb_command_buffer_wait(_handle,0);
++   else if(earlyEligible && syncCommit()==2)(void)nmb_command_buffer_wait_scheduled(_handle);
++   [self fireEarly];return;
++  }
+   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
+   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
+  }
+@@ -1859,7 +1871,7 @@
  #endif
  #if TARGET_OS_IPHONE
   // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
