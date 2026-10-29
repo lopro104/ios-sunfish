@@ -1,0 +1,137 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4687,6 +4687,22 @@
+  */
+ static volatile uint32_t g_scan_req;
+ static uint64_t g_last_scan_us;
++/* protects wp.bss against the pruning in the service thread while the Apple80211 ioctls read it (allocated in ew_if_create) */
++static lck_mtx_t *g_bss_lock;
++#define BSS_LOCK()      do { if (g_bss_lock != NULL) { lck_mtx_lock(g_bss_lock); } } while (0)
++#define BSS_UNLOCK()    do { if (g_bss_lock != NULL) { lck_mtx_unlock(g_bss_lock); } } while (0)
++
++/* the cache entry of the network we are connected to, found by BSSID (the index jn.bss moves when the cache is pruned); -1 if none; call with the lock held */
++static int
++ew_find_cur(void)
++{
++	for (unsigned k = 0; k < wp.nbss && k < 48; k++) {
++		if (memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0) {
++			return (int)k;
++		}
++	}
++	return -1;
++}
+ static uint64_t nt_us(void);
+ 
+ static void
+@@ -4695,6 +4711,7 @@
+ 	unsigned n = 0;
+ 	uint32_t newbss = 0xffffffffu;
+ 
++	BSS_LOCK();
+ 	for (unsigned k = 0; k < wp.nbss; k++) {
+ 		bool mine = jn.connected && memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0;
+ 
+@@ -4715,6 +4732,7 @@
+ 	if (newbss != 0xffffffffu) {
+ 		jn.bss = newbss;
+ 	}
++	BSS_UNLOCK();
+ }
+ 
+ /* Apple80211 events: kernel events vendor Apple (1), class 6, subclass 1; event code, then the interface name (16 bytes) and a payload */
+@@ -4806,7 +4824,7 @@
+ 	const char *ssid = wp.bss[k].ssid;
+ 	unsigned slen = strlen(ssid);
+ 
+-	if (slen == 0 && (int)k == jn.bss && jn.connected && jn.ssid_len > 0) {
++	if (slen == 0 && jn.connected && memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0 && jn.ssid_len > 0) {
+ 		ssid = jn.ssid;
+ 		slen = MIN((unsigned)jn.ssid_len, 32u);
+ 	}
+@@ -4819,7 +4837,7 @@
+ 	i16 = -95; memcpy(out + 0x12, &i16, 2);
+ 	{
+ 		/* Settings asks for minRSSI=-80 and wifid drops weaker networks; the offset lifts the other networks' signal (not the connected one's) */
+-		int rssi = wp.bss[k].rssi + ((int)k == jn.bss && jn.connected ? 0 : g_rssi_offset);
++		int rssi = wp.bss[k].rssi + (jn.connected && memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0 ? 0 : g_rssi_offset);
+ 
+ 		if (rssi > -30) {
+ 			rssi = -30;
+@@ -4976,7 +4994,16 @@
+ 	case 16:                                                /* RSSI / NOISE: {version, num_radios, unit, ctl[4], ctl_agr, ext[4], ext_agr} (found with markers) */
+ 	case 17: {
+ 		int32_t out[13] = { 0 };
+-		int32_t v = rq->req_type == 16 ? (up ? wp.bss[jn.bss].rssi : -100) : -95;
++		int32_t v = -95;
++
++		if (rq->req_type == 16) {
++			int cur;
++
++			BSS_LOCK();
++			cur = ew_find_cur();
++			v = (up && cur >= 0) ? wp.bss[cur].rssi : -100;
++			BSS_UNLOCK();
++		}
+ 
+ 		if (!set) {
+ 			out[0] = 1;
+@@ -5036,11 +5063,16 @@
+ 	case 11: {                                              /* SCAN_RESULT (get): indexed by req_val */
+ 		if (!set) {
+ 			uint32_t idx = rq->req_val;
++			uint8_t out[1160];
++			bool have;
+ 
+-			if (idx < wp.nbss) {
+-				uint8_t out[1160];
+-
++			BSS_LOCK();
++			have = idx < wp.nbss;
++			if (have) {
+ 				ew_a80211_scanrec(out, idx);
++			}
++			BSS_UNLOCK();
++			if (have) {
+ 				rq->req_val = idx + 1;
+ 				err = ew_a80211_out(rq, out, sizeof(out));
+ 			} else {
+@@ -5056,14 +5088,28 @@
+ 			} else {
+ 				uint8_t out[1160];
+ 
+-				if (jn.bss >= 0 && (unsigned)jn.bss < wp.nbss) {
+-					ew_a80211_scanrec(out, (unsigned)jn.bss);
++				int cur;
++
++				BSS_LOCK();
++				cur = ew_find_cur();
++				if (cur >= 0) {
++					ew_a80211_scanrec(out, (unsigned)cur);
+ 				} else {
+ 					memset(out, 0, sizeof(out));
+ 					uint32_t u32 = 1;
+ 					memcpy(out + 0, &u32, 4);
+ 					memcpy(out + 4, &u32, 4);
+ 				}
++				BSS_UNLOCK();
++				{
++					static unsigned n103;
++
++					if (n103++ < 400) {
++						const uint8_t *ie_ssid = swu_ie_find(out + 0x8c, *(uint16_t *)(out + 0x8a), 0);
++
++						ev("A80211: 103 #%u cur=%d nbss=%u ie_ssid=%.*s", n103, cur, wp.nbss, ie_ssid ? ie_ssid[1] : 0, ie_ssid ? (const char *)ie_ssid + 2 : "");
++					}
++				}
+ 				/* Ensure critical fields always match jn */
+ 				uint32_t ch = ew_a80211_channel(jn.mhz);
+ 				memcpy(out + 8, &ch, 4);
+@@ -5209,6 +5255,7 @@
+ 	}
+ 	grp = lck_grp_alloc_init("sweet_wlan_if", LCK_GRP_ATTR_NULL);
+ 	ew.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++	g_bss_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
+ 	ew.txq = kalloc_data(EW_TXQ * EW_FRAME_MAX, Z_WAITOK | Z_ZERO);
+ 	bzero(&init, sizeof(init));
+ 	init.ver = IFNET_INIT_CURRENT_VERSION;
