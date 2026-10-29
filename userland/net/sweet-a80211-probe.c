@@ -40,6 +40,7 @@ main(int argc, char **argv)
 	int (*GetInfoCopy)(void *, CFDictionaryRef *) = dlsym(lib, "Apple80211GetInfoCopy");
 	int (*Get)(void *, int, int, void *, unsigned long) = dlsym(lib, "Apple80211Get");
 	int (*Scan)(void *, CFArrayRef *, CFDictionaryRef) = dlsym(lib, "Apple80211Scan");
+	int (*Associate)(void *, CFDictionaryRef, CFStringRef) = dlsym(lib, "Apple80211Associate");
 	void *h = NULL;
 	int rc;
 
@@ -63,6 +64,26 @@ main(int argc, char **argv)
 
 		rc = GetPowerState(h, &st);
 		printf("GetPowerState -> %d state=%d\n", rc, st);
+	}
+	if (argc > 3 && strcmp(argv[1], "assoc") == 0 && Scan && Associate) {
+		/* sweet-a80211-probe assoc SSID PASSWORD: Apple80211Associate with the scan result of that SSID (the kernel logs the requests) */
+		CFArrayRef res = NULL;
+		CFStringRef want = CFStringCreateWithCString(NULL, argv[2], kCFStringEncodingUTF8);
+		CFStringRef pw = CFStringCreateWithCString(NULL, argv[3], kCFStringEncodingUTF8);
+
+		rc = Scan(h, &res, NULL);
+		printf("Scan -> %d\n", rc);
+		for (CFIndex i = 0; res != NULL && i < CFArrayGetCount(res); i++) {
+			CFDictionaryRef d = CFArrayGetValueAtIndex(res, i);
+			CFTypeRef ss = CFDictionaryGetValue(d, CFSTR("SSID_STR"));
+
+			if (ss != NULL && CFEqual(ss, want)) {
+				rc = Associate(h, d, pw);
+				printf("Associate(%s) -> %d\n", argv[2], rc);
+				break;
+			}
+		}
+		argc = 1;
 	}
 	if (argc > 1 && strcmp(argv[1], "scan") == 0 && Scan) {
 		CFArrayRef res = NULL;
