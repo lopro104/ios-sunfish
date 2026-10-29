@@ -7,8 +7,10 @@
  *
  * The device is UniXNU's native Metal frontend (AdrenoMetal NativeBridgeMetalFrontend.mm, MIT): a
  * dynamic subclass of _MTLDevice whose objects are the metal2vulkan runtime over Turnip, which talks
- * to SweetGPU's NativeAdreno service (xnu 0174/0176). Turnip is libvulkan_freedreno.dylib beside
- * this executable in the bundle.
+ * to SweetGPU's NativeAdreno service (xnu 0174/0176). It is SweetMetalCore.dylib beside this
+ * executable, opened only in a listed process: loaded into every process that asks for Metal (its
+ * classes and categories on Metal's own), it made SpringBoard die every few seconds although the
+ * device was nil there. Turnip is libvulkan_freedreno.dylib beside it.
  *
  * Only the processes named in /var/jb/etc/sweetmetal.clients (one name per line, "*" for all) get
  * the device; every other one gets nil, which is what Metal had before the plugin existed (no
@@ -23,13 +25,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-extern "C" id native_bridge_metal_open(const char *loader, const char *cache, uint64_t registryID,
-    void (*missing)(const char *, const char *));
+typedef id (*open_fn)(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
 extern "C" kern_return_t IORegistryEntryGetRegistryEntryID(unsigned entry, uint64_t *entryID);
-/* The frontend's telemetry reads UniXNU's shader-priming counters (their PrimeShaders.h); there is no priming here yet. */
-extern "C" {
-volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate;
-}
 
 @interface _MTLDevice : NSObject
 @end
@@ -75,13 +72,13 @@ listed(void)
 	return yes;
 }
 
-/* libvulkan_freedreno.dylib beside this executable. */
+/* `name` beside this executable. */
 static bool
-turnip_path(char *path, size_t size)
+beside(const char *name, char *path, size_t size)
 {
 	Dl_info info = {};
 
-	if (!dladdr((const void *)&turnip_path, &info) || info.dli_fname == NULL) {
+	if (!dladdr((const void *)&beside, &info) || info.dli_fname == NULL) {
 		return false;
 	}
 	snprintf(path, size, "%s", info.dli_fname);
@@ -89,21 +86,35 @@ turnip_path(char *path, size_t size)
 	if (slash == NULL) {
 		return false;
 	}
-	snprintf(slash + 1, size - (size_t)(slash + 1 - path), "libvulkan_freedreno.dylib");
+	snprintf(slash + 1, size - (size_t)(slash + 1 - path), "%s", name);
 	return access(path, R_OK) == 0;
 }
 
 @implementation SweetMetalDevice
 - (id)initWithAcceleratorPort:(unsigned)port
 {
-	char turnip[1024], cache[512];
+	char turnip[1024], core[1024], cache[512];
 	uint64_t registryID = 0;
 
+	/*
+	 * Returning nil or another object releases self, and -[_MTLDevice dealloc] of one never initialized
+	 * crashed (dispatch_release of its queues, inside CAMetalContextCreate: backboardd in a loop on the
+	 * first sweetmetal=1 boot). Initializing it ([super init]) in every process that asks for Metal
+	 * killed SpringBoard instead (sig 9 every few seconds). So self is never initialized and never
+	 * released: one leaked, empty object per process that asks.
+	 */
+	(void)CFBridgingRetain(self);
 	if (!listed()) {
 		return nil;
 	}
-	if (!turnip_path(turnip, sizeof(turnip))) {
-		os_log_error(sweet_log(), "SweetMetal: no Turnip beside the plugin");
+	if (!beside("libvulkan_freedreno.dylib", turnip, sizeof(turnip)) || !beside("SweetMetalCore.dylib", core, sizeof(core))) {
+		os_log_error(sweet_log(), "SweetMetal: no Turnip or SweetMetalCore beside the plugin");
+		return nil;
+	}
+	void *handle = dlopen(core, RTLD_NOW | RTLD_LOCAL);
+	open_fn open_device = handle ? (open_fn)dlsym(handle, "native_bridge_metal_open") : NULL;
+	if (open_device == NULL) {
+		os_log_error(sweet_log(), "SweetMetal: %{public}s", dlerror());
 		return nil;
 	}
 	setenv("TU_DARWIN_SERVICE", "NativeAdrenoGpuPublished", 0);
@@ -118,7 +129,7 @@ turnip_path(char *path, size_t size)
 	}
 	id device = nil;
 	@try {
-		device = native_bridge_metal_open(turnip, cache, registryID, missing);
+		device = open_device(turnip, cache, registryID, missing);
 	} @catch (NSException *exception) {
 		os_log_error(sweet_log(), "SweetMetal: %{public}@ opening the device", exception);
 		device = nil;
