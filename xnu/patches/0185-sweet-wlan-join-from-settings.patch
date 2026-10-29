@@ -1,0 +1,201 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -3697,14 +3697,56 @@
+ static const struct swu_wpa_ops jn_ops;
+ static void jn_dataframe(const uint8_t *eth, size_t n);
+ 
++/*
++ * A join asked for in Settings (Apple80211 ASSOCIATE): the ioctl fills g_ujoin_new and sets g_ujoin_pending; the station loop moves it to
++ * g_ujoin (the network jn_read_conf uses instead of /fw/wlan/net.conf, until a join of it fails) and rejoins. g_join_result is what
++ * ASSOCIATE_RESULT (21) answers: 0 while it runs, then Apple80211's number: 1 success, 21 wrong key, 2 anything else.
++ */
++struct ujoin {
++	uint8_t ssid[32];
++	uint8_t ssid_len;
++	uint8_t pmk[32];
++};
++static struct ujoin g_ujoin_new, g_ujoin;
++static volatile uint32_t g_ujoin_pending, g_ujoin_valid;
++static volatile uint32_t g_join_result;
++
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32) */
++static void
++ujoin_pmk(const uint8_t *pass, size_t plen, const uint8_t *ssid, size_t slen, uint8_t pmk[32])
++{
++	for (uint32_t blk = 1; blk <= 2; blk++) {
++		uint8_t cnt[4] = { 0, 0, 0, (uint8_t)blk }, u[20], r[20];
++
++		swu_hmac_sha1(pass, plen, ssid, slen, cnt, 4, u);
++		memcpy(r, u, 20);
++		for (unsigned i = 1; i < 4096; i++) {
++			swu_hmac_sha1(pass, plen, u, 20, NULL, 0, u);
++			for (unsigned k = 0; k < 20; k++) {
++				r[k] ^= u[k];
++			}
++		}
++		memcpy(pmk + (blk - 1) * 20, r, blk == 1 ? 20 : 12);
++	}
++}
++
+ static bool
+ jn_read_conf(void)
+ {
+ 	char buf[160];
+ 	off_t size = 0;
+-	int err = tftp_file("/fw/wlan/net.conf", 0, NULL, 0, &size);
++	int err;
+ 	unsigned i, l = 0;
+ 
++	if (g_ujoin_valid) {
++		memcpy(jn.ssid, g_ujoin.ssid, g_ujoin.ssid_len);
++		jn.ssid_len = g_ujoin.ssid_len;
++		memcpy(jn.pmk, g_ujoin.pmk, 32);
++		ev("JOIN: network \"%.*s\" asked for in Settings, PMK derived", jn.ssid_len, jn.ssid);
++		return true;
++	}
++	err = tftp_file("/fw/wlan/net.conf", 0, NULL, 0, &size);
++
+ 	if (err != 0 || size < 70 || size >= (off_t)sizeof(buf)) {
+ 		ev("JOIN: no usable /fw/wlan/net.conf (error %d, %lld bytes)", err, (long long)size);
+ 		return false;
+@@ -4908,7 +4950,7 @@
+ 		if (rq->req_type < sizeof(nset) && nset[rq->req_type] < 3) {
+ 			uint8_t d[96];
+ 			char hex[96 * 2 + 1];
+-			size_t n = MIN((size_t)rq->req_len, sizeof(d));
++			size_t n = rq->req_type == 20 ? 0 : MIN((size_t)rq->req_len, sizeof(d));     /* (ASSOCIATE carries the key: lengths only) */
+ 
+ 			nset[rq->req_type]++;
+ 			if (n != 0 && copyin((user_addr_t)rq->req_data, d, n) == 0) {
+@@ -4925,6 +4967,16 @@
+ 	case 12: {                                              /* CARD_CAPABILITIES: 13 bytes, a bitmap */
+ 		uint8_t caps[13] = { 0 };
+ 
++		/*
++		 * apple80211_var.h APPLE80211_CAP_*, a bit each: AES 2, AES-CCM 3, power management 6, short slot 9, short preamble 10, WPA2 14, WME 17,
++		 * short GI at 20 MHz 19 (the set the Topaz port of this tree found to work). Apple80211AssociateAsync fails with -3903 before it
++		 * sends ASSOCIATE unless the capability byte at handle+0x51 has bit 5 (WPA, 13) or bit 6 (WPA2, 14) set.
++		 */
++		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
++
++		for (unsigned i = 0; i < sizeof(has); i++) {
++			caps[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
++		}
+ 		if (!set) {
+ 			err = ew_a80211_out(rq, caps, sizeof(caps));
+ 		}
+@@ -4975,7 +5027,6 @@
+ 	}
+ 	case 5:                                                 /* POWERSAVE: 0 in req_val */
+ 	case 18:                                                /* INT_MIT: 0 in req_val */
+-	case 21:                                                /* ASSOCIATE_RESULT: 0 in req_val (0 = success) */
+ 	case 26:                                                /* TX_POWER: in req_val (mW) */
+ 	case 57:                                                /* POWER_SAVE_LEVEL: in req_val */
+ 	case 353:                                               /* NSS (number of spatial streams) */
+@@ -5196,6 +5247,59 @@
+ 		}
+ 		break;
+ 	}
++	case 20:                                                /* ASSOCIATE (set): a join asked for in Settings; answered at once, the station loop does it */
++		if (set) {
++			/* apple80211_assoc, 592 bytes: ssid_length @0xc, ssid @0x10, bssid @0x30, key_length @0x3c, key_cipher @0x40 (10: the passphrase as typed,
++			 * 6: the PMK), key @0x48 */
++			uint8_t a[0x88];
++			uint32_t slen, klen, cipher;
++
++			if (rq->req_len < sizeof(a) || copyin((user_addr_t)rq->req_data, a, sizeof(a)) != 0) {
++				err = EINVAL;
++				break;
++			}
++			memcpy(&slen, a + 0xc, 4);
++			memcpy(&klen, a + 0x3c, 4);
++			memcpy(&cipher, a + 0x40, 4);
++			ev("A80211: ASSOCIATE: name of %u bytes, key of %u bytes of kind %u", slen, klen, cipher);
++			if (slen == 0 || slen > 32 || g_ujoin_pending) {
++				err = EINVAL;
++				break;
++			}
++			memset(&g_ujoin_new, 0, sizeof(g_ujoin_new));
++			memcpy(g_ujoin_new.ssid, a + 0x10, slen);
++			g_ujoin_new.ssid_len = (uint8_t)slen;
++			if (cipher == 10 && klen >= 8 && klen <= 63) {
++				ujoin_pmk(a + 0x48, klen, a + 0x10, slen, g_ujoin_new.pmk);
++			} else if (cipher == 6 && klen == 32) {
++				memcpy(g_ujoin_new.pmk, a + 0x48, 32);
++			} else {
++				memset(a, 0, sizeof(a));
++				err = EINVAL;
++				break;
++			}
++			memset(a, 0, sizeof(a));
++			g_join_result = 0;
++			g_ujoin_pending = 1;
++			err = 0;
++		}
++		break;
++	case 21:                                                /* ASSOCIATE_RESULT (get): how the last join went, in req_val (0: not over yet) */
++		if (!set) {
++			rq->req_val = g_join_result;
++			err = 0;
++		}
++		break;
++	case 22:                                                /* DISASSOCIATE (set): wifid sends it before every join; accepted without leaving the network */
++		if (set) {
++			err = 0;
++		}
++		break;
++	case 422:                                               /* 6G_MODE (set): wifid sets it before every ASSOCIATE and abandons the join when it fails; no 6 GHz here */
++		if (set) {
++			err = 0;
++		}
++		break;
+ 	case 207: {                                             /* CHANNELS_INFO: {version, ..., count=0 at offset 12} */
+ 		if (!set) {
+ 			uint32_t out[4] = { 1, 0, 0, 0 };
+@@ -6095,6 +6199,11 @@
+ 		if (g_wlan_crashed || g_modem_crashed) {
+ 			return;
+ 		}
++		if (g_ujoin_pending) {
++			g_ujoin_pending = 0;
++			g_ujoin = g_ujoin_new;
++			g_ujoin_valid = 1;
++		}
+ 		for (unsigned att = 0; att < 4 && !found && !g_wlan_crashed && !g_modem_crashed; att++) {
+ 			wp_scan();
+ 			wp_fault_check("scan");
+@@ -6105,6 +6214,13 @@
+ 		}
+ 		if (!found || !jn_join()) {
+ 			ev("EW: no connection (found %u): trying again in 5 s", found);
++			if (g_ujoin_valid) {
++				/* the join Settings asked for failed: forget it (the next try is the stored network) and tell wifid */
++				g_ujoin_valid = 0;
++				memset(&g_ujoin, 0, sizeof(g_ujoin));
++				g_join_result = found ? 21 : 2;
++				ew_a80211_event(9, NULL, 0);
++			}
+ 			if (jn.active) {
+ 				jn_cleanup();
+ 			}
+@@ -6122,6 +6238,9 @@
+ 			continue;
+ 		}
+ 		wp_fault_check("join done");
++		if (g_ujoin_valid && g_join_result == 0) {
++			g_join_result = 1;
++		}
+ 		jn_net_test();                                  /* DHCP, then ew0 gets the address (service mode) */
+ 		if (nt.state != 4) {
+ 			ev("EW: no lease: joining again");      /* otherwise the link sits here for ever without an address */
+@@ -6130,6 +6249,10 @@
+ 		ev("EW: service running");
+ 		next_mon = nt_us() + 5000000;
+ 		while (!g_wlan_crashed && !g_modem_crashed && !jn.kicked) {
++			if (g_ujoin_pending) {
++				jn.kicked = true;                       /* a join asked for in Settings: leave this network, the loop's start takes it */
++				break;
++			}
+ 			wp_poll();
+ 			wlan_tx_pump();
+ 			if (g_vparam != 0) {
