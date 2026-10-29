@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_mpss.c b/bsd/dev/sweet_mpss.c
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4788,6 +4788,10 @@
+ 	return 0x2 | (mhz > 5000 ? 0x10u : 0x8u);
+ }
+ 
++/* kern.sweet_wlan_rssi_offset: dB added to the signal strength of scanned networks as Apple80211 reports it (iOS hides networks below -80 dBm) */
++static int g_rssi_offset = 10;
++SYSCTL_INT(_kern, OID_AUTO, sweet_wlan_rssi_offset, CTLFLAG_RW | CTLFLAG_LOCKED, &g_rssi_offset, 0, "dB added to scanned networks' signal in Apple80211 results");
++
+ /*
+  * apple80211_scan_result, 1160 bytes (found from the loads in __addScanResultToList): version 0, channel {version, channel, flags}
+  * at 4, noise/snr/rssi int16 at 0x12/0x14/0x16, beacon interval 0x18, capabilities 0x1a, BSSID 0x1c, rate count 0x22, SSID length
+@@ -4813,8 +4817,16 @@
+ 	u32 = ew_a80211_channel(wp.bss[k].mhz); memcpy(out + 8, &u32, 4);
+ 	u32 = ew_a80211_chflags(wp.bss[k].mhz); memcpy(out + 12, &u32, 4);
+ 	i16 = -95; memcpy(out + 0x12, &i16, 2);
+-	i16 = (int16_t)(wp.bss[k].rssi + 95); memcpy(out + 0x14, &i16, 2);
+-	i16 = wp.bss[k].rssi; memcpy(out + 0x16, &i16, 2);
++	{
++		/* Settings asks for minRSSI=-80 and wifid drops weaker networks; the offset lifts the other networks' signal (not the connected one's) */
++		int rssi = wp.bss[k].rssi + ((int)k == jn.bss && jn.connected ? 0 : g_rssi_offset);
++
++		if (rssi > -30) {
++			rssi = -30;
++		}
++		i16 = (int16_t)(rssi + 95); memcpy(out + 0x14, &i16, 2);
++		i16 = (int16_t)rssi; memcpy(out + 0x16, &i16, 2);
++	}
+ 	u16 = wp.bss[k].bint; memcpy(out + 0x18, &u16, 2);
+ 	u16 = wp.bss[k].cap; memcpy(out + 0x1a, &u16, 2);
+ 	memcpy(out + 0x1c, wp.bss[k].bssid, 6);
