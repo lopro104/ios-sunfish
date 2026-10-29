@@ -1,0 +1,41 @@
+--- a/bsd/dev/sweet_mpss.c
++++ b/bsd/dev/sweet_mpss.c
+@@ -4703,6 +4703,27 @@
+ 	}
+ 	return -1;
+ }
++/* true if another cache entry with the same SSID is the one to report instead of entry i; call with the lock held */
++static bool
++ew_bss_shadowed(unsigned i)
++{
++	if (wp.bss[i].ssid[0] == '\0') {
++		return false;
++	}
++	bool imine = jn.connected && memcmp(wp.bss[i].bssid, jn.bssid, 6) == 0;
++
++	for (unsigned k = 0; k < wp.nbss && k < 48; k++) {
++		if (k == i || strcmp(wp.bss[k].ssid, wp.bss[i].ssid) != 0) {
++			continue;
++		}
++		bool kmine = jn.connected && memcmp(wp.bss[k].bssid, jn.bssid, 6) == 0;
++
++		if (kmine || (!imine && (wp.bss[k].rssi > wp.bss[i].rssi || (wp.bss[k].rssi == wp.bss[i].rssi && k < i)))) {
++			return true;
++		}
++	}
++	return false;
++}
+ static uint64_t nt_us(void);
+ 
+ static void
+@@ -5067,6 +5088,10 @@
+ 			bool have;
+ 
+ 			BSS_LOCK();
++			/* one record per SSID (the connected BSS, else the strongest): wifid lists every BSSID of a network (2.4 and 5 GHz) as its own row */
++			while (idx < wp.nbss && ew_bss_shadowed(idx)) {
++				idx++;
++			}
+ 			have = idx < wp.nbss;
+ 			if (have) {
+ 				ew_a80211_scanrec(out, idx);
