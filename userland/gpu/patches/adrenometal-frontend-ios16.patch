@@ -1,0 +1,26 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -554,9 +554,13 @@
+  Method method=class_getInstanceMethod(object_getClass(object),selector);
+  return method && !strcmp(method_getTypeEncoding(method),encoding);
+ }
+-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
++// Bytes of a function constant of MTLDataType `type` (scalars and 2/3/4-wide vectors). 3-wide ones are packed, as the translator takes
++// them (metal2vulkan-air canon ConstValue: a float3 is 12 bytes); iOS 16.7's QuartzCore specializes fixed_frag_* with a uchar3 (51).
+ static uint64_t constantBytes(uint64_t type) {
+  switch(type) {
++  case 5:case 31:case 35:return 12;
++  case 18:case 39:case 43:return 6;
++  case 47:case 51:case 55:return 3;
+   case 3:case 29:case 33:return 4;
+   case 4:case 30:case 34:return 8;
+   case 6:case 32:case 36:return 16;
+@@ -1859,7 +1863,7 @@
+ #endif
+ #if TARGET_OS_IPHONE
+  // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
+- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
++ if(!base || class_getInstanceSize(base)<528){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+ #endif
+  if(!base)base=[NSObject class];
+  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;

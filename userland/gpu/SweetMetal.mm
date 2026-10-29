@@ -119,11 +119,24 @@ beside(const char *name, char *path, size_t size)
 	}
 	setenv("TU_DARWIN_SERVICE", "NativeAdrenoGpuPublished", 0);
 	setenv("TU_DEBUG", "nocb", 0);  /* (UniXNU: concurrent binning stalled passes) */
-	snprintf(cache, sizeof(cache), "/var/tmp/sweetmetal");
-	mkdir(cache, 0777);
-	strlcat(cache, "/", sizeof(cache));
-	strlcat(cache, getprogname(), sizeof(cache));
-	mkdir(cache, 0700);
+	/*
+	 * The runtime refuses to open without a writable shader-cache directory. backboardd runs as mobile:
+	 * a root-made /var/tmp/sweetmetal (0755) gave it none and so no device on the first try. The
+	 * process's own cache directory first (as UniXNU's plugin does), else one under /var/tmp per user.
+	 */
+	cache[0] = 0;
+	if (confstr(_CS_DARWIN_USER_CACHE_DIR, cache, sizeof(cache) - 32) != 0 && cache[0] != 0) {
+		strlcat(cache, "sweetmetal", sizeof(cache));
+		mkdir(cache, 0700);
+	}
+	if (cache[0] == 0 || access(cache, W_OK) != 0) {
+		snprintf(cache, sizeof(cache), "/var/tmp/sweetmetal-%u", (unsigned)getuid());
+		mkdir(cache, 0700);
+	}
+	if (access(cache, W_OK) != 0) {
+		os_log_error(sweet_log(), "SweetMetal: no writable cache directory for %{public}s", getprogname());
+		return nil;
+	}
 	if (port != 0) {
 		IORegistryEntryGetRegistryEntryID(port, &registryID);
 	}
