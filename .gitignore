@@ -12,3 +12,5 @@ __pycache__/
 tools-android/
 mesa/out/
 jb/
+COMMS.md
+.comms-seen/
