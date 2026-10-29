@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:36:02.361188803 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:36:02.371311562 +0200
+@@ -1041,14 +1041,31 @@
+ 	}
+ }
+ 
++/*
++ * Is the GPU done drawing a swap whose fence (the GPU's last submission when it came) is `fence`?
++ * With GL the frame was submitted before the swap: done when that fence is. With Metal
++ * (sweet_fb_present_wait) Core Animation swaps first and submits the frame's work after: done once
++ * a later submission exists and everything submitted is (filmed: the panel showed the tiles of a
++ * frame being drawn). No later submission within 3 vsyncs: shown as it is (vsync()).
++ */
++static bool
++sweet_fb_swap_drawn(uint32_t fence)
++{
++	if (sweet_fb_present_wait > 0) {
++		uint32_t last = sweet_gpu_last();
++		return last != fence && sweet_gpu_done(last);
++	}
++	return sweet_gpu_done(fence);
++}
++
+ /* Under fLock: the newest swap waiting that the GPU is done with (any, without sweetfb_gpuwait); NULL: none. */
+ uint8_t *
+ AppleCLCD::doneFrame(void)
+ {
+-	if (fPendingFence == 0 || sweet_gpu_done(fPendingFence)) {
++	if (fPendingFence == 0 || sweet_fb_swap_drawn(fPendingFence)) {
+ 		return fPending;
+ 	}
+-	if (fHaveReady && sweet_gpu_done(fReadyFence)) {
++	if (fHaveReady && sweet_fb_swap_drawn(fReadyFence)) {
+ 		return fReady;
+ 	}
+ 	return NULL;
