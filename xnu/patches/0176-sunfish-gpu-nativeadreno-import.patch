@@ -1,0 +1,191 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp	2026-10-29 02:27:11.486038755 +0200
++++ b/iokit/Kernel/arm/SweetGPU.cpp	2026-10-29 02:27:11.495637164 +0200
+@@ -751,8 +751,10 @@
+  *
+  * Unlike msm, the client picks its buffers' GPU addresses: each client gets a window of the
+  * kernel's address space of its own (va_start, va_size of the device info) and BoMap enters a
+- * buffer anywhere in it. Buffers are wired kernel memory, write-combined, as gemNew's. Not here
+- * yet: BoImport (a caller's own pages, for IOSurfaces), more than one ring (queues are numbers),
++ * buffer anywhere in it. Buffers are wired kernel memory, write-combined, as gemNew's, or with
++ * BoImport the caller's own pages (an IOSurface's, a malloc'd buffer), wired until BoFree and
++ * reached by the GPU uncached: the caller cleans its cache before the GPU reads and invalidates
++ * it after the GPU writes, as the ABI says. Not here yet: more than one ring (queues are numbers),
+  * and faults (GetStatus says none).
+  */
+ #define NA_TUNNEL_MAGIC         0x4e544e4cu     /* 'NTNL' */
+@@ -761,7 +763,8 @@
+ #define NA_UCHE_TRAP_BASE       0x1fffffffff000ull      /* sweet_adreno.c step 20 */
+ 
+ struct na_buffer {
+-	IOBufferMemoryDescriptor *      memory;         /* NULL: this handle is free */
++	IOMemoryDescriptor *            memory;         /* NULL: this handle is free */
++	bool                            imported;       /* the caller's pages (prepared: wired until released) */
+ 	uint64_t                        size;
+ 	uint64_t                        iova;           /* 0: not entered into the GPU's addresses */
+ 	uint32_t                        fence;          /* the last submission after it was entered */
+@@ -791,6 +794,9 @@
+ 	void unmapBuffer(struct na_buffer * b);
+ 	IOReturn call(uint32_t method, const void * in, size_t inSize, void * out, size_t * outSize);
+ 	IOReturn boAlloc(const NativeAdrenoAbiBoAlloc * request, NativeAdrenoAbiBoAllocReply * reply);
++	IOReturn boImport(const NativeAdrenoAbiBoImport * request, NativeAdrenoAbiBoAllocReply * reply);
++	IOReturn addBuffer(IOMemoryDescriptor * memory, uint64_t size, bool imported, NativeAdrenoAbiBoAllocReply * reply);
++	static void releaseMemory(struct na_buffer * b);
+ 	IOReturn boMap(const NativeAdrenoAbiBoMap * request, NativeAdrenoAbiBoMapReply * reply);
+ 	IOReturn submit(const NativeAdrenoAbiSubmit * request, NativeAdrenoAbiSubmitReply * reply);
+ 
+@@ -892,7 +898,7 @@
+ 				if (b->iova != 0) {
+ 					leak = true;    /* the GPU may still write it: it stays its own */
+ 				} else {
+-					b->memory->release();
++					releaseMemory(b);
+ 				}
+ 				b->memory = NULL;
+ 			}
+@@ -924,8 +930,6 @@
+ {
+ 	IOOptionBits options = kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapWriteCombineCache;
+ 	IOBufferMemoryDescriptor * memory;
+-	struct na_buffer * b = NULL;
+-	uint32_t handle = 0;
+ 
+ 	if (request->bytes == 0 || (request->bytes & 4095) || request->bytes > GPU_BUFFER_MAX ||
+ 	    request->align_log2 < 12 || request->align_log2 > 24 || request->contiguous > 1) {
+@@ -940,6 +944,20 @@
+ 		IOLog("SWEET GPU: no memory for a NativeAdreno buffer of %llu bytes\n", request->bytes);
+ 		return kIOReturnNoMemory;
+ 	}
++	IOReturn ret = addBuffer(memory, request->bytes, false, reply);
++	if (ret != kIOReturnSuccess) {
++		memory->release();
++	}
++	return ret;
++}
++
++/* A handle for `memory` (already wired); NULL slot: kIOReturnNoResources, and the memory stays the caller's. */
++IOReturn
++SweetNativeAdrenoClient::addBuffer(IOMemoryDescriptor * memory, uint64_t size, bool imported, NativeAdrenoAbiBoAllocReply * reply)
++{
++	struct na_buffer * b = NULL;
++	uint32_t handle = 0;
++
+ 	IOLockLock(gGPULock);
+ 	for (uint32_t n = 0; n < NA_BUFFERS; n++) {
+ 		uint32_t i = (fNextBuffer + n) % NA_BUFFERS;
+@@ -954,17 +972,57 @@
+ 	if (b != NULL) {
+ 		bzero(b, sizeof(*b));
+ 		b->memory = memory;
+-		b->size = request->bytes;
++		b->size = size;
++		b->imported = imported;
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	if (b == NULL) {
+-		memory->release();
+ 		return kIOReturnNoResources;
+ 	}
+ 	reply->handle = handle;
+ 	return kIOReturnSuccess;
+ }
+ 
++void
++SweetNativeAdrenoClient::releaseMemory(struct na_buffer * b)
++{
++	if (b->imported) {
++		b->memory->complete();
++	}
++	b->memory->release();
++}
++
++/* The calling task's pages [address, address + bytes) as a buffer: wired here, until BoFree. */
++IOReturn
++SweetNativeAdrenoClient::boImport(const NativeAdrenoAbiBoImport * request, NativeAdrenoAbiBoAllocReply * reply)
++{
++	IOMemoryDescriptor * memory;
++	IOReturn ret;
++
++	if (request->address == 0 || (request->address & 4095) || request->bytes == 0 || (request->bytes & 4095) ||
++	    request->bytes > GPU_BUFFER_MAX || request->address + request->bytes < request->address) {
++		return kIOReturnBadArgument;
++	}
++	memory = IOMemoryDescriptor::withAddressRange((mach_vm_address_t) request->address, (mach_vm_size_t) request->bytes,
++	    kIODirectionInOut, current_task());
++	if (memory == NULL) {
++		return kIOReturnNoMemory;
++	}
++	ret = memory->prepare();
++	if (ret != kIOReturnSuccess) {
++		IOLog("SWEET GPU: NativeAdreno import of %llu bytes at %#llx: the pages cannot be wired (%#x)\n", request->bytes,
++		    request->address, ret);
++		memory->release();
++		return ret;
++	}
++	ret = addBuffer(memory, request->bytes, true, reply);
++	if (ret != kIOReturnSuccess) {
++		memory->complete();
++		memory->release();
++	}
++	return ret;
++}
++
+ IOReturn
+ SweetNativeAdrenoClient::boMap(const NativeAdrenoAbiBoMap * request, NativeAdrenoAbiBoMapReply * reply)
+ {
+@@ -1076,6 +1134,7 @@
+ 		p->input_bits = 39;
+ 		p->output_bits = 36;
+ 		p->max_bo_bytes = GPU_BUFFER_MAX;
++		p->flags = NativeAdrenoParamsHostImport;
+ 		break;
+ 	}
+ 	case NativeAdrenoMethodGetDeviceInfo: {
+@@ -1123,7 +1182,7 @@
+ 		}
+ 		unmapBuffer(b);
+ 		if (b->iova == 0) {
+-			b->memory->release();
++			releaseMemory(b);
+ 		}
+ 		b->memory = NULL;
+ 		break;
+@@ -1204,8 +1263,8 @@
+ 	case NativeAdrenoMethodBoCpuMap: {
+ 		const NativeAdrenoAbiBoCpuMap * r = NA_IN(NativeAdrenoAbiBoCpuMap);
+ 		NativeAdrenoAbiBoCpuMapReply * a = NA_OUT(NativeAdrenoAbiBoCpuMapReply);
+-		if (r == NULL || a == NULL || (b = buffer(r->handle)) == NULL) {
+-			return kIOReturnBadArgument;
++		if (r == NULL || a == NULL || (b = buffer(r->handle)) == NULL || b->imported) {
++			return kIOReturnBadArgument;    /* (an imported buffer keeps the caller's own mapping) */
+ 		}
+ 		a->token = (uint32_t) r->handle;        /* clientMemoryForType's type is the handle */
+ 		a->reserved = 0;
+@@ -1219,8 +1278,17 @@
+ 		}
+ 		break;
+ 	}
+-	case NativeAdrenoMethodBoImport:
+-		return kIOReturnUnsupported;    /* (params.flags says so: no NativeAdrenoParamsHostImport) */
++	case NativeAdrenoMethodBoImport: {
++		const NativeAdrenoAbiBoImport * r = NA_IN(NativeAdrenoAbiBoImport);
++		NativeAdrenoAbiBoAllocReply * a = NA_OUT(NativeAdrenoAbiBoAllocReply);
++		if (r == NULL || a == NULL) {
++			return kIOReturnBadArgument;
++		}
++		IOLockUnlock(gGPULock);         /* (wiring may sleep; addBuffer takes the lock itself) */
++		ret = boImport(r, a);
++		IOLockLock(gGPULock);
++		break;
++	}
+ 	default:
+ 		return kIOReturnUnsupported;
+ 	}
+@@ -1238,7 +1306,7 @@
+ 
+ 	IOLockLock(gGPULock);
+ 	b = buffer(type);
+-	if (b != NULL) {
++	if (b != NULL && !b->imported) {
+ 		b->memory->retain();
+ 		*memory = b->memory;
+ 		*options = 0;
