@@ -13,7 +13,17 @@
  
  			nset[rq->req_type]++;
  			if (n != 0 && copyin((user_addr_t)rq->req_data, d, n) == 0) {
-@@ -5196,6 +5196,16 @@
+@@ -4925,6 +4925,9 @@
+ 	case 12: {                                              /* CARD_CAPABILITIES: 13 bytes, a bitmap */
+ 		uint8_t caps[13] = { 0 };
+ 
++		/* bits 13 and 14 (byte 1, 0x60): Apple80211AssociateAsync fails with -3903 for a WPA3/SAE-capable network (Settings joins a
++		 * transition-mode hotspot) before sending ASSOCIATE unless the handle's capability byte at +0x51 has bit 5 or 6 set */
++		caps[1] = 0x60;
+ 		if (!set) {
+ 			err = ew_a80211_out(rq, caps, sizeof(caps));
+ 		}
+@@ -5196,6 +5199,16 @@
  		}
  		break;
  	}
