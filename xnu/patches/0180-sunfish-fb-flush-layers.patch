@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:15:15.823150336 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:15:15.833278248 +0200
+@@ -37,6 +37,15 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);  /* osfmk/arm/caches_internal.h */
++/*
++ * Out of this processor's cache before a layer is read: with Metal (sweetmetal=1) the GPU writes the
++ * window server's surfaces through the caller's own pages (NativeAdreno BoImport), past the cache,
++ * while present() reads them through the kernel's cached mapping, so lines of an earlier frame were
++ * shown (blocks of the screen missing in every animation). Boot-arg sweetfb_inval=0/1 overrides
++ * the default (on with sweetmetal=1).
++ */
++static int sweet_fb_inval = -1;
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1211,6 +1220,17 @@
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		uint32_t row = s->bytesPerRow, base = s->offset;
++		if (sweet_fb_inval < 0) {
++			int on = 0, metal = 0;
++			if (!PE_parse_boot_argn("sweetfb_inval", &on, sizeof(on))) {
++				on = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
++			}
++			sweet_fb_inval = on != 0;
++			IOLog("SWEET FB: layers %s out of the cache before they are read\n", sweet_fb_inval ? "flushed" : "not flushed");
++		}
++		if (sweet_fb_inval && src != 0 && s->memory != NULL) {
++			FlushPoC_DcacheRegion((vm_offset_t)src, (size_t)s->memory->getLength());
++		}
+ 		/*
+ 		 * 'b3a8' (what backboardd draws the screen into with the GL layer): blue-first pixels in
+ 		 * plane 0, opacity in plane 1; the panel shows plane 0, with that plane's own rows.
