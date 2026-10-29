@@ -19,6 +19,7 @@
  */
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <os/log.h>
 #include <stdio.h>
 #include <string.h>
@@ -26,6 +27,31 @@
 #include <unistd.h>
 
 typedef id (*open_fn)(const char *loader, const char *cache, uint64_t registryID, void (*missing)(const char *, const char *));
+typedef size_t (*table_fn)(char *out, size_t size);
+
+/* The frontend's telemetry table (UniXNU's GPU8 rows: commit-to-complete times, pipelines, caches...) into <cache>/telemetry.txt every 5 s. */
+struct telemetry_job {
+	table_fn table;
+	char path[600];
+};
+
+static void *
+telemetry_thread(void *arg)
+{
+	struct telemetry_job *job = (struct telemetry_job *)arg;
+	static char text[8192];
+
+	for (;;) {
+		sleep(5);
+		size_t n = job->table(text, sizeof(text));
+		FILE *f = fopen(job->path, "w");
+		if (f != NULL) {
+			fwrite(text, 1, n, f);
+			fclose(f);
+		}
+	}
+	return NULL;
+}
 extern "C" kern_return_t IORegistryEntryGetRegistryEntryID(unsigned entry, uint64_t *entryID);
 
 @interface _MTLDevice : NSObject
@@ -185,6 +211,18 @@ beside(const char *name, char *path, size_t size)
 		device = nil;
 	}
 	os_log(sweet_log(), "SweetMetal: %{public}s gets %{public}s", getprogname(), device ? "the Adreno" : "no device");
+	table_fn table = handle ? (table_fn)dlsym(handle, "native_bridge_metal_telemetry") : NULL;
+	if (device != nil && table != NULL) {
+		struct telemetry_job *job = (struct telemetry_job *)calloc(1, sizeof(*job));
+		pthread_t thread;
+		if (job != NULL) {
+			job->table = table;
+			snprintf(job->path, sizeof(job->path), "%s/telemetry.txt", cache);
+			if (pthread_create(&thread, NULL, telemetry_thread, job) == 0) {
+				pthread_detach(thread);
+			}
+		}
+	}
 	return device;
 }
 @end

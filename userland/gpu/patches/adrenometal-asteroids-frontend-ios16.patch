@@ -1,0 +1,79 @@
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -12,6 +12,7 @@
+ #import <objc/runtime.h>
+ #import <objc/message.h>
+ #include <algorithm>
++#include <sys/sysctl.h>
+ #include <array>
+ #include <memory>
+ #include <deque>
+@@ -1190,9 +1191,13 @@
+  Method method=class_getInstanceMethod(object_getClass(object),selector);
+  return method && !strcmp(method_getTypeEncoding(method),encoding);
+ }
+-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
++// Bytes of a function constant of MTLDataType `type` (scalars and 2/3/4-wide vectors). 3-wide ones are packed, as the translator takes
++// them (metal2vulkan-air canon ConstValue: a float3 is 12 bytes); iOS 16.7's QuartzCore specializes fixed_frag_* with a uchar3 (51).
+ static uint64_t constantBytes(uint64_t type) {
+  switch(type) {
++  case 5:case 31:case 35:return 12;
++  case 18:case 39:case 43:return 6;
++  case 47:case 51:case 55:return 3;
+   case 3:case 29:case 33:return 4;
+   case 4:case 30:case 34:return 8;
+   case 6:case 32:case 36:return 16;
+@@ -1544,6 +1549,7 @@
+  uint64_t createdUs;
+  uint32_t createCpu,createTid,commitCpu,commitTid;
+  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
++ std::vector<int> markedSurfaces;   // sunfish: IOSurface ids told to the kernel as drawn into (kern.sweet_surface_gpu), until finish
+  std::vector<WatchedSource> watched;
+ }
+ @property(nonatomic) NmbCommandBuffer *handle;
+@@ -2295,7 +2301,13 @@
+ // waited for the GPU of the frame before it (interval = GPU time + encode time). The handlers of the server's own render buffers run at submission
+ // instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
+ // (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
+-static bool earlyOn() {return false;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
++static bool earlyOn() {return false;}
++// SWEETMETAL_SURFACE_GPU=1 (SweetMetal.bundle file surface_gpu): the render server's command buffers tell the sunfish kernel which
++// IOSurfaces they draw into, from commit (on the caller's thread, before Core Animation's swap; encoding and submission run later on the
++// encoding thread) until finish (GPU completion), with sysctl kern.sweet_surface_gpu=id / -id; its display does not copy such a surface
++// (xnu 0186): without it the panel showed frames the GPU was still drawing.
++static bool surfaceGpu() {static int on=-1;if(on<0){const char *v=getenv("SWEETMETAL_SURFACE_GPU");on=v&&*v=='1';}return on==1;}
++static void surfaceGpuTell(int value) {(void)sysctlbyname("kern.sweet_surface_gpu",NULL,NULL,&value,sizeof value);}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
+ static bool onRenderServerThread() {
+  char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
+  return !strncmp(name,"com.apple.coreanimation",23);
+@@ -2664,6 +2676,8 @@
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish {
+  flushSurfaces(_surfaces);
++ for(int id:markedSurfaces)surfaceGpuTell(-id);
++ markedSurfaces.clear();
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+@@ -2721,6 +2735,12 @@
+  dispatch_group_enter(_handlers);
+  dispatch_group_enter(_schedulingHandlers);
+  @synchronized(gInFlight){[gInFlight addObject:self];}
++ if(earlyEligible && surfaceGpu() && !self.encodeFailure) {
++  for(NBTexture *texture in _surfaces) {
++   const int id=(int)IOSurfaceGetID(texture.surface);
++   if(id>0 && std::find(markedSurfaces.begin(),markedSurfaces.end(),id)==markedSurfaces.end()){markedSurfaces.push_back(id);surfaceGpuTell(id);}
++  }
++ }
+  ENCODE([self submit]);
+  encodeFlush();
+ }
+@@ -4030,7 +4050,7 @@
+ #if defined(__arm64e__)
+  if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
+ #else
+- if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
++ if(!base || class_getInstanceSize(base)<528){   /* iOS 16.7: 528 (iPadOS 17.7.11: 536) */NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+ #endif
+ #endif
+  if(!base)base=[NSObject class];
