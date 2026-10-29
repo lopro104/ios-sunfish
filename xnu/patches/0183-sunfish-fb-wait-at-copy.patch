@@ -1,0 +1,47 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:31:12.582807835 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:31:12.596111473 +0200
+@@ -56,6 +56,16 @@
+ #define SWEET_SURFACE_STATE_USE         0x18
+ #define SWEET_FB_HELD                   16
+ static int sweet_fb_hold = -1;
++/*
++ * With Metal, Core Animation swaps before the frame's GPU work reaches the kernel, so the fence taken
++ * at swap time (sweetfb_gpuwait) is the frame before's: the panel showed frames the GPU was still
++ * drawing (filmed with sweet-film: one triangle of a quad black). On with sweetmetal=1 (boot-arg
++ * sweetfb_presentwait overrides): before a copy, wait for all the work submitted by then, at most
++ * SWEET_FB_PRESENT_WAIT_MS.
++ */
++#define SWEET_FB_PRESENT_WAIT_MS        20
++static int sweet_fb_present_wait = -1;
++static uint32_t sweet_fb_present_late;
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -1276,6 +1286,27 @@
+ 	}
+ 	fFitShown = fit;
+ 
++	if (sweet_fb_present_wait < 0) {
++		int on = 0, metal = 0;
++		if (!PE_parse_boot_argn("sweetfb_presentwait", &on, sizeof(on))) {
++			on = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
++		}
++		sweet_fb_present_wait = on != 0;
++		IOLog("SWEET FB: a copy %s for the GPU's work submitted by then\n", sweet_fb_present_wait ? "waits" : "does not wait");
++	}
++	if (sweet_fb_present_wait && sweet_gpu_ready()) {
++		uint32_t fence = sweet_gpu_last();
++		uint32_t waited = 0;
++		while (fence != 0 && !sweet_gpu_done(fence) && waited < SWEET_FB_PRESENT_WAIT_MS * 4) {
++			IODelay(250);
++			waited++;
++		}
++		if (fence != 0 && !sweet_gpu_done(fence) && sweet_fb_present_late++ < 8) {
++			IOLog("SWEET FB: the GPU was not done with submission %u after %u ms: shown as it is\n", fence,
++			    SWEET_FB_PRESENT_WAIT_MS);
++		}
++	}
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;

@@ -118,7 +118,23 @@ beside(const char *name, char *path, size_t size)
 		return nil;
 	}
 	setenv("TU_DARWIN_SERVICE", "NativeAdrenoGpuPublished", 0);
-	setenv("TU_DEBUG", "nocb", 0);  /* (UniXNU: concurrent binning stalled passes) */
+	/*
+	 * Turnip's TU_DEBUG: "nocb" (UniXNU: concurrent binning stalled passes), or the first line of the file
+	 * tu_debug beside this executable (e.g. "nocb,sysmem": no tiles, straight to memory) for experiments.
+	 */
+	char options[256] = "nocb", file[1024];
+	if (beside("tu_debug", file, sizeof(file))) {
+		FILE *f = fopen(file, "r");
+		if (f != NULL) {
+			if (fgets(options, sizeof(options), f) == NULL) {
+				strlcpy(options, "nocb", sizeof(options));
+			}
+			options[strcspn(options, "\r\n")] = 0;
+			fclose(f);
+		}
+	}
+	setenv("TU_DEBUG", options, 0);
+	os_log(sweet_log(), "SweetMetal: TU_DEBUG=%{public}s", getenv("TU_DEBUG"));
 	/*
 	 * The runtime refuses to open without a writable shader-cache directory. backboardd runs as mobile:
 	 * a root-made /var/tmp/sweetmetal (0755) gave it none and so no device on the first try. The
