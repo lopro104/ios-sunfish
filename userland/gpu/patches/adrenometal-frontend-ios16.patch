@@ -1,6 +1,14 @@
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
-@@ -554,9 +554,13 @@
+@@ -11,6 +11,7 @@
+ #import <IOSurface/IOSurfaceRef.h>
+ #import <objc/runtime.h>
+ #include <algorithm>
++#include <sys/sysctl.h>
+ #include <atomic>
+ #include <mutex>
+ #include <pthread.h>
+@@ -554,9 +555,13 @@
   Method method=class_getInstanceMethod(object_getClass(object),selector);
   return method && !strcmp(method_getTypeEncoding(method),encoding);
  }
@@ -15,7 +23,15 @@
    case 3:case 29:case 33:return 4;
    case 4:case 30:case 34:return 8;
    case 6:case 32:case 36:return 16;
-@@ -1018,7 +1022,11 @@
+@@ -736,6 +741,7 @@
+  uint64_t createdUs;
+  uint32_t createCpu,createTid,commitCpu,commitTid;
+  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
++ std::vector<int> markedSurfaces;   // sunfish: IOSurface ids told to the kernel as drawn into (kern.sweet_surface_gpu), until finish
+ }
+ @property(nonatomic) NmbCommandBuffer *handle;
+ @property(nonatomic,strong) NBQueue *queue;
+@@ -1018,7 +1024,16 @@
  // waited for the GPU of the frame before it (interval = GPU time + encode time). The handlers of the server's own render buffers run at submission
  // instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
  // (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
@@ -24,11 +40,34 @@
 +// SWEETMETAL_SYNC_COMMIT (set by SweetMetal.bundle from its file sync_commit): a command buffer made by the render server's thread is,
 +// in commit, waited for until completed (1) or until submitted to the GPU (2), so Core Animation's swap that follows never names a
 +// frame whose work the kernel has not seen yet (sunfish: the display copy showed tiles of frames being drawn; 1 fixed it, slowly).
-+static int syncCommit() {static int on=-1;if(on<0){const char *v=getenv("SWEETMETAL_SYNC_COMMIT");on=v?atoi(v):0;}return on;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
++static int syncCommit() {static int on=-1;if(on<0){const char *v=getenv("SWEETMETAL_SYNC_COMMIT");on=v?atoi(v):0;}return on;}
++// SWEETMETAL_SURFACE_GPU=1 (SweetMetal.bundle file surface_gpu): the render server's command buffers tell the sunfish kernel which
++// IOSurfaces they draw into, from commit until finish (GPU completion), with sysctl kern.sweet_surface_gpu=id / -id; its display does
++// not copy such a surface (xnu 0186). Unlike sync_commit, nothing waits.
++static bool surfaceGpu() {static int on=-1;if(on<0){const char *v=getenv("SWEETMETAL_SURFACE_GPU");on=v&&*v=='1';}return on==1;}
++static void surfaceGpuTell(int value) {(void)sysctlbyname("kern.sweet_surface_gpu",NULL,NULL,&value,sizeof value);}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
  static bool onRenderServerThread() {
   char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
   return !strncmp(name,"com.apple.coreanimation",23);
-@@ -1189,7 +1197,11 @@
+@@ -1152,6 +1167,8 @@
+ // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
+ - (void)finish {
+  flushSurfaces(_surfaces);
++ for(int id:markedSurfaces)surfaceGpuTell(-id);
++ markedSurfaces.clear();
+  // Actual GPU completion (or a local refusal that never submitted) is the
+  // release point. A retained completed command must not pin every old frame.
+  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+@@ -1186,10 +1203,20 @@
+  @synchronized(gInFlight){[gInFlight addObject:self];}
+  if(!self.encodeFailure) {
+   flushSurfaces(_surfaces);
++  if(earlyEligible && surfaceGpu()) {
++   for(NBTexture *texture in _surfaces) {
++    const int id=(int)IOSurfaceGetID(texture.surface);
++    if(id>0 && std::find(markedSurfaces.begin(),markedSurfaces.end(),id)==markedSurfaces.end()){markedSurfaces.push_back(id);surfaceGpuTell(id);}
++   }
++  }
    // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
    void *context=(__bridge_retained void *)self;
    if(nmb_command_buffer_on_completed(_handle,completed,context) &&
@@ -41,7 +80,7 @@
    (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
    [self refuse:[@"commit: " stringByAppendingString:lastError()]];
   }
-@@ -1859,7 +1871,7 @@
+@@ -1859,7 +1886,7 @@
  #endif
  #if TARGET_OS_IPHONE
   // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.

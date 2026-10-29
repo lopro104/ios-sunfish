@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 21:23:12.265526941 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 21:23:12.275776417 +0200
+@@ -747,7 +747,12 @@
+ 		 * tick (it showed nothing for a whole vsync, and the rate halved), and after 3 ticks show
+ 		 * the newest as it is.
+ 		 */
+-		if (++fb->fFenceTicks < 3) {
++		/*
++		 * With Metal (sweet_fb_present_wait set up, sweetmetal=1) a frame the GPU has not finished is
++		 * not shown for 30 ticks: its animation frames take the GPU longer than 3 (filmed: 16% of the
++		 * frames shown were these, half drawn); the panel keeps the last finished frame meanwhile.
++		 */
++		if (++fb->fFenceTicks < (sweet_fb_present_wait >= 0 && sweet_fb_inval > 0 ? 30u : 3u)) {
+ 			if (fb->fRetry != NULL) {
+ 				fb->fRetries = 0;
+ 				fb->fRetry->setTimeoutUS(1000);

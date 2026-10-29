@@ -134,6 +134,10 @@ beside(const char *name, char *path, size_t size)
 		}
 	}
 	setenv("TU_DEBUG", options, 0);
+	/* the file surface_gpu beside this executable: the frontend tells the kernel which surfaces are being drawn (xnu 0186) */
+	if (beside("surface_gpu", file, sizeof(file))) {
+		setenv("SWEETMETAL_SURFACE_GPU", "1", 0);
+	}
 	/*
 	 * The file sync_commit beside this executable: the render server's command buffers are waited for in
 	 * commit (frontend patch), until completed ("1", or an empty file) or until submitted ("2").

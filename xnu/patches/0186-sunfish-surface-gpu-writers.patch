@@ -1,0 +1,116 @@
+--- a/iokit/Kernel/arm/SweetSurface.h	2026-10-29 21:17:54.997773220 +0200
++++ b/iokit/Kernel/arm/SweetSurface.h	2026-10-29 21:17:55.019739469 +0200
+@@ -44,6 +44,7 @@
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
+ 	bool                      wrapped;      /* memory is a task's own (IOSurfaceAddress), prepared */
+ 	uint32_t                  wrapDelta;    /* where the pixels start in its first page */
++	volatile SInt32           gpuWriters;   /* GPU work drawing into it, not yet completed (kern.sweet_surface_gpu) */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/SweetSurface.cpp	2026-10-29 21:17:55.002197729 +0200
++++ b/iokit/Kernel/arm/SweetSurface.cpp	2026-10-29 21:17:55.019872984 +0200
+@@ -194,6 +194,33 @@
+ 	}
+ }
+ 
++/*
++ * kern.sweet_surface_gpu (bsd/dev/sweet_sample.c): a Metal client (SweetMetal's frontend) says that GPU
++ * work drawing into surface `value` was committed (value > 0) or has completed (value = -id). The
++ * display does not copy a surface with work outstanding (SweetFramebuffer.cpp): Core Animation swaps
++ * before that work is done, and the panel showed frames being drawn.
++ */
++extern "C" int
++sweet_surface_gpu(int value)
++{
++	uint32_t id = (uint32_t)(value < 0 ? -value : value);
++	SweetSurface *s = sweet_surface_copy(id);
++
++	if (s == NULL) {
++		return ENOENT;
++	}
++	if (value > 0) {
++		OSIncrementAtomic(&s->gpuWriters);
++	} else {
++		SInt32 now = s->gpuWriters;
++		while (now > 0 && !OSCompareAndSwap((UInt32)now, (UInt32)(now - 1), (volatile UInt32 *)&s->gpuWriters)) {
++			now = s->gpuWriters;
++		}
++	}
++	s->release();
++	return 0;
++}
++
+ SweetSurface *
+ sweet_surface_copy(uint32_t id)
+ {
+--- a/bsd/dev/sweet_sample.c	2026-10-29 21:17:55.009544426 +0200
++++ b/bsd/dev/sweet_sample.c	2026-10-29 21:17:55.019961679 +0200
+@@ -125,6 +125,27 @@
+ 	return error;
+ }
+ 
++/*
++ * kern.sweet_surface_gpu=ID (+1) or -ID (-1), anybody: GPU work drawing into IOSurface ID was committed /
++ * has completed (iokit/Kernel/arm/SweetSurface.cpp sweet_surface_gpu; written by SweetMetal's frontend).
++ */
++extern int sweet_surface_gpu(int value);
++
++static int
++sysctl_sweet_surface_gpu(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
++{
++	int value = 0;
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	return value == 0 ? EINVAL : sweet_surface_gpu(value);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_surface_gpu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, 0, 0,
++    sysctl_sweet_surface_gpu, "I", "GPU work into an IOSurface: id committed, -id completed");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0,
+     sysctl_sweet_brightness, "I", "panel brightness, 4 to 1023 (DCS 0x51 over DSI0)");
+ 
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 21:17:55.006249282 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 21:17:55.020056633 +0200
+@@ -1058,14 +1058,35 @@
+ 	return sweet_gpu_done(fence);
+ }
+ 
++/* Has a layer surface of this swap GPU work still drawing into it (SweetSurface gpuWriters, from the Metal client)? */
++static bool
++sweet_fb_swap_busy(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++	bool busy = false;
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS && !busy; layer++) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		if (!(mask & (1u << layer)) || id == 0) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(id);
++		if (s != NULL) {
++			busy = s->gpuWriters > 0;
++			s->release();
++		}
++	}
++	return busy;
++}
++
+ /* Under fLock: the newest swap waiting that the GPU is done with (any, without sweetfb_gpuwait); NULL: none. */
+ uint8_t *
+ AppleCLCD::doneFrame(void)
+ {
+-	if (fPendingFence == 0 || sweet_fb_swap_drawn(fPendingFence)) {
++	if ((fPendingFence == 0 || sweet_fb_swap_drawn(fPendingFence)) && !sweet_fb_swap_busy(fPending)) {
+ 		return fPending;
+ 	}
+-	if (fHaveReady && sweet_fb_swap_drawn(fReadyFence)) {
++	if (fHaveReady && sweet_fb_swap_drawn(fReadyFence) && !sweet_fb_swap_busy(fReady)) {
+ 		return fReady;
+ 	}
+ 	return NULL;
