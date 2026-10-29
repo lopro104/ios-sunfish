@@ -1,0 +1,133 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:23:11.271864007 +0200
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp	2026-10-29 13:23:11.286808814 +0200
+@@ -46,6 +46,16 @@
+  * the default (on with sweetmetal=1).
+  */
+ static int sweet_fb_inval = -1;
++/*
++ * Surfaces the display still needs (queued, waiting for the GPU, or on the panel) are "in use":
++ * the u64 at +0x18 of the surface's shared state page is what IOSurfaceIsInUse reads (iOS 16.7
++ * IOSurface: client->state page ->[0x18] != 0). Core Animation does not draw into a surface in
++ * use; with Metal it otherwise drew the next frame into the one being copied to the panel (blocks
++ * of the screen gone in every animation). On with sweetmetal=1; boot-arg sweetfb_hold overrides.
++ */
++#define SWEET_SURFACE_STATE_USE         0x18
++#define SWEET_FB_HELD                   16
++static int sweet_fb_hold = -1;
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -179,6 +189,7 @@
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void retryFired(OSObject *owner, IOTimerEventSource *sender);
+ 	uint8_t *doneFrame(void);
++	void updateHolds(void);
+ 	void taken(const uint8_t *src);
+ 
+ public:
+@@ -201,6 +212,9 @@
+ 	uint8_t       fReady[SWEET_FB_SWAP_REC_SIZE];       /* the swap before fPending, not yet shown */
+ 	bool          fHaveReady;
+ 	uint32_t      fReadyFence;
++	SweetSurface *fHeld[SWEET_FB_HELD];     /* surfaces whose use count this driver raised */
++	uint32_t      fHeldCount;
++	uint32_t      fShownIDs[SWEET_FB_LAYERS];  /* the layers' surfaces on the panel */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -950,6 +964,73 @@
+ 	return v;
+ }
+ 
++static void
++sweet_fb_use(SweetSurface *s, int64_t delta)
++{
++	if (s->state != NULL) {
++		OSAddAtomic64(delta, (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE));
++	}
++}
++
++/* Under fLock: raise the use count of the surfaces now needed, lower it of those no longer needed. */
++void
++AppleCLCD::updateHolds(void)
++{
++	uint32_t want[3 * SWEET_FB_LAYERS], wanted = 0;
++
++	if (sweet_fb_hold < 0) {
++		int on = 0, metal = 0;
++		if (!PE_parse_boot_argn("sweetfb_hold", &on, sizeof(on))) {
++			on = PE_parse_boot_argn("sweetmetal", &metal, sizeof(metal)) && metal != 0;
++		}
++		sweet_fb_hold = on != 0;
++		IOLog("SWEET FB: surfaces on the way to the panel %s in use\n", sweet_fb_hold ? "marked" : "not marked");
++	}
++	if (!sweet_fb_hold) {
++		return;
++	}
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if (fDirty && (get32(fPending, 0x104) & (1u << layer)) && get32(fPending, 0x54 + 4 * layer) != 0) {
++			want[wanted++] = get32(fPending, 0x54 + 4 * layer);
++		}
++		if (fHaveReady && (get32(fReady, 0x104) & (1u << layer)) && get32(fReady, 0x54 + 4 * layer) != 0) {
++			want[wanted++] = get32(fReady, 0x54 + 4 * layer);
++		}
++		if (fShownIDs[layer] != 0) {
++			want[wanted++] = fShownIDs[layer];
++		}
++	}
++	for (uint32_t i = 0; i < fHeldCount;) {
++		bool keep = false;
++		for (uint32_t k = 0; k < wanted && !keep; k++) {
++			keep = fHeld[i]->id == want[k];
++		}
++		if (keep) {
++			i++;
++			continue;
++		}
++		sweet_fb_use(fHeld[i], -1);
++		fHeld[i]->release();
++		fHeld[i] = fHeld[--fHeldCount];
++	}
++	for (uint32_t k = 0; k < wanted; k++) {
++		bool held = false;
++		for (uint32_t i = 0; i < fHeldCount && !held; i++) {
++			held = fHeld[i]->id == want[k];
++		}
++		if (held || fHeldCount >= SWEET_FB_HELD) {
++			continue;
++		}
++		SweetSurface *s = sweet_surface_copy(want[k]);
++		if (s == NULL || s == fSurface) {
++			OSSafeReleaseNULL(s);
++			continue;
++		}
++		sweet_fb_use(s, 1);
++		fHeld[fHeldCount++] = s;
++	}
++}
++
+ /* Under fLock: the newest swap waiting that the GPU is done with (any, without sweetfb_gpuwait); NULL: none. */
+ uint8_t *
+ AppleCLCD::doneFrame(void)
+@@ -1038,6 +1119,7 @@
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	fPendingFence = fGPUWaits && sweet_gpu_ready() ? sweet_gpu_last() : 0;
++	updateHolds();
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+@@ -1317,6 +1399,13 @@
+ 		}
+ 		s->release();
+ 	}
++	/* the surfaces copied are the panel's now; those it showed before are free (once nothing else waits on them) */
++	IOLockLock(fLock);
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		fShownIDs[layer] = (mask & (1u << layer)) ? get32(rec, 0x54 + 4 * layer) : 0;
++	}
++	updateHolds();
++	IOLockUnlock(fLock);
+ 	uint64_t dt = mach_absolute_time() - t0;
+ 	uint64_t ns = 0;
+ 	absolutetime_to_nanoseconds(dt, &ns);
