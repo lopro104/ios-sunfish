@@ -13,11 +13,16 @@
  
  			nset[rq->req_type]++;
  			if (n != 0 && copyin((user_addr_t)rq->req_data, d, n) == 0) {
-@@ -5196,6 +5196,11 @@
+@@ -5196,6 +5196,16 @@
  		}
  		break;
  	}
 +	case 22:                                                /* DISASSOCIATE (set): wifid sends it before every join; accepted without leaving the network (ASSOCIATE 20 is only logged so far) */
++		if (set) {
++			err = 0;
++		}
++		break;
++	case 422:                                               /* 6G_MODE (set): wifid sets it before every ASSOCIATE and abandons the join when it fails; no 6 GHz here */
 +		if (set) {
 +			err = 0;
 +		}
