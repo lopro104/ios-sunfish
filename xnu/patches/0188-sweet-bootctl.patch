@@ -1,0 +1,756 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -39,6 +39,9 @@
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
++#include <sys/sysctl.h>
++#include <libkern/crc.h>
++#include <kern/kalloc.h>
+ 
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+@@ -57,6 +60,12 @@
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_thermal_init(void);
+ extern void sweet_usb_probe(void);
++int sweet_ufs_mark_boot_successful(int slot);
++int sweet_ufs_get_current_slot(void);
++int sweet_ufs_is_slot_marked_successful(int slot);
++int sweet_ufs_is_slot_bootable(int slot);
++int sweet_ufs_set_active_boot_slot(int slot);
++int sweet_ufs_set_slot_as_unbootable(int slot);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -772,6 +781,12 @@
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	uint32_t markboot = 0;
++	PE_parse_boot_argn("markboot", &markboot, sizeof(markboot));
++	PE_parse_boot_argn("sweet_mark_boot", &markboot, sizeof(markboot));
++	if (markboot) {
++		sweet_ufs_mark_boot_successful(-1);
++	}
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -975,6 +990,717 @@
+ 	return error;
+ }
+ 
++/*
++ * Qualcomm A/B Boot Control ("bootctl")
++ *
++ * Implements Qualcomm's boot_control HAL partition attribute manipulation for A/B slots.
++ * Attribute byte 6 (offset 54 within 128-byte partition entry, bits 48..55):
++ *   Bit 2 (0x04): AB_PARTITION_ATTR_SLOT_ACTIVE
++ *   Bit 6 (0x40): AB_PARTITION_ATTR_BOOT_SUCCESSFUL
++ *   Bit 7 (0x80): AB_PARTITION_ATTR_UNBOOTABLE
++ *
++ * Sysctls:
++ *   kern.sweet_boot_successful (RW)
++ *   kern.sweet_boot_slot (RW)
++ *   kern.sweet_bootctl (RW)
++ */
++
++#define AB_ATTR_BYTE                    54
++#define AB_ATTR_SLOT_ACTIVE             (1u << 2)       /* 0x04 */
++#define AB_ATTR_BOOT_SUCCESSFUL         (1u << 6)       /* 0x40 */
++#define AB_ATTR_UNBOOTABLE              (1u << 7)       /* 0x80 */
++
++static int
++ufs_write_raw_blocks(uint64_t lba, uint32_t count)
++{
++	if (lba > UINT32_MAX || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK) {
++		return EINVAL;
++	}
++	uint8_t cdb[10] = {
++		0x2a, 0,
++		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
++		0, (uint8_t)(count >> 8), (uint8_t)count, 0
++	};
++	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++}
++
++static bool
++is_ab_partition(const char *name, const char *suffix)
++{
++	size_t nlen = strlen(name);
++	size_t slen = strlen(suffix);
++	if (nlen <= slen || strcmp(name + nlen - slen, suffix) != 0) {
++		return false;
++	}
++	/* Explicit safety: only known A/B partitions on LUN 0, never touches persist/misc/modemst */
++	if (strncmp(name, "boot_", 5) == 0 ||
++	    strncmp(name, "modem_", 6) == 0 ||
++	    strncmp(name, "vbmeta_system_", 14) == 0 ||
++	    strncmp(name, "system_", 7) == 0 ||
++	    strncmp(name, "vendor_", 7) == 0) {
++		return true;
++	}
++	return false;
++}
++
++int sweet_ufs_get_current_slot(void);
++int sweet_ufs_is_slot_marked_successful(int slot);
++int sweet_ufs_is_slot_bootable(int slot);
++int sweet_ufs_mark_boot_successful(int slot);
++int sweet_ufs_set_active_boot_slot(int slot);
++int sweet_ufs_set_slot_as_unbootable(int slot);
++
++int
++sweet_ufs_get_current_slot(void)
++{
++	char arg[16] = "";
++	if (PE_parse_boot_argn("androidboot.slot_suffix", arg, sizeof(arg)) ||
++	    PE_parse_boot_argn("slot_suffix", arg, sizeof(arg)) ||
++	    PE_parse_boot_argn("bootslot", arg, sizeof(arg))) {
++		if (strcmp(arg, "_b") == 0 || strcmp(arg, "b") == 0 || strcmp(arg, "1") == 0) {
++			return 1;
++		}
++		if (strcmp(arg, "_a") == 0 || strcmp(arg, "a") == 0 || strcmp(arg, "0") == 0) {
++			return 0;
++		}
++	}
++	if (!su.ready) {
++		return 0;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return 0;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return 0;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	int slot = 0;
++	if (!error) {
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = bounce + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) break;
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			if (strcmp(name, "boot_b") == 0) {
++				if ((e[AB_ATTR_BYTE] & AB_ATTR_SLOT_ACTIVE) &&
++				    !(e[AB_ATTR_BYTE] & AB_ATTR_UNBOOTABLE)) {
++					slot = 1;
++				}
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return slot;
++}
++
++int
++sweet_ufs_is_slot_marked_successful(int slot)
++{
++	if (!su.ready) {
++		return -1;
++	}
++	if (slot < 0) {
++		slot = sweet_ufs_get_current_slot();
++	}
++	const char *target = (slot == 1) ? "boot_b" : "boot_a";
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return -1;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return -1;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	int res = -1;
++	if (!error) {
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = bounce + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) break;
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			if (strcmp(name, target) == 0) {
++				res = (e[AB_ATTR_BYTE] & AB_ATTR_BOOT_SUCCESSFUL) ? 1 : 0;
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return res;
++}
++
++int
++sweet_ufs_is_slot_bootable(int slot)
++{
++	if (!su.ready) {
++		return -1;
++	}
++	if (slot < 0) {
++		slot = sweet_ufs_get_current_slot();
++	}
++	const char *target = (slot == 1) ? "boot_b" : "boot_a";
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return -1;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return -1;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	int res = -1;
++	if (!error) {
++		for (uint32_t i = 0; i < nent; i++) {
++			const uint8_t *e = bounce + i * esz;
++			char name[37];
++			unsigned c;
++			for (c = 0; c < 36; c++) {
++				uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++				if (ch == 0 || ch > 0x7f) break;
++				name[c] = (char)ch;
++			}
++			name[c] = 0;
++			if (strcmp(name, target) == 0) {
++				res = (e[AB_ATTR_BYTE] & AB_ATTR_UNBOOTABLE) ? 0 : 1;
++				break;
++			}
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return res;
++}
++
++int
++sweet_ufs_mark_boot_successful(int slot)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	if (slot < 0) {
++		slot = sweet_ufs_get_current_slot();
++	}
++	const char *suffix = (slot == 1) ? "_b" : "_a";
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++
++	/* 1. Read Primary Header at LBA 1 */
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return error ? error : ENXIO;
++	}
++	uint64_t alt_lba, entry_lba;
++	uint32_t nent, esz, gpt_header_size;
++	memcpy(&alt_lba, bounce + 32, 8);
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	memcpy(&gpt_header_size, bounce + 12, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE || alt_lba == 0 ||
++	    gpt_header_size < 92 || gpt_header_size > UFS_BLOCK) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENXIO;
++	}
++	uint32_t nent_bytes = nent * esz;
++	uint32_t nent_blocks = (nent_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++
++	uint8_t *hdr_pri = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_pri = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *hdr_bak = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_bak = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	if (!hdr_pri || !ptn_pri || !hdr_bak || !ptn_bak) {
++		if (hdr_pri) kfree_data(hdr_pri, UFS_BLOCK);
++		if (ptn_pri) kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++		if (hdr_bak) kfree_data(hdr_bak, UFS_BLOCK);
++		if (ptn_bak) kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENOMEM;
++	}
++
++	memcpy(hdr_pri, bounce, UFS_BLOCK);
++
++	/* 2. Read Primary Partition Entry Array */
++	error = ufs_read_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_pri, bounce, nent_blocks * UFS_BLOCK);
++
++	/* 3. Read Backup Header at alt_lba */
++	error = ufs_read_blocks(alt_lba, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		error = error ? error : ENXIO;
++		goto out;
++	}
++	memcpy(hdr_bak, bounce, UFS_BLOCK);
++
++	/* 4. Read Backup Partition Entry Array at alt_lba - nent_blocks */
++	error = ufs_read_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_bak, bounce, nent_blocks * UFS_BLOCK);
++
++	/* 5. Update attributes for slot partitions */
++	int modified = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = ptn_pri + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) break;
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (is_ab_partition(name, suffix)) {
++			uint8_t flag = e[AB_ATTR_BYTE];
++			if (!(flag & AB_ATTR_BOOT_SUCCESSFUL)) {
++				ptn_pri[i * esz + AB_ATTR_BYTE] |= AB_ATTR_BOOT_SUCCESSFUL;
++				ptn_bak[i * esz + AB_ATTR_BYTE] |= AB_ATTR_BOOT_SUCCESSFUL;
++				modified++;
++				printf("SWEET BOOTCTL: marked %s boot successful (0x%02x -> 0x%02x)\n",
++				    name, flag, ptn_pri[i * esz + AB_ATTR_BYTE]);
++			}
++		}
++	}
++
++	if (modified == 0) {
++		printf("SWEET BOOTCTL: slot %s already marked successful\n", suffix);
++		error = 0;
++		goto out;
++	}
++
++	/* 6. Recalculate CRCs */
++	uint32_t ptn_crc = crc32(0, ptn_pri, nent_bytes);
++	memcpy(hdr_pri + 88, &ptn_crc, 4);
++	bzero(hdr_pri + 16, 4);
++	uint32_t hdr_crc = crc32(0, hdr_pri, gpt_header_size);
++	memcpy(hdr_pri + 16, &hdr_crc, 4);
++
++	uint32_t bak_ptn_crc = crc32(0, ptn_bak, nent_bytes);
++	memcpy(hdr_bak + 88, &bak_ptn_crc, 4);
++	bzero(hdr_bak + 16, 4);
++	uint32_t bak_hdr_crc = crc32(0, hdr_bak, gpt_header_size);
++	memcpy(hdr_bak + 16, &bak_hdr_crc, 4);
++
++	/* 7. Write Primary partition array and header */
++	memcpy(bounce, ptn_pri, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_pri, UFS_BLOCK);
++	error = ufs_write_raw_blocks(1, 1);
++	if (error) goto out;
++
++	/* 8. Write Backup partition array and header */
++	memcpy(bounce, ptn_bak, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_bak, UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba, 1);
++	if (error) goto out;
++
++	/* 9. Flush cache */
++	error = ufs_sync_cache();
++	printf("SWEET BOOTCTL: slot %s marked successful (%d ptns, pri crc 0x%08x/0x%08x bak crc 0x%08x/0x%08x): %d\n",
++	    suffix, modified, hdr_crc, ptn_crc, bak_hdr_crc, bak_ptn_crc, error);
++
++out:
++	kfree_data(hdr_pri, UFS_BLOCK);
++	kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++	kfree_data(hdr_bak, UFS_BLOCK);
++	kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_set_active_boot_slot(int slot)
++{
++	if (!su.ready || (slot != 0 && slot != 1)) {
++		return EINVAL;
++	}
++	const char *target_suffix = (slot == 1) ? "_b" : "_a";
++	const char *other_suffix  = (slot == 1) ? "_a" : "_b";
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return error ? error : ENXIO;
++	}
++	uint64_t alt_lba, entry_lba;
++	uint32_t nent, esz, gpt_header_size;
++	memcpy(&alt_lba, bounce + 32, 8);
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	memcpy(&gpt_header_size, bounce + 12, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE || alt_lba == 0 ||
++	    gpt_header_size < 92 || gpt_header_size > UFS_BLOCK) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENXIO;
++	}
++	uint32_t nent_bytes = nent * esz;
++	uint32_t nent_blocks = (nent_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++
++	uint8_t *hdr_pri = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_pri = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *hdr_bak = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_bak = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	if (!hdr_pri || !ptn_pri || !hdr_bak || !ptn_bak) {
++		if (hdr_pri) kfree_data(hdr_pri, UFS_BLOCK);
++		if (ptn_pri) kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++		if (hdr_bak) kfree_data(hdr_bak, UFS_BLOCK);
++		if (ptn_bak) kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENOMEM;
++	}
++
++	memcpy(hdr_pri, bounce, UFS_BLOCK);
++	error = ufs_read_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_pri, bounce, nent_blocks * UFS_BLOCK);
++
++	error = ufs_read_blocks(alt_lba, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		error = error ? error : ENXIO;
++		goto out;
++	}
++	memcpy(hdr_bak, bounce, UFS_BLOCK);
++
++	error = ufs_read_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_bak, bounce, nent_blocks * UFS_BLOCK);
++
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = ptn_pri + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) break;
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (is_ab_partition(name, target_suffix)) {
++			ptn_pri[i * esz + AB_ATTR_BYTE] |= AB_ATTR_SLOT_ACTIVE;
++			ptn_pri[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_UNBOOTABLE;
++			ptn_bak[i * esz + AB_ATTR_BYTE] |= AB_ATTR_SLOT_ACTIVE;
++			ptn_bak[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_UNBOOTABLE;
++		} else if (is_ab_partition(name, other_suffix)) {
++			ptn_pri[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_SLOT_ACTIVE;
++			ptn_bak[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_SLOT_ACTIVE;
++		}
++	}
++
++	uint32_t ptn_crc = crc32(0, ptn_pri, nent_bytes);
++	memcpy(hdr_pri + 88, &ptn_crc, 4);
++	bzero(hdr_pri + 16, 4);
++	uint32_t hdr_crc = crc32(0, hdr_pri, gpt_header_size);
++	memcpy(hdr_pri + 16, &hdr_crc, 4);
++
++	uint32_t bak_ptn_crc = crc32(0, ptn_bak, nent_bytes);
++	memcpy(hdr_bak + 88, &bak_ptn_crc, 4);
++	bzero(hdr_bak + 16, 4);
++	uint32_t bak_hdr_crc = crc32(0, hdr_bak, gpt_header_size);
++	memcpy(hdr_bak + 16, &bak_hdr_crc, 4);
++
++	memcpy(bounce, ptn_pri, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_pri, UFS_BLOCK);
++	error = ufs_write_raw_blocks(1, 1);
++	if (error) goto out;
++
++	memcpy(bounce, ptn_bak, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_bak, UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba, 1);
++	if (error) goto out;
++
++	error = ufs_sync_cache();
++	printf("SWEET BOOTCTL: active slot set to %s: %d\n", target_suffix, error);
++
++out:
++	kfree_data(hdr_pri, UFS_BLOCK);
++	kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++	kfree_data(hdr_bak, UFS_BLOCK);
++	kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++int
++sweet_ufs_set_slot_as_unbootable(int slot)
++{
++	if (!su.ready || (slot != 0 && slot != 1)) {
++		return EINVAL;
++	}
++	const char *target_suffix = (slot == 1) ? "_b" : "_a";
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++
++	int error = ufs_read_blocks(1, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return error ? error : ENXIO;
++	}
++	uint64_t alt_lba, entry_lba;
++	uint32_t nent, esz, gpt_header_size;
++	memcpy(&alt_lba, bounce + 32, 8);
++	memcpy(&entry_lba, bounce + 72, 8);
++	memcpy(&nent, bounce + 80, 4);
++	memcpy(&esz, bounce + 84, 4);
++	memcpy(&gpt_header_size, bounce + 12, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE || alt_lba == 0 ||
++	    gpt_header_size < 92 || gpt_header_size > UFS_BLOCK) {
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENXIO;
++	}
++	uint32_t nent_bytes = nent * esz;
++	uint32_t nent_blocks = (nent_bytes + UFS_BLOCK - 1) / UFS_BLOCK;
++
++	uint8_t *hdr_pri = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_pri = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *hdr_bak = (uint8_t *)kalloc_data(UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	uint8_t *ptn_bak = (uint8_t *)kalloc_data(nent_blocks * UFS_BLOCK, Z_WAITOK | Z_ZERO);
++	if (!hdr_pri || !ptn_pri || !hdr_bak || !ptn_bak) {
++		if (hdr_pri) kfree_data(hdr_pri, UFS_BLOCK);
++		if (ptn_pri) kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++		if (hdr_bak) kfree_data(hdr_bak, UFS_BLOCK);
++		if (ptn_bak) kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++		lck_mtx_unlock(&sweet_ufs_lock);
++		return ENOMEM;
++	}
++
++	memcpy(hdr_pri, bounce, UFS_BLOCK);
++	error = ufs_read_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_pri, bounce, nent_blocks * UFS_BLOCK);
++
++	error = ufs_read_blocks(alt_lba, 1);
++	if (error || memcmp(bounce, "EFI PART", 8) != 0) {
++		error = error ? error : ENXIO;
++		goto out;
++	}
++	memcpy(hdr_bak, bounce, UFS_BLOCK);
++
++	error = ufs_read_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++	memcpy(ptn_bak, bounce, nent_blocks * UFS_BLOCK);
++
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = ptn_pri + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) break;
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (is_ab_partition(name, target_suffix)) {
++			ptn_pri[i * esz + AB_ATTR_BYTE] |= AB_ATTR_UNBOOTABLE;
++			ptn_pri[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_SLOT_ACTIVE;
++			ptn_bak[i * esz + AB_ATTR_BYTE] |= AB_ATTR_UNBOOTABLE;
++			ptn_bak[i * esz + AB_ATTR_BYTE] &= ~AB_ATTR_SLOT_ACTIVE;
++		}
++	}
++
++	uint32_t ptn_crc = crc32(0, ptn_pri, nent_bytes);
++	memcpy(hdr_pri + 88, &ptn_crc, 4);
++	bzero(hdr_pri + 16, 4);
++	uint32_t hdr_crc = crc32(0, hdr_pri, gpt_header_size);
++	memcpy(hdr_pri + 16, &hdr_crc, 4);
++
++	uint32_t bak_ptn_crc = crc32(0, ptn_bak, nent_bytes);
++	memcpy(hdr_bak + 88, &bak_ptn_crc, 4);
++	bzero(hdr_bak + 16, 4);
++	uint32_t bak_hdr_crc = crc32(0, hdr_bak, gpt_header_size);
++	memcpy(hdr_bak + 16, &bak_hdr_crc, 4);
++
++	memcpy(bounce, ptn_pri, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(entry_lba, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_pri, UFS_BLOCK);
++	error = ufs_write_raw_blocks(1, 1);
++	if (error) goto out;
++
++	memcpy(bounce, ptn_bak, nent_blocks * UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba - nent_blocks, nent_blocks);
++	if (error) goto out;
++
++	memcpy(bounce, hdr_bak, UFS_BLOCK);
++	error = ufs_write_raw_blocks(alt_lba, 1);
++	if (error) goto out;
++
++	error = ufs_sync_cache();
++	printf("SWEET BOOTCTL: slot %s marked unbootable: %d\n", target_suffix, error);
++
++out:
++	kfree_data(hdr_pri, UFS_BLOCK);
++	kfree_data(ptn_pri, nent_blocks * UFS_BLOCK);
++	kfree_data(hdr_bak, UFS_BLOCK);
++	kfree_data(ptn_bak, nent_blocks * UFS_BLOCK);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++static int
++sysctl_sweet_boot_successful SYSCTL_HANDLER_ARGS
++{
++	int val = sweet_ufs_is_slot_marked_successful(-1);
++	int error = SYSCTL_OUT(req, &val, sizeof(val));
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int err = proc_suser(current_proc());
++	if (err) {
++		return err;
++	}
++	int new_val = 0;
++	error = SYSCTL_IN(req, &new_val, sizeof(new_val));
++	if (error) {
++		return error;
++	}
++	if (new_val == 1) {
++		return sweet_ufs_mark_boot_successful(-1);
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_successful, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_boot_successful, "I", "mark active boot slot successful (1) or query status (0/1)");
++
++static int
++sysctl_sweet_boot_slot SYSCTL_HANDLER_ARGS
++{
++	int slot = sweet_ufs_get_current_slot();
++	int error = SYSCTL_OUT(req, &slot, sizeof(slot));
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int err = proc_suser(current_proc());
++	if (err) {
++		return err;
++	}
++	int new_slot = 0;
++	error = SYSCTL_IN(req, &new_slot, sizeof(new_slot));
++	if (error) {
++		return error;
++	}
++	if (new_slot == 0 || new_slot == 1) {
++		return sweet_ufs_set_active_boot_slot(new_slot);
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_boot_slot, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_boot_slot, "I", "get (0=_a, 1=_b) or set active boot slot");
++
++static int
++sysctl_sweet_bootctl SYSCTL_HANDLER_ARGS
++{
++	int cur = sweet_ufs_get_current_slot();
++	int s0_good = sweet_ufs_is_slot_marked_successful(0);
++	int s0_boot = sweet_ufs_is_slot_bootable(0);
++	int s1_good = sweet_ufs_is_slot_marked_successful(1);
++	int s1_boot = sweet_ufs_is_slot_bootable(1);
++
++	char status[128];
++	snprintf(status, sizeof(status),
++	    "slot=%d (%s) slot0: good=%d bootable=%d slot1: good=%d bootable=%d\n",
++	    cur, cur == 1 ? "_b" : "_a", s0_good, s0_boot, s1_good, s1_boot);
++
++	int error = SYSCTL_OUT(req, status, strlen(status) + 1);
++	if (error || req->newptr == USER_ADDR_NULL) {
++		return error;
++	}
++	int err = proc_suser(current_proc());
++	if (err) {
++		return err;
++	}
++	char cmd[64] = "";
++	error = SYSCTL_IN(req, cmd, sizeof(cmd) - 1);
++	if (error) {
++		return error;
++	}
++	cmd[sizeof(cmd) - 1] = 0;
++	size_t len = strlen(cmd);
++	while (len > 0 && (cmd[len - 1] == '\n' || cmd[len - 1] == '\r' || cmd[len - 1] == ' ')) {
++		cmd[--len] = 0;
++	}
++
++	if (strcmp(cmd, "mark-successful") == 0 || strcmp(cmd, "mark-boot-successful") == 0) {
++		return sweet_ufs_mark_boot_successful(-1);
++	}
++	if (strcmp(cmd, "mark-successful 0") == 0 || strcmp(cmd, "mark-successful a") == 0 || strcmp(cmd, "mark-successful _a") == 0) {
++		return sweet_ufs_mark_boot_successful(0);
++	}
++	if (strcmp(cmd, "mark-successful 1") == 0 || strcmp(cmd, "mark-successful b") == 0 || strcmp(cmd, "mark-successful _b") == 0) {
++		return sweet_ufs_mark_boot_successful(1);
++	}
++	if (strcmp(cmd, "set-active 0") == 0 || strcmp(cmd, "set-active a") == 0 || strcmp(cmd, "set-active _a") == 0) {
++		return sweet_ufs_set_active_boot_slot(0);
++	}
++	if (strcmp(cmd, "set-active 1") == 0 || strcmp(cmd, "set-active b") == 0 || strcmp(cmd, "set-active _b") == 0) {
++		return sweet_ufs_set_active_boot_slot(1);
++	}
++	if (strcmp(cmd, "set-unbootable 0") == 0) {
++		return sweet_ufs_set_slot_as_unbootable(0);
++	}
++	if (strcmp(cmd, "set-unbootable 1") == 0) {
++		return sweet_ufs_set_slot_as_unbootable(1);
++	}
++	return EINVAL;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_bootctl, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_bootctl, "A", "Qualcomm boot control command interface");
++
+ int sweet_ufs_rootdev(dev_t *dev);
+ 
+ int

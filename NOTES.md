@@ -1,5 +1,28 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-10-30 ~21:20 QUALCOMM BOOTCTL IMPLEMENTED (Antigravity): XNU 0188 & USERLAND BOOTCTL
+- **Goal**: Allow iOS to mark boots as successful and control A/B boot slots so Qualcomm's ABL (Android Bootloader) does not decrement tries or mark the slot unbootable (`0x80`).
+- **Kernel Implementation (`xnu/patches/0188-sweet-bootctl.patch`)**:
+  - Implemented in `bsd/dev/sweet_ufs.c` under `sweet_ufs_lock`:
+    - Manipulates Qualcomm CAF partition attribute flags on attribute byte 6 (offset 54 in 128-byte partition entries):
+      - Bit 2 (`0x04`): `AB_PARTITION_ATTR_SLOT_ACTIVE`
+      - Bit 6 (`0x40`): `AB_PARTITION_ATTR_BOOT_SUCCESSFUL`
+      - Bit 7 (`0x80`): `AB_PARTITION_ATTR_UNBOOTABLE`
+    - Partition safety: `is_ab_partition()` strictly allows only `boot_`, `modem_`, `vbmeta_system_`, `system_`, `vendor_` for the target slot (`_a` or `_b`) on LUN 0 (`sda`). Explicitly excludes `persist`, `modemst1`, `modemst2`, `fsg`, `userdata`, `misc`.
+    - Updates attribute flags for all matching A/B entries in both Primary GPT (LBA 2) and Backup GPT (LBA `alt_lba - nent_blocks`), recalculates CRC32 of partition array and header, writes back Primary (LBA 2, LBA 1) and Backup (LBA `alt_lba - nent_blocks`, LBA `alt_lba`), and flushes UFS cache (`ufs_sync_cache()`).
+    - Idempotent: returns immediately with 0 disk writes if active slot is already marked successful.
+    - Sysctls:
+      - `kern.sweet_boot_successful` (RW): read 1 if marked successful, 0 if not; write 1 to mark current slot successful.
+      - `kern.sweet_boot_slot` (RW): read 0 (_a) or 1 (_b); write 0 or 1 to set active boot slot.
+      - `kern.sweet_bootctl` (RW): read formatted status summary (`slot=...`); write commands (`mark-successful`, `set-active 0/1`, `set-unbootable 0/1`).
+    - Boot-arg auto-marking: `markboot=1` or `sweet_mark_boot=1` in cmdline auto-marks successful during `sweet_ufs_init()`.
+  - Built and verified in Docker (`kernel.development.sweet`, symbols `_sweet_ufs_mark_boot_successful`, `_sysctl_sweet_boot_successful`, `_sysctl_sweet_boot_slot`, `_sysctl_sweet_bootctl` present).
+- **Userland CLI (`userland/tools/sweet-bootctl.c`)**:
+  - Android `bootctl` CLI compatibility:
+    - `hal-info`, `get-number-slots`, `get-current-slot`, `mark-boot-successful`, `is-slot-marked-successful [SLOT]`, `is-slot-bootable [SLOT]`, `get-suffix [SLOT]`, `set-active-boot-slot [SLOT]`, `set-slot-as-unbootable [SLOT]`, `status`.
+  - Build script: `userland/tools/build.sh` (Theos clang targeting `arm64-apple-ios16.0`, signed with `ldid -S`). Built binary `userland/tools/sweet-bootctl` tested.
+
+
 ## 2026-10-29 ~14:25 HANDOFF (Antigravity): COMMCENTER RESTORED & WIFID KNOWN NETWORKS FIXED
 - **CommCenter**: Re-added both `com.apple.CommCenter.plist` and `com.apple.CommCenter-noncellular.plist` jobs to `/System/Library/xpc/launchd.plist` on the phone via `tools/sweet-commcenter.py --enable`. Backup saved at `/var/root/launchd.plist.before-commcenter`. Undo with `tools/sweet-commcenter.py --disable`. No modem partitions touched. Change takes effect on reboot.
 - **wifid "GET KNOWN NETWORKS LIST err=2" FIXED (now err=0)**:
