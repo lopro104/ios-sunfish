@@ -72,7 +72,7 @@ BUILD=build-softpipe-freedreno
 	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
 # the archives hakios-metal links (tools/compiler.mk MESA_ARCHIVE_PATHS) and the front end's
 ninja -C $BUILD src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/freedreno/isa/libir3encode.a \
-	src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a src/compiler/libcompiler.a \
+	src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/freedreno/fdl/libfreedreno_layout.a \
 	src/freedreno/common/libfreedreno_common.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a \
 	src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a > ninja.log 2>&1 || { tail -30 ninja.log; exit 1; }
 echo "mk-hakios-mesa-ios.sh: $B/$BUILD"
