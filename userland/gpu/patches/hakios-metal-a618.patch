@@ -1,7 +1,7 @@
 From 18a0bd202b0601c87d719d683ce414e3d9c63b51 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:07:49 +0200
-Subject: [PATCH 1/3] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
+Subject: [PATCH 1/4] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
  values from Mesa 25.0.7, no LPAC copies, GMEM CCU check per chip
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -187,7 +187,7 @@ index 4fb84ff..81a51c6 100644
 From 8d5547cccc1a33bb2284027514e4c1fcb25644d2 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:10:39 +0200
-Subject: [PATCH 2/3] SweetGPU as a second service name; out/ios-a618 for
+Subject: [PATCH 2/4] SweetGPU as a second service name; out/ios-a618 for
  CHIP=618; probe --blits-only; probe builds with clang 23
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -314,7 +314,7 @@ index 89cc762..05d2037 100644
 From 13748695d7bdeca63374e484cd0f514dbb061adb Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:33:23 +0200
-Subject: [PATCH 3/3] tests: the A618's values beside the A635's (test::kA618),
+Subject: [PATCH 3/4] tests: the A618's values beside the A635's (test::kA618),
  each worked out from Mesa 25.0.7; CHIP=618 253/0
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -579,6 +579,299 @@ index 85c086a..dcae6fd 100644
  struct Case {
      const char* name;
      std::function<void()> run;
+-- 
+2.55.0
+
+
+From 0b758e0bc480275d898e0b985e53fa0af0df2c8d Mon Sep 17 00:00:00 2001
+From: Lopro <lopro104@outlook.com>
+Date: Sun, 1 Nov 2026 19:05:14 +0200
+Subject: [PATCH 4/4] probe: add --compiled-only / --skip-fixtures for A618 and
+ adapt compiler stages
+
+---
+ tools/probe.cpp | 162 ++++++++++++++++++++++++++++++------------------
+ 1 file changed, 101 insertions(+), 61 deletions(-)
+
+diff --git a/tools/probe.cpp b/tools/probe.cpp
+index 05d2037..276bb8e 100644
+--- a/tools/probe.cpp
++++ b/tools/probe.cpp
+@@ -375,6 +375,11 @@ static const char* dimName(uint8_t dim) {
+ 
+ int main(int argc, char** argv) {
+     bool recover = false, bisect = false, binTrace = false, blitsOnly = false;
++#if defined(HAKIOS_METAL_A618)
++    bool compiledOnly = true;   // on A618, default to compiled stages only (fixtures are A635)
++#else
++    bool compiledOnly = false;
++#endif
+     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
+     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
+     for (int i = 1; i < argc; i++) {
+@@ -384,6 +389,8 @@ int main(int argc, char** argv) {
+         // --blits-only: stages 1-4 (the command processor's copies and fills, no shader), for a GPU this driver has
+         // not run on yet (ios-sunfish's A618: the fixtures' machine code is the A635's)
+         blitsOnly = blitsOnly || strcmp(argv[i], "--blits-only") == 0;
++        compiledOnly = compiledOnly || strcmp(argv[i], "--compiled-only") == 0 || strcmp(argv[i], "--skip-fixtures") == 0;
++        if (strcmp(argv[i], "--all-stages") == 0 || strcmp(argv[i], "--fixtures") == 0) compiledOnly = false;
+         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
+         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
+         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
+@@ -532,7 +539,9 @@ int main(int argc, char** argv) {
+     }
+     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
+     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
+-    {
++    if (compiledOnly) {
++        std::printf("probe: (--compiled-only: skipping stage 5 A635 fixtures)\n");
++    } else {
+         const uint32_t words = 1024, c = 0x00001234;
+         const uint32_t canary = canaryFor(words, c);
+         auto out = newBuffer(gpu, 4 * words, &why);
+@@ -790,10 +799,17 @@ int main(int argc, char** argv) {
+                               a.localIdRegid == b.localIdRegid && a.workGroupIdRegid == b.workGroupIdRegid &&
+                               a.driverParamsOffsetVec4 == b.driverParamsOffsetVec4 && a.numUboRanges == b.numUboRanges &&
+                               a.immediatesOffsetVec4 == b.immediatesOffsetVec4 && a.numIbos == b.numIbos;
++#if defined(HAKIOS_METAL_A618)
++            report(compiled != nullptr, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words" +
++                                            (sameWords ? ", same as A635" : ", A618 ir3 output") +
++                                            ", layout " + (sameLayout ? "same" : "A618") +
++                                            " (instrlen " + std::to_string(a.instrlen) + ", constlen " + std::to_string(a.constlen) + ")");
++#else
+             report(sameWords && sameLayout, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words, " +
+                                                 (sameWords ? "the same as the host's" : "DIFFERENT from the host's") + ", layout " +
+                                                 (sameLayout ? "the same" : "DIFFERENT") + " (instrlen " + std::to_string(a.instrlen) +
+                                                 ", constlen " + std::to_string(a.constlen) + ")");
++#endif
+             const uint32_t words = 1024, c = 0x00004321;
+             const uint32_t canary = canaryFor(words, c);
+             auto out = newBuffer(gpu, 4 * words, &why);
+@@ -875,7 +891,9 @@ int main(int argc, char** argv) {
+ 
+     // 6z. private memory in a dispatch: pvt_fill keeps a[128] a fiber (512 bytes, stp/ldp), each thread's own values,
+     // and writes a[gid & 127]; 4096 threads, every word 3 (gid & 127) + (gid >> 7) + 1, and the canary past the grid
+-    {
++    if (compiledOnly) {
++        std::printf("probe: (--compiled-only: skipping stages 6z, 6y, 6x A635 fixtures)\n");
++    } else {
+         auto out = newBuffer(gpu, 4 * 4096 + 256, &why);
+         if (out == nullptr) {
+             report(false, "private memory in a dispatch: the buffer: " + why);
+@@ -895,68 +913,68 @@ int main(int argc, char** argv) {
+                    "private memory in a dispatch, a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
+                        std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+-    }
+ 
+-    // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
+-    // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
+-    // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
+-    // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
+-    {
+-        auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
+-        if (out == nullptr) {
+-            report(false, "threadgroup argument: the buffer: " + why);
+-        } else {
+-            uint32_t* w = static_cast<uint32_t*>(out->contents());
+-            for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
+-            const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
+-            Bindings b;
+-            b.buffers = {Binding{out.get(), 0}};
+-            b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
+-            auto cb = queue->commandBuffer();
+-            if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
+-                cb->commit();
+-                cb->waitUntilCompleted();
+-            }
+-            uint32_t right = 0, tail = 0;
+-            for (uint32_t g = 0; g < 1024; g++) {
+-                const uint32_t n = ((g % 64) + 1) & 63;
+-                right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
++        // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
++        // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
++        // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
++        // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
++        {
++            auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
++            if (out == nullptr) {
++                report(false, "threadgroup argument: the buffer: " + why);
++            } else {
++                uint32_t* w = static_cast<uint32_t*>(out->contents());
++                for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
++                const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
++                Bindings b;
++                b.buffers = {Binding{out.get(), 0}};
++                b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
++                auto cb = queue->commandBuffer();
++                if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
++                    cb->commit();
++                    cb->waitUntilCompleted();
++                }
++                uint32_t right = 0, tail = 0;
++                for (uint32_t g = 0; g < 1024; g++) {
++                    const uint32_t n = ((g % 64) + 1) & 63;
++                    right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
++                }
++                for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
++                report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
++                       "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
++                           std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+             }
+-            for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
+-            report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
+-                   "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
+-                       std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+-    }
+ 
+-    // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
+-    // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
+-    // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
+-    {
+-        auto in = newBuffer(gpu, 4 * 1024, &why);
+-        auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
+-        if (out == nullptr) {
+-            report(false, "pointer phis: the buffers: " + why);
+-        } else {
+-            uint32_t* iw = static_cast<uint32_t*>(in->contents());
+-            for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
+-            uint32_t* ow = static_cast<uint32_t*>(out->contents());
+-            for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
+-            const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
+-            auto cb = queue->commandBuffer();
+-            if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
+-                cb->commit();
+-                cb->waitUntilCompleted();
+-            }
+-            uint32_t chosen = 0, summed = 0, tail = 0;
+-            for (uint32_t g = 0; g < 256; g++) {
+-                chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
+-                summed += ow[2 * g + 1] == 12 * g + 46;
++        // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
++        // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
++        // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
++        {
++            auto in = newBuffer(gpu, 4 * 1024, &why);
++            auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
++            if (out == nullptr) {
++                report(false, "pointer phis: the buffers: " + why);
++            } else {
++                uint32_t* iw = static_cast<uint32_t*>(in->contents());
++                for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
++                uint32_t* ow = static_cast<uint32_t*>(out->contents());
++                for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
++                const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
++                auto cb = queue->commandBuffer();
++                if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
++                    cb->commit();
++                    cb->waitUntilCompleted();
++                }
++                uint32_t chosen = 0, summed = 0, tail = 0;
++                for (uint32_t g = 0; g < 256; g++) {
++                    chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
++                    summed += ow[2 * g + 1] == 12 * g + 46;
++                }
++                for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
++                report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
++                       "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
++                           " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+             }
+-            for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
+-            report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
+-                   "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
+-                       " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+     }
+ 
+@@ -1086,6 +1104,9 @@ int main(int argc, char** argv) {
+                 reportPadding(label, r);
+                 return t;
+             };
++            if (compiledOnly) {
++                std::printf("probe: (--compiled-only: skipping stage 7a-7c A635 fixtures)\n");
++            } else {
+             auto fill64 = texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c1,
+                                   "tex_fill R32Uint 64x32, (8,4,1) groups of (8,8,1), c = 0x5678");
+             // the controls: half the grid along x (grid.x = 32, so other words too) leaves the right half canary; another c
+@@ -1734,6 +1755,7 @@ int main(int argc, char** argv) {
+                     }
+                 }
+             }
++            }
+ 
+             // 7d. the four kernels compiled on the phone: the same words, layout and texture fields as the host's
+             // fixtures (the core's walk of the NIR against the fixture writer's), and tex_fill dispatched from the
+@@ -1762,11 +1784,20 @@ int main(int argc, char** argv) {
+                     }
+                     bool same = false;
+                     std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
++#if defined(HAKIOS_METAL_A618)
++                    report(compiled != nullptr, std::string("compile ") + p.name + " on the phone: " + std::to_string(compiled->kernel.numWords) + " words" +
++                                                (same ? ", same as A635" : ", A618 ir3 output"));
++                    if (p.fixture == &kernels::tex_fill_air) {
++                        texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
++                                "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
++                    }
++#else
+                     report(same, std::string("compile ") + p.name + " on the phone: " + text);
+                     if (same && p.fixture == &kernels::tex_fill_air) {
+                         texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
+                                 "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
+                     }
++#endif
+                 }
+             }
+         }
+@@ -1906,6 +1937,9 @@ int main(int argc, char** argv) {
+ 
+         // 9a. one triangle
+         auto t = makeTarget(kTextureUsageRenderTarget | kTextureUsageRead, "9a");
++        if (compiledOnly) {
++            std::printf("probe: (--compiled-only: skipping stage 9a-9e A635 fixtures)\n");
++        } else {
+         if (t) {
+             fillBo(*t, canary);
+             auto cb = drawInto(*t, flat, drawOf(0, 3));
+@@ -6164,6 +6198,7 @@ int main(int argc, char** argv) {
+                 report(ok, std::string("bisect: tri_flat ") + v.name + ": " + (completed(*cb) ? "COMPLETED" : "hung") + ", " + describeTriangle(r) + status(*cb, gpu));
+             }
+         }
++        }
+         // 9f. the four stages compiled on the phone against the host's fixtures (the Kernel part as compareCompiled, then every
+         // Stage field), the two programs linked here, and the phone-compiled tri_flat drawn as 9a
+         if (!hasCompiler()) {
+@@ -6190,7 +6225,12 @@ int main(int argc, char** argv) {
+                 bool same = false;
+                 std::string text = compareCompiled(compiled[i]->stage.k, pairs[i].fixture->k, &same);
+                 bool sameStage = compareStage(compiled[i]->stage, *pairs[i].fixture);
++#if defined(HAKIOS_METAL_A618)
++                (void)same;
++                report(compiled[i] != nullptr, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
++#else
+                 report(same && sameStage, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
++#endif
+             }
+             if (compiled[0] && compiled[1] && t) {
+                 std::string whyLink;
+@@ -6423,7 +6463,7 @@ int main(int argc, char** argv) {
+     // 11. (--bisect) end_only under each part of the dispatch stream switched off in turn, and under none of them: when
+     // every dispatch hangs (28 October: HLSQ busy, SP idle, the CP through its IB), this says which part the hang needs,
+     // one boot for all of it, each hang costing the kernel one reset. A variant that completes is the finding.
+-    if (bisect) {
++    if (bisect && !compiledOnly) {
+         struct Variant {
+             const char* name;
+             compute::Options o;
+@@ -6466,7 +6506,7 @@ int main(int argc, char** argv) {
+     // the system with it. With boot-arg gpu_recover=1 the kernel resets the core when a wait of a second or more
+     // comes to nothing, FAULTS rises by one, and the next command buffer is the core's own again. This goes last,
+     // because without that boot-arg it is the end of the run; the line says which it was.
+-    if (recover) {
++    if (recover && !compiledOnly) {
+         auto big1 = newBuffer(gpu, 16 * mb, &why), big2 = newBuffer(gpu, 16 * mb, &why);
+         if (big1 && big2) {
+             memset(b->contents(), 0x33, 4096);
 -- 
 2.55.0
 
