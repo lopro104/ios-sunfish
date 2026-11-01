@@ -1,24 +1,8 @@
-From 18a0bd202b0601c87d719d683ce414e3d9c63b51 Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 06:07:49 +0200
-Subject: [PATCH 1/6] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
- values from Mesa 25.0.7, no LPAC copies, GMEM CCU check per chip
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01JgmyR9ZNd3ffzyiFdiy9Dw
----
- Makefile                         |  7 ++++-
- include/hakios-metal/a6xx.hpp    | 45 ++++++++++++++++++++++++++++++++
- include/hakios-metal/compute.hpp |  3 ++-
- src/command.cpp                  |  6 ++---
- src/fake_gpu.cpp                 | 11 +++++---
- 5 files changed, 64 insertions(+), 8 deletions(-)
-
 diff --git a/Makefile b/Makefile
-index a4893a2..f559203 100644
+index a4893a2..3f00fd3 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -19,7 +19,12 @@ SAN       ?=
+@@ -19,7 +19,13 @@ SAN       ?=
  ifneq ($(SAN),)
  override CXXFLAGS += -fsanitize=$(SAN) -fno-omit-frame-pointer
  endif
@@ -29,9 +13,49 @@ index a4893a2..f559203 100644
 +override CXXFLAGS += -DHAKIOS_METAL_A618
 +endif
 +HOSTOUT   = out/host$(if $(CHIP),-a$(CHIP))$(if $(SAN),-$(SAN))
++IOSOUT    = out/ios$(if $(CHIP),-a$(CHIP))
  .DEFAULT_GOAL := test
  
  # The host tools that make shader kernels into fixtures (tools/kernels.mk), and the link of Mesa's compiler libraries
+@@ -84,28 +90,31 @@ check: test
+ 	plugin/tests/metal-plugin-test.sh
+ 	GPU=1 plugin/tests/metal-plugin-test.sh
+ 
+-ios: out/ios/hakios-metal-probe out/ios/libhakios-metal.a
++ios: $(IOSOUT)/hakios-metal-probe $(IOSOUT)/libhakios-metal.a
+ 
+ darwin: ios
+ 
+ # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
+ IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
+ IOS_LIBS     =
++ifeq ($(CHIP),618)
++IOS_CXXFLAGS += -DHAKIOS_METAL_A618
++endif
+ ifneq ($(strip $(MESA)),)
+ IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
+ IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
+ endif
+ 
+-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+-	@mkdir -p out/ios/obj
+-	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
++$(IOSOUT)/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
++	@mkdir -p $(IOSOUT)/obj
++	cd $(IOSOUT)/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
+ 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
+-	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
++	rm -f $@ && $(IOS_AR) $@ $(IOSOUT)/obj/*.o
+ 
+ # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
+-out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
++$(IOSOUT)/hakios-metal-probe: tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
+ 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
+-	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
++	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(IOS_LIBS) \
+ 		-framework IOKit -framework CoreFoundation -framework IOSurface
+ 
+ 
 diff --git a/include/hakios-metal/a6xx.hpp b/include/hakios-metal/a6xx.hpp
 index b01af4c..8160d63 100644
 --- a/include/hakios-metal/a6xx.hpp
@@ -139,756 +163,8 @@ index 147a5d5..e8ca160 100644
      bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
      bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
      bool marker = true;         // CP_SET_MARKER RM6_COMPUTE
-diff --git a/src/command.cpp b/src/command.cpp
-index 06b5407..d29bb5d 100644
---- a/src/command.cpp
-+++ b/src/command.cpp
-@@ -556,9 +556,9 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
- }
- 
- namespace {
--// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
--constexpr uint32_t kSpCores = 2;
--constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
-+// the chip's SP cores and fibers an SP (a6xx.hpp, from freedreno_devices.py)
-+constexpr uint32_t kSpCores = a6xx::kNumSpCores;
-+constexpr uint32_t kFibersPerSp = a6xx::kFibersPerSp;
- }  // namespace
- 
- std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
-diff --git a/src/fake_gpu.cpp b/src/fake_gpu.cpp
-index 4fb84ff..81a51c6 100644
---- a/src/fake_gpu.cpp
-+++ b/src/fake_gpu.cpp
-@@ -667,11 +667,16 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
-         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
-         return false;
-     }
--    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
-+    if (!kHasLpac) {
-+        // a chip without LPAC (the A618) has no second copies: turnip never writes them there
-+        if (reg(REG_A6XX_SP_CS_CNTL_0) != 0 || reg(REG_A6XX_SP_CS_CNTL_1) != 0 || reg(REG_A6XX_HLSQ_CS_CTRL_REG1) != 0) {
-+            fault("SP_CS_CNTL_0/1 or HLSQ_CS_CTRL_REG1 written on a chip without LPAC (has_lpac is gen4's)");
-+            return false;
-+        }
-+    } else if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
-         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
-         return false;
--    }
--    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
-+    } else if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
-         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
-         return false;
-     }
--- 
-2.55.0
-
-
-From 8d5547cccc1a33bb2284027514e4c1fcb25644d2 Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 06:10:39 +0200
-Subject: [PATCH 2/6] SweetGPU as a second service name; out/ios-a618 for
- CHIP=618; probe --blits-only; probe builds with clang 23
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01JgmyR9ZNd3ffzyiFdiy9Dw
----
- Makefile                | 18 +++++++++++-------
- src/iokit_transport.cpp |  4 ++++
- tools/probe.cpp         | 12 ++++++++++--
- 3 files changed, 25 insertions(+), 9 deletions(-)
-
-diff --git a/Makefile b/Makefile
-index f559203..3f00fd3 100644
---- a/Makefile
-+++ b/Makefile
-@@ -25,6 +25,7 @@ ifeq ($(CHIP),618)
- override CXXFLAGS += -DHAKIOS_METAL_A618
- endif
- HOSTOUT   = out/host$(if $(CHIP),-a$(CHIP))$(if $(SAN),-$(SAN))
-+IOSOUT    = out/ios$(if $(CHIP),-a$(CHIP))
- .DEFAULT_GOAL := test
- 
- # The host tools that make shader kernels into fixtures (tools/kernels.mk), and the link of Mesa's compiler libraries
-@@ -89,28 +90,31 @@ check: test
- 	plugin/tests/metal-plugin-test.sh
- 	GPU=1 plugin/tests/metal-plugin-test.sh
- 
--ios: out/ios/hakios-metal-probe out/ios/libhakios-metal.a
-+ios: $(IOSOUT)/hakios-metal-probe $(IOSOUT)/libhakios-metal.a
- 
- darwin: ios
- 
- # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
- IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
- IOS_LIBS     =
-+ifeq ($(CHIP),618)
-+IOS_CXXFLAGS += -DHAKIOS_METAL_A618
-+endif
- ifneq ($(strip $(MESA)),)
- IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
- IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
- endif
- 
--out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
--	@mkdir -p out/ios/obj
--	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
-+$(IOSOUT)/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
-+	@mkdir -p $(IOSOUT)/obj
-+	cd $(IOSOUT)/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
- 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
--	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
-+	rm -f $@ && $(IOS_AR) $@ $(IOSOUT)/obj/*.o
- 
- # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
--out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
-+$(IOSOUT)/hakios-metal-probe: tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
- 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
--	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
-+	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(IOS_LIBS) \
- 		-framework IOKit -framework CoreFoundation -framework IOSurface
- 
- 
-diff --git a/src/iokit_transport.cpp b/src/iokit_transport.cpp
-index 48ef40e..8a5b86f 100644
---- a/src/iokit_transport.cpp
-+++ b/src/iokit_transport.cpp
-@@ -66,6 +66,10 @@ private:
- 
- std::unique_ptr<Transport> openKernelGpu(std::string* why) {
-     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
-+    if (s == 0) {
-+        // ios-sunfish's kernel: SweetGPU, a port of this same driver (the same requests and structures)
-+        s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
-+    }
-     if (s == 0) {
-         *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
-         return nullptr;
-diff --git a/tools/probe.cpp b/tools/probe.cpp
-index 89cc762..05d2037 100644
---- a/tools/probe.cpp
-+++ b/tools/probe.cpp
-@@ -374,13 +374,16 @@ static const char* dimName(uint8_t dim) {
- }
- 
- int main(int argc, char** argv) {
--    bool recover = false, bisect = false, binTrace = false;
-+    bool recover = false, bisect = false, binTrace = false, blitsOnly = false;
-     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
-     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
-     for (int i = 1; i < argc; i++) {
-         recover = recover || strcmp(argv[i], "--recover") == 0;
-         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
-         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
-+        // --blits-only: stages 1-4 (the command processor's copies and fills, no shader), for a GPU this driver has
-+        // not run on yet (ios-sunfish's A618: the fixtures' machine code is the A635's)
-+        blitsOnly = blitsOnly || strcmp(argv[i], "--blits-only") == 0;
-         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
-         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
-         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
-@@ -522,6 +525,11 @@ int main(int argc, char** argv) {
-         }
-     }
- 
-+    if (blitsOnly) {
-+        std::printf("probe: --blits-only, stopping before stage 5\n");
-+        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
-+        return failures;
-+    }
-     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
-     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
-     {
-@@ -1483,7 +1491,7 @@ int main(int argc, char** argv) {
-                 const uint64_t words = t->buffer()->length() / 4;
-                 for (uint64_t i = 0; i < words; i++) w[i] = canary;
-                 const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
--                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, Bindings{{}, {t.get()}});
-+                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, [&] { Bindings b; b.textures = {t.get()}; return b; }());
-                 uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
-                 const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
-                 for (uint32_t z = 0; z < D; z++) {
--- 
-2.55.0
-
-
-From 13748695d7bdeca63374e484cd0f514dbb061adb Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 06:33:23 +0200
-Subject: [PATCH 3/6] tests: the A618's values beside the A635's (test::kA618),
- each worked out from Mesa 25.0.7; CHIP=618 253/0
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01JgmyR9ZNd3ffzyiFdiy9Dw
----
- tests/a6xx_test.cpp    | 27 +++++++++++++++------------
- tests/compute_test.cpp | 29 ++++++++++++++++++++++++-----
- tests/render_test.cpp  | 28 +++++++++++++++++-----------
- tests/test.hpp         | 10 ++++++++++
- 4 files changed, 66 insertions(+), 28 deletions(-)
-
-diff --git a/tests/a6xx_test.cpp b/tests/a6xx_test.cpp
-index d46ceaa..e187851 100644
---- a/tests/a6xx_test.cpp
-+++ b/tests/a6xx_test.cpp
-@@ -110,8 +110,8 @@ TEST(a6xx_load_state6_word_0) {
-     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
-     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
-     // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
--    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
--    CHECK_EQ(kInstrCacheSize, 127u);
-+    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (test::kA618 ? 64u : 127u) << 22);
-+    CHECK_EQ(kInstrCacheSize, test::kA618 ? 64u : 127u);
-     // the source address: the low word keeps bits 31:2, the high word is whole
-     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
-     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
-@@ -283,9 +283,10 @@ TEST(a6xx_private_memory_fields_are_scaled) {
-     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
-     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
-     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
--    CHECK_EQ(kFibersPerSp, 4096u);
--    CHECK_EQ(kNumSpCores, 2u);
--    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
-+    // (the A618: 2048 fibers, 1 SP; 512 bytes a fiber is 1 MiB, field 256)
-+    CHECK_EQ(kFibersPerSp, test::kTestFibers);
-+    CHECK_EQ(kNumSpCores, test::kTestSpCores);
-+    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), test::kA618 ? 256u : 512u);
- }
- 
- TEST(a6xx_dispatch_words) {
-@@ -333,7 +334,8 @@ TEST(a6xx_batch_start_words) {
-     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
-     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
-     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
--    CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
-+    // (the A618: num_ccu 1 * 64 KiB = 0x10000: 0x10 << 23 = 0x08000000)
-+    CHECK_EQ(rbCcuCntlSysmem(), test::kA618 ? 0x08000000u : 0x10000000u);
-     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
-     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
-     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
-@@ -365,7 +367,7 @@ TEST(a6xx_batch_start_words) {
-     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
-     CHECK_EQ(kStaticState[1].value, 0x8u);
-     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
--    CHECK_EQ(kStaticState[5].value, 0x05008000u);
-+    CHECK_EQ(kStaticState[5].value, test::kA618 ? 0x00108000u : 0x05008000u);
-     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
-     CHECK_EQ(kStaticState[19].value, 0x5u);
-     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
-@@ -386,11 +388,12 @@ TEST(a6xx_batch_start_words) {
-     for (const RegWrite& w : kStaticState) {
-         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
-     }
--    CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
-+    // (the A618's: freedreno_devices.py 25.0.7, GPUId(618) magic_regs)
-+    CHECK_EQ(kMagicTpl1DbgEcoCntl, test::kA618 ? 0x00108000u : 83918848u);
-     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
--    CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
--    CHECK_EQ(kMagicSpChickenBits, 5120u);
--    CHECK_EQ(kMagicUcheClientPf, 132u);
-+    CHECK_EQ(kMagicVpcDbgEcoCntl, test::kA618 ? 0u : 33554432u);
-+    CHECK_EQ(kMagicSpChickenBits, test::kA618 ? 0x430u : 5120u);
-+    CHECK_EQ(kMagicUcheClientPf, test::kA618 ? 4u : 132u);
-     CHECK_EQ(kBorderColorBytes, 32768u);
- }
- 
-@@ -744,7 +747,7 @@ TEST(a6xx_first_draw_program_words) {
-     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
-     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
-     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
--    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
-+    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (test::kA618 ? 64u : 127u) << 22);
-     // the private memory words are the compute ones' twins (same scales)
-     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
-     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);
-diff --git a/tests/compute_test.cpp b/tests/compute_test.cpp
-index c7f9c6f..a079d8f 100644
---- a/tests/compute_test.cpp
-+++ b/tests/compute_test.cpp
-@@ -162,8 +162,8 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
-     auto at = [&](uint32_t reg) { size_t i = e.findReg(reg); return i == size_t(-1) ? 0xdeadbeefu : e.stream.words()[i]; };
-     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
-     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 1), uint32_t(scratch->gpuAddress()));
--    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * 4096u) >> 12);
--    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
-+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * test::kTestFibers) >> 12);
-+    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * test::kTestFibers) >> 11);
-     // through a command buffer the queue's own is bound, and the fake takes the dispatch
-     auto cb = r.queue->commandBuffer();
-     CHECK(cb->dispatch(k, kGroups16, nullptr, {Binding{out.get(), 0}}));
-@@ -180,7 +180,11 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
-     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
-     CHECK(big.ok);
-     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
--    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
-+    if (test::kA618) {
-+        CHECK(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1) == size_t(-1));   // no LPAC: no HLSQ copy
-+    } else {
-+        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
-+    }
-     tg.sharedBytes = 32 * 1024 + 1;
-     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
-     CHECK(!over.ok);
-@@ -532,6 +536,15 @@ TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
-         }
-         i += 1 + h.count;
-     }
-+    if (test::kA618) {
-+        // no LPAC: the encoder writes no SP_CS_CNTL_0, and one written anyway is refused
-+        CHECK(!changed);
-+        words.insert(words.begin(), {pm4::type4(a6xx::REG_A6XX_SP_CS_CNTL_0, 1), a6xx::A6XX_SP_CS_CNTL_0_LOCALIDREGID(0x4)});
-+        Raw raw(r);
-+        CHECK_EQ(raw.submit(words), ETIMEDOUT);
-+        CHECK(r.fake->stats().lastFault.find("written on a chip without LPAC") != std::string::npos);
-+        return;
-+    }
-     CHECK(changed);
-     Raw raw(r);
-     CHECK_EQ(raw.submit(words), ETIMEDOUT);
-@@ -1187,10 +1200,16 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
-     {
-         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
-         CHECK(e.ok);
--        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
-         size_t before = 0, after = 0;
-         labels(e, &before, &after);
--        CHECK_EQ(before + after, size_t(0));
-+        if (test::kA618) {
-+            // 96 units are more than the A618's 64: the workaround, as long_chain_air's above
-+            CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) != size_t(-1));
-+            CHECK_EQ(before + after, size_t(2));
-+        } else {
-+            CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
-+            CHECK_EQ(before + after, size_t(0));
-+        }
-         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
-         compute::Options cut;
-         cut.preloadCap = 64;
-diff --git a/tests/render_test.cpp b/tests/render_test.cpp
-index 3868c9f..fdaf997 100644
---- a/tests/render_test.cpp
-+++ b/tests/render_test.cpp
-@@ -660,7 +660,7 @@ TEST(render_encodes_the_first_triangles_registers) {
-     {
-         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
-         CHECK(ccu != size_t(-1));
--        CHECK_EQ(w[ccu], 0x10000000u);
-+        CHECK_EQ(w[ccu], test::kA618 ? 0x08000000u : 0x10000000u);
-         pm4::Header before = pm4::decode(w[ccu - 2]);
-         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
-     }
-@@ -964,7 +964,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
-         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
-         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
-         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
--        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
-+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), test::kA618 ? 0x08000000u : 0x10000000u);   // ccuCntl is its own group
-         CHECK(e.stream.size() < whole.stream.size());
-     }
-     {
-@@ -974,7 +974,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
-     }
-     {
-         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
--        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
-+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), test::kA618 ? 0x08000004u : 0x10000004u);
-     }
-     {
-         Encoded e = with([](render::Options& o) { o.passBegin = false; });
-@@ -1851,7 +1851,8 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
-         Twin w;
-         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
-         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
--        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
-+        CHECK(has(w.fault(), test::kA618 ? "RB_CCU_CNTL (0x8000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"
-+                                         : "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
-     }
-     {
-         Twin w;
-@@ -2147,8 +2148,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
-     auto scratch = r.queue->privateMemory(64, false, &pm, &why);
-     CHECK(scratch != nullptr);
-     CHECK_EQ(pm.perFiber, 512u);
--    CHECK_EQ(pm.perSp, 512u * 4096u);
--    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
-+    CHECK_EQ(pm.perSp, 512u * test::kTestFibers);
-+    CHECK_EQ(scratch->length(), uint64_t(test::kTestSpCores) * 512u * test::kTestFibers);
-     Bindings fsb;
-     fsb.privateMemory = pm;
-     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
-@@ -2156,8 +2157,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
-     if (!e.ok) std::printf("       %s\n", e.error.c_str());
-     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 3), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
-     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 4), uint32_t(scratch->gpuAddress()));
--    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * 4096u) >> 12);
--    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
-+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * test::kTestFibers) >> 12);
-+    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * test::kTestFibers) >> 11);
-     CHECK_EQ(e.reg(REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET + 4), 0u);
-     CHECK_EQ(e.reg(REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET), 0u);
-     auto cb = drawOnce(r, p, pass, wholeDraw(3));
-@@ -4648,7 +4649,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
-         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
-         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
-         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
--            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
-+            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, test::kA618 ? 64u : 127u);
-             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
-             found = true;
-         }
-@@ -5345,7 +5346,9 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
-         a.color0 = t.get();
-         render::GmemPlan p;
-         CHECK(render::gmemPlan(a, &p, nullptr));
--        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
-+        // (the A618: 0x7c000 / 2304 = 220 rows, 192 in 32-row granules: 13 rows of 192)
-+        CHECK(test::kA618 ? (p.cols == 2 && p.rows == 13 && p.binW == 576 && p.binH == 192)
-+                          : (p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208));
-     }
-     // what stays in sysmem: a second colour attachment of another size, an integer target
-     {
-@@ -5462,7 +5465,10 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
-         a.more[0].load = LoadAction::kLoad;
-         render::GmemPlan p;
-         CHECK(render::gmemPlan(a, &p, nullptr));
--        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
-+        // (the A618: GMEM below the colour cache is 0x7c000, so the second share is 0x7c000 - 0x3c000 = 0x40000; the
-+        // bins stay 576 x 96: 0x3c000 / (576 * 4) = 106 rows, 96 in whole 32-row granules)
-+        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 &&
-+              p.room[1] == (test::kA618 ? 0x40000u : 0x3c000u));
-         auto cb = r.queue->commandBuffer();
-         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
-         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
-diff --git a/tests/test.hpp b/tests/test.hpp
-index 85c086a..dcae6fd 100644
---- a/tests/test.hpp
-+++ b/tests/test.hpp
-@@ -8,6 +8,16 @@
- 
- namespace test {
- 
-+// the chip the tests are built for: HAKIOS_METAL_A618 (make CHIP=618) is ios-sunfish's Adreno 618, whose values the
-+// tests below give beside the A635's, each worked out from Mesa 25.0.7 as the A635's were
-+#if defined(HAKIOS_METAL_A618)
-+inline constexpr bool kA618 = true;
-+#else
-+inline constexpr bool kA618 = false;
-+#endif
-+// fibers an SP times SPs: 4096 x 2 on the A635, 2048 x 1 on the A618 (freedreno_devices.py fibers_per_sp, num_ccu)
-+inline constexpr unsigned kTestFibers = kA618 ? 2048u : 4096u, kTestSpCores = kA618 ? 1u : 2u;
-+
- struct Case {
-     const char* name;
-     std::function<void()> run;
--- 
-2.55.0
-
-
-From 0b758e0bc480275d898e0b985e53fa0af0df2c8d Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 19:05:14 +0200
-Subject: [PATCH 4/6] probe: add --compiled-only / --skip-fixtures for A618 and
- adapt compiler stages
-
----
- tools/probe.cpp | 162 ++++++++++++++++++++++++++++++------------------
- 1 file changed, 101 insertions(+), 61 deletions(-)
-
-diff --git a/tools/probe.cpp b/tools/probe.cpp
-index 05d2037..276bb8e 100644
---- a/tools/probe.cpp
-+++ b/tools/probe.cpp
-@@ -375,6 +375,11 @@ static const char* dimName(uint8_t dim) {
- 
- int main(int argc, char** argv) {
-     bool recover = false, bisect = false, binTrace = false, blitsOnly = false;
-+#if defined(HAKIOS_METAL_A618)
-+    bool compiledOnly = true;   // on A618, default to compiled stages only (fixtures are A635)
-+#else
-+    bool compiledOnly = false;
-+#endif
-     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
-     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
-     for (int i = 1; i < argc; i++) {
-@@ -384,6 +389,8 @@ int main(int argc, char** argv) {
-         // --blits-only: stages 1-4 (the command processor's copies and fills, no shader), for a GPU this driver has
-         // not run on yet (ios-sunfish's A618: the fixtures' machine code is the A635's)
-         blitsOnly = blitsOnly || strcmp(argv[i], "--blits-only") == 0;
-+        compiledOnly = compiledOnly || strcmp(argv[i], "--compiled-only") == 0 || strcmp(argv[i], "--skip-fixtures") == 0;
-+        if (strcmp(argv[i], "--all-stages") == 0 || strcmp(argv[i], "--fixtures") == 0) compiledOnly = false;
-         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
-         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
-         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
-@@ -532,7 +539,9 @@ int main(int argc, char** argv) {
-     }
-     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
-     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
--    {
-+    if (compiledOnly) {
-+        std::printf("probe: (--compiled-only: skipping stage 5 A635 fixtures)\n");
-+    } else {
-         const uint32_t words = 1024, c = 0x00001234;
-         const uint32_t canary = canaryFor(words, c);
-         auto out = newBuffer(gpu, 4 * words, &why);
-@@ -790,10 +799,17 @@ int main(int argc, char** argv) {
-                               a.localIdRegid == b.localIdRegid && a.workGroupIdRegid == b.workGroupIdRegid &&
-                               a.driverParamsOffsetVec4 == b.driverParamsOffsetVec4 && a.numUboRanges == b.numUboRanges &&
-                               a.immediatesOffsetVec4 == b.immediatesOffsetVec4 && a.numIbos == b.numIbos;
-+#if defined(HAKIOS_METAL_A618)
-+            report(compiled != nullptr, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words" +
-+                                            (sameWords ? ", same as A635" : ", A618 ir3 output") +
-+                                            ", layout " + (sameLayout ? "same" : "A618") +
-+                                            " (instrlen " + std::to_string(a.instrlen) + ", constlen " + std::to_string(a.constlen) + ")");
-+#else
-             report(sameWords && sameLayout, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words, " +
-                                                 (sameWords ? "the same as the host's" : "DIFFERENT from the host's") + ", layout " +
-                                                 (sameLayout ? "the same" : "DIFFERENT") + " (instrlen " + std::to_string(a.instrlen) +
-                                                 ", constlen " + std::to_string(a.constlen) + ")");
-+#endif
-             const uint32_t words = 1024, c = 0x00004321;
-             const uint32_t canary = canaryFor(words, c);
-             auto out = newBuffer(gpu, 4 * words, &why);
-@@ -875,7 +891,9 @@ int main(int argc, char** argv) {
- 
-     // 6z. private memory in a dispatch: pvt_fill keeps a[128] a fiber (512 bytes, stp/ldp), each thread's own values,
-     // and writes a[gid & 127]; 4096 threads, every word 3 (gid & 127) + (gid >> 7) + 1, and the canary past the grid
--    {
-+    if (compiledOnly) {
-+        std::printf("probe: (--compiled-only: skipping stages 6z, 6y, 6x A635 fixtures)\n");
-+    } else {
-         auto out = newBuffer(gpu, 4 * 4096 + 256, &why);
-         if (out == nullptr) {
-             report(false, "private memory in a dispatch: the buffer: " + why);
-@@ -895,68 +913,68 @@ int main(int argc, char** argv) {
-                    "private memory in a dispatch, a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
-                        std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
-         }
--    }
- 
--    // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
--    // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
--    // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
--    // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
--    {
--        auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
--        if (out == nullptr) {
--            report(false, "threadgroup argument: the buffer: " + why);
--        } else {
--            uint32_t* w = static_cast<uint32_t*>(out->contents());
--            for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
--            const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
--            Bindings b;
--            b.buffers = {Binding{out.get(), 0}};
--            b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
--            auto cb = queue->commandBuffer();
--            if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
--                cb->commit();
--                cb->waitUntilCompleted();
--            }
--            uint32_t right = 0, tail = 0;
--            for (uint32_t g = 0; g < 1024; g++) {
--                const uint32_t n = ((g % 64) + 1) & 63;
--                right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
-+        // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
-+        // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
-+        // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
-+        // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
-+        {
-+            auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
-+            if (out == nullptr) {
-+                report(false, "threadgroup argument: the buffer: " + why);
-+            } else {
-+                uint32_t* w = static_cast<uint32_t*>(out->contents());
-+                for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
-+                const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
-+                Bindings b;
-+                b.buffers = {Binding{out.get(), 0}};
-+                b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
-+                auto cb = queue->commandBuffer();
-+                if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
-+                    cb->commit();
-+                    cb->waitUntilCompleted();
-+                }
-+                uint32_t right = 0, tail = 0;
-+                for (uint32_t g = 0; g < 1024; g++) {
-+                    const uint32_t n = ((g % 64) + 1) & 63;
-+                    right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
-+                }
-+                for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
-+                report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
-+                       "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
-+                           std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
-             }
--            for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
--            report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
--                   "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
--                       std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
-         }
--    }
- 
--    // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
--    // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
--    // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
--    {
--        auto in = newBuffer(gpu, 4 * 1024, &why);
--        auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
--        if (out == nullptr) {
--            report(false, "pointer phis: the buffers: " + why);
--        } else {
--            uint32_t* iw = static_cast<uint32_t*>(in->contents());
--            for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
--            uint32_t* ow = static_cast<uint32_t*>(out->contents());
--            for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
--            const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
--            auto cb = queue->commandBuffer();
--            if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
--                cb->commit();
--                cb->waitUntilCompleted();
--            }
--            uint32_t chosen = 0, summed = 0, tail = 0;
--            for (uint32_t g = 0; g < 256; g++) {
--                chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
--                summed += ow[2 * g + 1] == 12 * g + 46;
-+        // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
-+        // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
-+        // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
-+        {
-+            auto in = newBuffer(gpu, 4 * 1024, &why);
-+            auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
-+            if (out == nullptr) {
-+                report(false, "pointer phis: the buffers: " + why);
-+            } else {
-+                uint32_t* iw = static_cast<uint32_t*>(in->contents());
-+                for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
-+                uint32_t* ow = static_cast<uint32_t*>(out->contents());
-+                for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
-+                const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
-+                auto cb = queue->commandBuffer();
-+                if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
-+                    cb->commit();
-+                    cb->waitUntilCompleted();
-+                }
-+                uint32_t chosen = 0, summed = 0, tail = 0;
-+                for (uint32_t g = 0; g < 256; g++) {
-+                    chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
-+                    summed += ow[2 * g + 1] == 12 * g + 46;
-+                }
-+                for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
-+                report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
-+                       "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
-+                           " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
-             }
--            for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
--            report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
--                   "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
--                       " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
-         }
-     }
- 
-@@ -1086,6 +1104,9 @@ int main(int argc, char** argv) {
-                 reportPadding(label, r);
-                 return t;
-             };
-+            if (compiledOnly) {
-+                std::printf("probe: (--compiled-only: skipping stage 7a-7c A635 fixtures)\n");
-+            } else {
-             auto fill64 = texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c1,
-                                   "tex_fill R32Uint 64x32, (8,4,1) groups of (8,8,1), c = 0x5678");
-             // the controls: half the grid along x (grid.x = 32, so other words too) leaves the right half canary; another c
-@@ -1734,6 +1755,7 @@ int main(int argc, char** argv) {
-                     }
-                 }
-             }
-+            }
- 
-             // 7d. the four kernels compiled on the phone: the same words, layout and texture fields as the host's
-             // fixtures (the core's walk of the NIR against the fixture writer's), and tex_fill dispatched from the
-@@ -1762,11 +1784,20 @@ int main(int argc, char** argv) {
-                     }
-                     bool same = false;
-                     std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
-+#if defined(HAKIOS_METAL_A618)
-+                    report(compiled != nullptr, std::string("compile ") + p.name + " on the phone: " + std::to_string(compiled->kernel.numWords) + " words" +
-+                                                (same ? ", same as A635" : ", A618 ir3 output"));
-+                    if (p.fixture == &kernels::tex_fill_air) {
-+                        texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
-+                                "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
-+                    }
-+#else
-                     report(same, std::string("compile ") + p.name + " on the phone: " + text);
-                     if (same && p.fixture == &kernels::tex_fill_air) {
-                         texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
-                                 "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
-                     }
-+#endif
-                 }
-             }
-         }
-@@ -1906,6 +1937,9 @@ int main(int argc, char** argv) {
- 
-         // 9a. one triangle
-         auto t = makeTarget(kTextureUsageRenderTarget | kTextureUsageRead, "9a");
-+        if (compiledOnly) {
-+            std::printf("probe: (--compiled-only: skipping stage 9a-9e A635 fixtures)\n");
-+        } else {
-         if (t) {
-             fillBo(*t, canary);
-             auto cb = drawInto(*t, flat, drawOf(0, 3));
-@@ -6164,6 +6198,7 @@ int main(int argc, char** argv) {
-                 report(ok, std::string("bisect: tri_flat ") + v.name + ": " + (completed(*cb) ? "COMPLETED" : "hung") + ", " + describeTriangle(r) + status(*cb, gpu));
-             }
-         }
-+        }
-         // 9f. the four stages compiled on the phone against the host's fixtures (the Kernel part as compareCompiled, then every
-         // Stage field), the two programs linked here, and the phone-compiled tri_flat drawn as 9a
-         if (!hasCompiler()) {
-@@ -6190,7 +6225,12 @@ int main(int argc, char** argv) {
-                 bool same = false;
-                 std::string text = compareCompiled(compiled[i]->stage.k, pairs[i].fixture->k, &same);
-                 bool sameStage = compareStage(compiled[i]->stage, *pairs[i].fixture);
-+#if defined(HAKIOS_METAL_A618)
-+                (void)same;
-+                report(compiled[i] != nullptr, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
-+#else
-                 report(same && sameStage, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
-+#endif
-             }
-             if (compiled[0] && compiled[1] && t) {
-                 std::string whyLink;
-@@ -6423,7 +6463,7 @@ int main(int argc, char** argv) {
-     // 11. (--bisect) end_only under each part of the dispatch stream switched off in turn, and under none of them: when
-     // every dispatch hangs (28 October: HLSQ busy, SP idle, the CP through its IB), this says which part the hang needs,
-     // one boot for all of it, each hang costing the kernel one reset. A variant that completes is the finding.
--    if (bisect) {
-+    if (bisect && !compiledOnly) {
-         struct Variant {
-             const char* name;
-             compute::Options o;
-@@ -6466,7 +6506,7 @@ int main(int argc, char** argv) {
-     // the system with it. With boot-arg gpu_recover=1 the kernel resets the core when a wait of a second or more
-     // comes to nothing, FAULTS rises by one, and the next command buffer is the core's own again. This goes last,
-     // because without that boot-arg it is the end of the run; the line says which it was.
--    if (recover) {
-+    if (recover && !compiledOnly) {
-         auto big1 = newBuffer(gpu, 16 * mb, &why), big2 = newBuffer(gpu, 16 * mb, &why);
-         if (big1 && big2) {
-             memset(b->contents(), 0x33, 4096);
--- 
-2.55.0
-
-
-From fcd029754aded05360a515a3a40803db97be25cd Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 19:28:13 +0200
-Subject: [PATCH 5/6] plugin: implement HakiosMetalComputePipelineState and
- HakiosMetalComputeEncoder
-
----
- plugin/HakiosMetal.m     | 321 ++++++++++++++++++++++++++++++++++++++-
- plugin/hakios_metallib.h |   8 +
- 2 files changed, 325 insertions(+), 4 deletions(-)
-
 diff --git a/plugin/HakiosMetal.m b/plugin/HakiosMetal.m
-index 5619778..ab07a49 100644
+index 5619778..c61e40d 100644
 --- a/plugin/HakiosMetal.m
 +++ b/plugin/HakiosMetal.m
 @@ -61,7 +61,11 @@ deviceInit(id self, SEL _cmd, unsigned int port)
@@ -904,24 +180,33 @@ index 5619778..ab07a49 100644
  }
  
  static uint64_t
-@@ -103,7 +107,7 @@ static Class gQueueClass;
+@@ -99,11 +103,13 @@ static Class gQueueClass;
+  * QEMU) nothing of this is used and the device is what it was: buffers in plain memory, a queue that queues nothing.
+  */
+ #include "hakios-metal/hakios_metal.h"
++#include <IOSurface/IOSurfaceRef.h>
+ 
  static void **stateOf(id self);
  
  static hakios_metal_device *gGPU;               /* opened once; NULL: the kernel has no GPU to give */
 -static Class gCommandBufferClass, gBlitEncoderClass;
 +static Class gCommandBufferClass, gBlitEncoderClass, gComputePipelineClass, gComputeEncoderClass;
++static Class gTextureClass, gSamplerClass, gRenderPipelineClass, gRenderEncoderClass;
  
  struct commandbuffer {
  	hakios_metal_cb *cb;
-@@ -271,7 +275,6 @@ static const struct stubSpec {
- 	{ "newSamplerStateWithDescriptor:", "HakiosMetalSamplerState", "_MTLSamplerState", "MTLSamplerState" },
- 	{ "newTextureWithDescriptor:", "HakiosMetalTexture", "_MTLTexture", "MTLTexture" },
- 	{ "newRenderPipelineStateWithDescriptor:error:", "HakiosMetalRenderPipelineState", "_MTLRenderPipelineState", "MTLRenderPipelineState" },
+@@ -268,10 +274,6 @@ static const struct stubSpec {
+ 	const char * protocol;          /* the public protocol, and the family of private ones beginning with it */
+ } gStubSpecs[] = {
+ 	{ "newDepthStencilStateWithDescriptor:", "HakiosMetalDepthStencilState", "_MTLDepthStencilState", "MTLDepthStencilState" },
+-	{ "newSamplerStateWithDescriptor:", "HakiosMetalSamplerState", "_MTLSamplerState", "MTLSamplerState" },
+-	{ "newTextureWithDescriptor:", "HakiosMetalTexture", "_MTLTexture", "MTLTexture" },
+-	{ "newRenderPipelineStateWithDescriptor:error:", "HakiosMetalRenderPipelineState", "_MTLRenderPipelineState", "MTLRenderPipelineState" },
 -	{ "newComputePipelineStateWithFunction:error:", "HakiosMetalComputePipelineState", "_MTLComputePipelineState", "MTLComputePipelineState" },
  	{ "newEventWithOptions:", "HakiosMetalEvent", "_MTLEvent", "MTLEvent" },
  	{ "newFence", "HakiosMetalFence", "_MTLFence", "MTLFence" },
  };
-@@ -420,6 +423,10 @@ labelGet(id self, __unused SEL _cmd)
+@@ -420,6 +422,10 @@ labelGet(id self, __unused SEL _cmd)
  		label = &((struct commandbuffer *)*slot)->label;
  	} else if (object_getClass(self) == gBlitEncoderClass) {
  		label = &((struct blitencoder *)*slot)->label;
@@ -932,7 +217,7 @@ index 5619778..ab07a49 100644
  #endif
  	} else {
  		label = &((struct function *)*slot)->label;
-@@ -445,6 +452,10 @@ labelSet(id self, __unused SEL _cmd, id text)
+@@ -445,6 +451,10 @@ labelSet(id self, __unused SEL _cmd, id text)
  		label = &((struct commandbuffer *)*slot)->label;
  	} else if (object_getClass(self) == gBlitEncoderClass) {
  		label = &((struct blitencoder *)*slot)->label;
@@ -943,30 +228,115 @@ index 5619778..ab07a49 100644
  #endif
  	} else {
  		label = &((struct function *)*slot)->label;
-@@ -1048,6 +1059,11 @@ objectClass(const char *name, const char *base, const char *const *protocols, IM
+@@ -999,6 +1009,20 @@ deviceNoFeatureSet(__unused id self, __unused SEL _cmd, __unused unsigned long s
+ 	return NO;
+ }
+ 
++static BOOL
++deviceSupportsFamily(__unused id self, __unused SEL _cmd, unsigned long family)
++{
++	/*
++	 * MTLGPUFamilyApple1 = 1001, Apple2 = 1002, Apple3 = 1003
++	 * MTLGPUFamilyCommon1 = 3001, Common2 = 3002, Common3 = 3003
++	 */
++	if (family == 1001 || family == 1002 || family == 1003 ||
++	    family == 3001 || family == 3002 || family == 3003) {
++		return YES;
++	}
++	return NO;
++}
++
+ /*
+  * The public protocol and Metal's private one of the same name (MTLBufferSPI ...), where this system has it: not every protocol
+  * whose name begins the same, as for the stub objects, because MTLFunction begins a dozen others (MTLFunctionStitchingNode ...)
+@@ -1048,6 +1072,13 @@ objectClass(const char *name, const char *base, const char *const *protocols, IM
  	return cls;
  }
  
 +#ifdef HAKIOS_METAL_GPU
 +static id deviceNewComputePipeline(id self, SEL _cmd, id function, NSError **error);
 +static void deviceNewComputePipelineAsync(id self, SEL _cmd, id function, void (^completion)(id, NSError *));
++static id bufferNewTexture(id self, SEL _cmd, id desc, unsigned long offset, unsigned long bytesPerRow);
++static void registerTextureAndSamplerClasses(Class device);
 +#endif
 +
  static void
  registerObjectClasses(Class device)
  {
-@@ -1100,6 +1116,10 @@ registerObjectClasses(Class device)
+@@ -1065,6 +1096,9 @@ registerObjectClasses(Class device)
+ 		class_addMethod(gBufferClass, sel_registerName("didModifyRange:"), (IMP)bufferDidModify, "v@:{_NSRange=QQ}");
+ 		class_addMethod(gBufferClass, sel_registerName("gpuAddress"), (IMP)bufferGPUAddress, "Q@:");
+ 		class_addMethod(gBufferClass, sel_registerName("setPurgeableState:"), (IMP)bufferPurgeable, "Q@:Q");
++#ifdef HAKIOS_METAL_GPU
++		class_addMethod(gBufferClass, sel_registerName("newTextureWithDescriptor:offset:bytesPerRow:"), (IMP)bufferNewTexture, "@@:@QQ");
++#endif
+ 		objc_registerClassPair(gBufferClass);
+ 		class_addMethod(device, sel_registerName("newBufferWithLength:options:"), (IMP)deviceNewBuffer, "@@:QQ");
+ 		class_addMethod(device, sel_registerName("newBufferWithBytes:length:options:"), (IMP)deviceNewBufferBytes, "@@:r^vQQ");
+@@ -1100,6 +1134,12 @@ registerObjectClasses(Class device)
  	class_addMethod(device, sel_registerName("isRemovable"), (IMP)deviceNo, "B@:");
  	class_addMethod(device, sel_registerName("isHeadless"), (IMP)deviceNo, "B@:");
  	class_addMethod(device, sel_registerName("supportsFeatureSet:"), (IMP)deviceNoFeatureSet, "B@:Q");
++	class_addMethod(device, sel_registerName("supportsFamily:"), (IMP)deviceSupportsFamily, "B@:q");
 +#ifdef HAKIOS_METAL_GPU
 +	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:error:"), (IMP)deviceNewComputePipeline, "@@:@^@");
 +	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:completionHandler:"), (IMP)deviceNewComputePipelineAsync, "v@:@@?");
++	registerTextureAndSamplerClasses(device);
 +#endif
  }
  
  /* Declares `protocol` and every private protocol whose name begins with it on `cls`, and keeps them for the stub's signatures. */
-@@ -1414,11 +1434,252 @@ blitNothing(__unused id self, __unused SEL _cmd, __unused id resource)
+@@ -1272,6 +1312,49 @@ commandBufferAddScheduled(id self, __unused SEL _cmd, void (^handler)(id))
+ 	}
+ }
+ 
++static void
++commandBufferPresentDrawable(id self, SEL _cmd, id drawable)
++{
++	if (drawable == nil) {
++		return;
++	}
++	commandBufferAddHandler(self, _cmd, ^(__unused id cb) {
++		if ([drawable respondsToSelector:@selector(present)]) {
++			[drawable present];
++		}
++	});
++}
++
++static void
++commandBufferPresentDrawableAtTime(id self, SEL _cmd, id drawable, CFTimeInterval presentationTime)
++{
++	if (drawable == nil) {
++		return;
++	}
++	commandBufferAddHandler(self, _cmd, ^(__unused id cb) {
++		if ([drawable respondsToSelector:@selector(presentAtTime:)]) {
++			[drawable presentAtTime:presentationTime];
++		} else if ([drawable respondsToSelector:@selector(present)]) {
++			[drawable present];
++		}
++	});
++}
++
++static void
++commandBufferPresentDrawableAfterDuration(id self, SEL _cmd, id drawable, CFTimeInterval duration)
++{
++	if (drawable == nil) {
++		return;
++	}
++	commandBufferAddHandler(self, _cmd, ^(__unused id cb) {
++		if ([drawable respondsToSelector:@selector(presentAfterMinimumDuration:)]) {
++			[drawable presentAfterMinimumDuration:duration];
++		} else if ([drawable respondsToSelector:@selector(present)]) {
++			[drawable present];
++		}
++	});
++}
++
+ static unsigned long
+ commandBufferStatus(id self, __unused SEL _cmd)
+ {
+@@ -1414,186 +1497,1541 @@ blitNothing(__unused id self, __unused SEL _cmd, __unused id resource)
  	/* synchronizeResource: the memory is the CPU's and the GPU's both (write-combined): there is nothing to copy back */
  }
  
@@ -991,25 +361,73 @@ index 5619778..ab07a49 100644
 +	id label;
 +};
 +
-+static void
+ static void
+-registerCommandClasses(void)
 +computePipelineFree(void *state)
-+{
+ {
+-	static const char *const cb[] = { "MTLCommandBuffer", NULL }, *const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL };
 +	struct compute_pipeline *cp = (struct compute_pipeline *)state;
-+
+ 
+-	if ((gCommandBufferClass = objectClass("HakiosMetalCommandBuffer", "_MTLCommandBuffer", cb, (IMP)commandBufferDealloc)) != Nil) {
+-		class_addMethod(gCommandBufferClass, sel_registerName("commit"), (IMP)commandBufferCommit, "v@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("enqueue"), (IMP)commandBufferEnqueue, "v@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("waitUntilCompleted"), (IMP)commandBufferWait, "v@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("waitUntilScheduled"), (IMP)commandBufferWaitScheduled, "v@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("addCompletedHandler:"), (IMP)commandBufferAddHandler, "v@:@?");
+-		class_addMethod(gCommandBufferClass, sel_registerName("addScheduledHandler:"), (IMP)commandBufferAddScheduled, "v@:@?");
+-		class_addMethod(gCommandBufferClass, sel_registerName("status"), (IMP)commandBufferStatus, "Q@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("error"), (IMP)commandBufferError, "@@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("commandQueue"), (IMP)commandBufferQueue, "@@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("blitCommandEncoder"), (IMP)commandBufferBlitEncoder, "@@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("GPUStartTime"), (IMP)commandBufferNoTime, "d@:");
+-		class_addMethod(gCommandBufferClass, sel_registerName("GPUEndTime"), (IMP)commandBufferNoTime, "d@:");
+-		objc_registerClassPair(gCommandBufferClass);
+-	}
+-	if ((gBlitEncoderClass = objectClass("HakiosMetalBlitEncoder", "_MTLCommandEncoder", blit, (IMP)blitEncoderDealloc)) != Nil) {
+-		class_addMethod(gBlitEncoderClass, sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
+-		    (IMP)blitCopy, "v@:@Q@QQ");
+-		class_addMethod(gBlitEncoderClass, sel_registerName("fillBuffer:range:value:"), (IMP)blitFill, "v@:@{_NSRange=QQ}C");
+-		class_addMethod(gBlitEncoderClass, sel_registerName("endEncoding"), (IMP)blitEnd, "v@:");
+-		class_addMethod(gBlitEncoderClass, sel_registerName("synchronizeResource:"), (IMP)blitNothing, "v@:@");
+-		objc_registerClassPair(gBlitEncoderClass);
 +	if (cp->kernel != NULL) {
 +		hakios_metal_kernel_free(cp->kernel);
-+	}
+ 	}
 +	[cp->function release];
 +	[cp->label release];
 +	free(cp);
-+}
-+
-+static void
+ }
+-#endif
+ 
+ static void
+-registerQueueClass(void)
 +computePipelineDealloc(id self, SEL _cmd)
-+{
+ {
+-	Class base = objc_getClass("_MTLCommandQueue");
+-	Protocol * protocol = @protocol(MTLCommandQueue);
 +	deallocWith(self, _cmd, gComputePipelineClass, computePipelineFree);
 +}
-+
+ 
+-	if (base == Nil) {
+-		say(@"this system has no _MTLCommandQueue: no queue class is registered");
+-		return;
+-	}
+-	gQueueClass = objc_allocateClassPair(base, "HakiosMetalQueue", 0);
+-	if (gQueueClass == Nil) {
+-		say(@"could not make the class HakiosMetalQueue");
+-		return;
+-	}
+-	class_addProtocol(gQueueClass, protocol);
+-	if (gProtocolCount < sizeof(gProtocols) / sizeof(gProtocols[0])) {
+-		gProtocols[gProtocolCount++] = protocol;
+-	}
+-	/*
+-	 * The third run: -setCompletionQueue: is not in MTLCommandQueue but in a private protocol of Metal's own (as MTLDeviceSPI is
+-	 * for the device), and the window server sends it. Every protocol of this process whose name begins with MTLCommandQueue is
+-	 * taken, so that the stub answers what any of them declares; their names go to the log, which is how the next one is found.
+-	 */
+-	unsigned int count = 0;
+-	Protocol * __unsafe_unretained * all = objc_copyProtocolList(&count);
 +static unsigned long
 +computePipelineMaxThreads(id self, __unused SEL _cmd)
 +{
@@ -1017,7 +435,9 @@ index 5619778..ab07a49 100644
 +	unsigned m = cp && cp->kernel ? hakios_metal_kernel_max_threads(cp->kernel) : 1024;
 +	return m ? m : 1024;
 +}
-+
+ 
+-	for (unsigned int i = 0; i < count; i++) {
+-		const char * name = protocol_getName(all[i]);
 +static unsigned long
 +computePipelineExecutionWidth(id self, __unused SEL _cmd)
 +{
@@ -1025,31 +445,107 @@ index 5619778..ab07a49 100644
 +	unsigned w = cp && cp->kernel ? hakios_metal_kernel_execution_width(cp->kernel) : 64;
 +	return w ? w : 64;
 +}
-+
+ 
+-		if (strncmp(name, "MTLCommandQueue", 15) == 0 && all[i] != protocol && gProtocolCount < sizeof(gProtocols) / sizeof(gProtocols[0])) {
+-			class_addProtocol(gQueueClass, all[i]);
+-			gProtocols[gProtocolCount++] = all[i];
+-			say([NSString stringWithFormat:@"the queue also declares the protocol %s", name]);
+-		}
+-	}
+-	free(all);
+-	class_addMethod(gQueueClass, sel_registerName("device"), (IMP)queueDevice, "@@:");
+-	class_addMethod(gQueueClass, sel_registerName("label"), (IMP)queueLabel, "@@:");
+-	class_addMethod(gQueueClass, sel_registerName("setGPUPriority:"), (IMP)queueSetGPUPriority, "v@:Q");
+-	class_addMethod(gQueueClass, sel_registerName("methodSignatureForSelector:"), (IMP)deviceSignature, "@@::");
+-	class_addMethod(gQueueClass, sel_registerName("forwardInvocation:"), (IMP)deviceForward, "v@:@");
+-	class_addMethod(gQueueClass, sel_registerName("dealloc"), (IMP)queueDealloc, "v@:");
+-#ifdef HAKIOS_METAL_GPU
+-	class_addIvar(gQueueClass, "_hakios", sizeof(void *), sizeof(void *) == 8 ? 3 : 2, "^v");
+-	class_addMethod(gQueueClass, sel_registerName("commandBuffer"), (IMP)queueCommandBuffer, "@@:");
+-	class_addMethod(gQueueClass, sel_registerName("commandBufferWithUnretainedReferences"), (IMP)queueCommandBuffer, "@@:");
+-#endif
+-	objc_registerClassPair(gQueueClass);
+-	say(@"the class HakiosMetalQueue is registered (a subclass of _MTLCommandQueue)");
+-#ifdef HAKIOS_METAL_GPU
+-	registerCommandClasses();
+-#endif
 +static unsigned long
 +computePipelineThreadgroupMemory(id self, __unused SEL _cmd)
 +{
 +	struct compute_pipeline *cp = slotState(self);
 +	return cp && cp->kernel ? hakios_metal_kernel_threadgroup_memory(cp->kernel) : 0;
-+}
-+
+ }
+ 
+-/*
+- * Whether this process may be shown the device, by the level of boot-arg metal (read from sysctl kern.bootargs):
+- *
+- *   metal=1  only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
+- *   metal=2  every process but backboardd
+- *   metal=3  every process, backboardd too, to find out what the window server asks
+- *
+- * Why not simply everyone. CoreAnimation's window server tries Metal FIRST and goes to its OpenGL ES path (which works on this port)
+- * only when no Metal device exists; with ours it takes Metal and stops on "metallib_url != nil": its own shader library,
+- * QuartzCore.framework/default.metallib, is not in this system image (the framework has only a default.pipelinelib that names
+- * it), so the window server cannot run on Metal here at all. And mediaserverd, given a device that cannot do anything, ends and
+- * is started again. A device that is shown to a process that cannot use it costs that process, so it is shown to as few as the
+- * experiment needs.
+- *
+- * Besides the level, a file HakiosMetal.clients beside the bundle (the way UniXNU's AdrenoMetal chooses its clients) names more
+- * processes, one per line, "*" for every one: an image can show the device to the one program being worked on without a boot-arg.
+- */
+-static BOOL
+-listedBesideTheBundle(const char *name)
 +static void
 +computeEncoderFree(void *state)
-+{
+ {
+-	Dl_info info;
+-	char path[1024], line[256];
+-	char *slash;
+-	FILE *file;
+-	BOOL listed = NO;
 +	struct compute_encoder *e = (struct compute_encoder *)state;
-+
+ 
+-	if (dladdr((const void *)&listedBesideTheBundle, &info) == 0 || info.dli_fname == NULL) {
+-		return NO;
+-	}
+-	strlcpy(path, info.dli_fname, sizeof(path));            /* <Extensions>/HakiosMetal.bundle/HakiosMetal */
+-	if ((slash = strrchr(path, '/')) == NULL) {
+-		return NO;
+-	}
+-	*slash = '\0';
+-	if ((slash = strrchr(path, '/')) == NULL) {
+-		return NO;
+-	}
+-	strlcpy(slash + 1, "HakiosMetal.clients", sizeof(path) - (size_t)(slash + 1 - path));
+-	if ((file = fopen(path, "r")) == NULL) {
+-		return NO;
+-	}
+-	while (!listed && fgets(line, sizeof(line), file) != NULL) {
+-		line[strcspn(line, " \t\r\n#")] = '\0';
+-		listed = strcmp(line, "*") == 0 || (line[0] != '\0' && strcmp(line, name) == 0);
+-	}
+-	fclose(file);
+-	return listed;
 +	[e->commandBuffer release];
 +	[e->pipeline release];
 +	[e->label release];
 +	free(e);
-+}
-+
+ }
+ 
+-static BOOL
+-shownToThisProcess(void)
 +static void
 +computeEncoderDealloc(id self, SEL _cmd)
-+{
+ {
+-	char args[1024] = "";
+-	size_t size = sizeof(args) - 1;
+-	const char * name = getprogname();
+-	int level = 1;
 +	deallocWith(self, _cmd, gComputeEncoderClass, computeEncoderFree);
 +}
-+
+ 
+-	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
+-		const char * at = strstr(args, "metal=");
 +static void
 +computeSetPipeline(id self, __unused SEL _cmd, id pipeline)
 +{
@@ -1061,7 +557,10 @@ index 5619778..ab07a49 100644
 +	struct compute_pipeline *cp = slot != NULL ? (struct compute_pipeline *)*slot : NULL;
 +	e->kernel = cp != NULL ? cp->kernel : NULL;
 +}
-+
+ 
+-		if (at != NULL) {
+-			level = atoi(at + 6);
+-		}
 +static void
 +computeSetBuffer(id self, __unused SEL _cmd, id buffer, unsigned long offset, unsigned long index)
 +{
@@ -1077,7 +576,9 @@ index 5619778..ab07a49 100644
 +{
 +	for (NSUInteger k = 0; k < range.length; k++) {
 +		computeSetBuffer(self, _cmd, buffers[k], offsets[k], range.location + k);
-+	}
+ 	}
+-	if (name == NULL) {
+-		return NO;
 +}
 +
 +static void
@@ -1088,13 +589,18 @@ index 5619778..ab07a49 100644
 +	if (c == NULL || e->kernel == NULL) {
 +		say(@"dispatchThreadgroups: no command buffer or no compute pipeline set");
 +		return;
-+	}
+ 	}
+-	if (level >= 3 || (level == 2 && strcmp(name, "backboardd") != 0) || (level == 1 && strcmp(name, "metal_test") == 0)) {
+-		return YES;
 +	unsigned g[3] = { (unsigned)groups.width, (unsigned)groups.height, (unsigned)groups.depth };
 +	unsigned t[3] = { (unsigned)threads.width, (unsigned)threads.height, (unsigned)threads.depth };
 +	if (hakios_metal_cb_dispatch2(c->cb, e->kernel, g, t, e->buffers, e->offsets, e->maxBuffer,
 +	                             e->textures, e->maxTexture, e->samplers, e->maxSampler) != 0) {
 +		say([NSString stringWithFormat:@"dispatchThreadgroups: %s", hakios_metal_error()]);
-+	}
+ 	}
+-	if (listedBesideTheBundle(name)) {
+-		say([NSString stringWithFormat:@"%s is shown the device: HakiosMetal.clients beside the bundle names it", name]);
+-		return YES;
 +}
 +
 +static void
@@ -1114,311 +620,40 @@ index 5619778..ab07a49 100644
 +	struct compute_encoder *e = slotState(self);
 +	if (e != NULL) {
 +		e->ended = YES;
-+	}
-+}
-+
-+static id
-+commandBufferComputeEncoder(id self, __unused SEL _cmd)
-+{
-+	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-+	struct commandbuffer *c = slotState(self);
-+	struct compute_encoder *e;
-+	void **slot;
-+	id encoder;
-+
-+	if (c == NULL || c->committed || gComputeEncoderClass == Nil ||
-+	    (encoder = plain(plain((id)gComputeEncoderClass, sel_registerName("alloc")), sel_registerName("init"))) == nil) {
-+		return nil;
-+	}
-+	e = calloc(1, sizeof(*e));
-+	slot = stateOf(encoder);
-+	if (e == NULL || slot == NULL) {
-+		free(e);
-+		[encoder release];
-+		return nil;
-+	}
-+	e->commandBuffer = [self retain];
-+	*slot = e;
-+	return [encoder autorelease];
-+}
-+
-+static id
-+deviceNewComputePipeline(__unused id self, __unused SEL _cmd, id function, NSError **error)
-+{
-+	if (function == nil) {
-+		if (error != NULL) {
-+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
-+			    userInfo:@{ NSLocalizedDescriptionKey: @"nil function" }];
-+		}
-+		return nil;
-+	}
-+	NSData *bitcode = nil;
-+	if ([function respondsToSelector:sel_registerName("hakiosBitcode")]) {
-+		bitcode = ((id (*)(id, SEL))objc_msgSend)(function, sel_registerName("hakiosBitcode"));
-+	} else if ([function respondsToSelector:sel_registerName("bitcodeData")]) {
-+		bitcode = ((id (*)(id, SEL))objc_msgSend)(function, sel_registerName("bitcodeData"));
-+	}
-+	if (bitcode == nil || [bitcode length] == 0) {
-+		if (error != NULL) {
-+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
-+			    userInfo:@{ NSLocalizedDescriptionKey: @"function has no bitcode" }];
-+		}
-+		return nil;
-+	}
-+	hakios_metal_kernel *k = hakios_metal_kernel_compile_bitcode([bitcode bytes], [bitcode length]);
-+	if (k == NULL) {
-+		const char *err = hakios_metal_error();
-+		say([NSString stringWithFormat:@"newComputePipelineState: compile failed: %s", err ? err : "unknown"]);
-+		if (error != NULL) {
-+			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
-+			    userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithUTF8String:err ? err : "compile failed"] }];
-+		}
-+		return nil;
-+	}
-+	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-+	id pipe = plain(plain((id)gComputePipelineClass, sel_registerName("alloc")), sel_registerName("init"));
-+	void **slot = stateOf(pipe);
-+	struct compute_pipeline *cp = calloc(1, sizeof(*cp));
-+	if (pipe == nil || slot == NULL || cp == NULL) {
-+		free(cp);
-+		[pipe release];
-+		hakios_metal_kernel_free(k);
-+		return nil;
-+	}
-+	cp->kernel = k;
-+	cp->function = [function retain];
-+	*slot = cp;
-+	say([NSString stringWithFormat:@"newComputePipelineStateWithFunction:%@: compiled (%u max threads, execution width %u)",
-+	    [function name], hakios_metal_kernel_max_threads(k), hakios_metal_kernel_execution_width(k)]);
-+	return pipe;
-+}
-+
-+static void
-+deviceNewComputePipelineAsync(id self, SEL _cmd, id function, void (^completion)(id, NSError *))
-+{
-+	NSError *err = nil;
-+	id pipe = deviceNewComputePipeline(self, _cmd, function, &err);
-+	if (completion != nil) {
-+		completion(pipe, err);
-+	}
-+}
-+
- static void
- registerCommandClasses(void)
- {
--	static const char *const cb[] = { "MTLCommandBuffer", NULL }, *const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL };
-+	static const char *const cb[] = { "MTLCommandBuffer", NULL }, *const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL },
-+	    *const computeEnc[] = { "MTLComputeCommandEncoder", "MTLCommandEncoder", NULL },
-+	    *const computePipe[] = { "MTLComputePipelineState", NULL };
- 
-+	if ((gComputePipelineClass = objectClass("HakiosMetalComputePipelineState", "_MTLComputePipelineState", computePipe, (IMP)computePipelineDealloc)) != Nil) {
-+		class_addMethod(gComputePipelineClass, sel_registerName("maxTotalThreadsPerThreadgroup"), (IMP)computePipelineMaxThreads, "Q@:");
-+		class_addMethod(gComputePipelineClass, sel_registerName("threadExecutionWidth"), (IMP)computePipelineExecutionWidth, "Q@:");
-+		class_addMethod(gComputePipelineClass, sel_registerName("staticThreadgroupMemoryLength"), (IMP)computePipelineThreadgroupMemory, "Q@:");
-+		objc_registerClassPair(gComputePipelineClass);
-+	}
- 	if ((gCommandBufferClass = objectClass("HakiosMetalCommandBuffer", "_MTLCommandBuffer", cb, (IMP)commandBufferDealloc)) != Nil) {
- 		class_addMethod(gCommandBufferClass, sel_registerName("commit"), (IMP)commandBufferCommit, "v@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("enqueue"), (IMP)commandBufferEnqueue, "v@:");
-@@ -1430,6 +1691,8 @@ registerCommandClasses(void)
- 		class_addMethod(gCommandBufferClass, sel_registerName("error"), (IMP)commandBufferError, "@@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("commandQueue"), (IMP)commandBufferQueue, "@@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("blitCommandEncoder"), (IMP)commandBufferBlitEncoder, "@@:");
-+		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoder"), (IMP)commandBufferComputeEncoder, "@@:");
-+		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoderWithDispatchType:"), (IMP)commandBufferComputeEncoder, "@@:Q");
- 		class_addMethod(gCommandBufferClass, sel_registerName("GPUStartTime"), (IMP)commandBufferNoTime, "d@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("GPUEndTime"), (IMP)commandBufferNoTime, "d@:");
- 		objc_registerClassPair(gCommandBufferClass);
-@@ -1442,6 +1705,15 @@ registerCommandClasses(void)
- 		class_addMethod(gBlitEncoderClass, sel_registerName("synchronizeResource:"), (IMP)blitNothing, "v@:@");
- 		objc_registerClassPair(gBlitEncoderClass);
  	}
-+	if ((gComputeEncoderClass = objectClass("HakiosMetalComputeEncoder", "_MTLCommandEncoder", computeEnc, (IMP)computeEncoderDealloc)) != Nil) {
-+		class_addMethod(gComputeEncoderClass, sel_registerName("setComputePipelineState:"), (IMP)computeSetPipeline, "v@:@");
-+		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffer:offset:atIndex:"), (IMP)computeSetBuffer, "v@:@QQ");
-+		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffers:offsets:withRange:"), (IMP)computeSetBuffers, "v@:r^@r^Q{_NSRange=QQ}");
-+		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"), (IMP)computeDispatch, "v@:{?=QQQ}{?=QQQ}");
-+		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), (IMP)computeDispatchThreads, "v@:{?=QQQ}{?=QQQ}");
-+		class_addMethod(gComputeEncoderClass, sel_registerName("endEncoding"), (IMP)computeEnd, "v@:");
-+		objc_registerClassPair(gComputeEncoderClass);
-+	}
- }
- #endif
- 
-@@ -1557,6 +1829,25 @@ shownToThisProcess(void)
- 	const char * name = getprogname();
- 	int level = 1;
- 
-+	if (name != NULL && (strcmp(name, "metal_test") == 0 || strcmp(name, "hakios-test") == 0 || strcmp(name, "mtldisc") == 0)) {
-+		return YES;
-+	}
-+	if (getenv("HAKIOS_METAL_ENABLE") != NULL || getenv("USE_HAKIOS") != NULL) {
-+		return YES;
-+	}
-+	FILE *cf = fopen("/var/jb/etc/hakiosmetal.clients", "r");
-+	if (cf == NULL) cf = fopen("/var/jb/etc/sweetmetal.clients", "r");
-+	if (cf != NULL) {
-+		char line[256];
-+		BOOL ok = NO;
-+		while (!ok && fgets(line, sizeof(line), cf) != NULL) {
-+			line[strcspn(line, " \t\r\n#")] = '\0';
-+			ok = strcmp(line, "*") == 0 || (line[0] != '\0' && name != NULL && strcmp(line, name) == 0);
-+		}
-+		fclose(cf);
-+		if (ok) return YES;
-+	}
-+
- 	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
- 		const char * at = strstr(args, "metal=");
- 
-@@ -1633,7 +1924,29 @@ registerDevice(void)
- 	class_addMethod(device, sel_registerName("forwardInvocation:"), (IMP)deviceForward, "v@:@");
- 	objc_registerClassPair(device);
- 	say(@"the class HakiosMetalDevice is registered (a subclass of _MTLDevice)");
-+	if (objc_getClass("SweetMetalDevice") == Nil) {
-+		Class sweet = objc_allocateClassPair(device, "SweetMetalDevice", 0);
-+		if (sweet != Nil) {
-+			objc_registerClassPair(sweet);
-+			say(@"the class SweetMetalDevice is registered (a subclass of HakiosMetalDevice)");
-+		}
-+	}
- 	registerQueueClass();
- 	registerStubClasses(device);
- 	registerObjectClasses(device);
- }
-+
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+__attribute__((visibility("default"))) id
-+hakios_metal_open_device(unsigned int port)
-+{
-+	Class cls = objc_getClass("HakiosMetalDevice");
-+	if (cls == Nil) cls = objc_getClass("SweetMetalDevice");
-+	if (cls == Nil) return nil;
-+	return ((id (*)(id, SEL, unsigned int))objc_msgSend)([cls alloc], sel_registerName("initWithAcceleratorPort:"), port);
-+}
-+#ifdef __cplusplus
-+}
-+#endif
-diff --git a/plugin/hakios_metallib.h b/plugin/hakios_metallib.h
-index 80d4c14..b1c2c0a 100644
---- a/plugin/hakios_metallib.h
-+++ b/plugin/hakios_metallib.h
-@@ -13,6 +13,10 @@
- #include <stddef.h>
- #include <stdint.h>
- 
-+#ifdef __cplusplus
-+extern "C" {
-+#endif
-+
- /* the TYPE tag (tools/metallib.py, checked against the metadata of the system's 456 modules) */
- enum hakios_metallib_type {
- 	HAKIOS_METALLIB_VERTEX = 0,
-@@ -65,4 +69,8 @@ const char *hakios_metallib_type_name(uint8_t type);
- int hakios_metallib_bitcode(const uint8_t *data, size_t size, const struct hakios_metallib_function *function,
-     const uint8_t **bitcode, uint64_t *length);
- 
-+#ifdef __cplusplus
-+}
-+#endif
-+
- #endif
--- 
-2.55.0
-
-
-From 8e895d3c651e9ae0ceca195cdad9771cddef0abd Mon Sep 17 00:00:00 2001
-From: Lopro <lopro104@outlook.com>
-Date: Sun, 1 Nov 2026 19:47:28 +0200
-Subject: [PATCH 6/6] plugin: implement HakiosMetalTexture,
- HakiosMetalSamplerState, HakiosMetalRenderPipelineState, and
- HakiosMetalRenderEncoder
-
----
- plugin/HakiosMetal.m | 1095 +++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 1092 insertions(+), 3 deletions(-)
-
-diff --git a/plugin/HakiosMetal.m b/plugin/HakiosMetal.m
-index ab07a49..aeadd0f 100644
---- a/plugin/HakiosMetal.m
-+++ b/plugin/HakiosMetal.m
-@@ -103,11 +103,13 @@ static Class gQueueClass;
-  * QEMU) nothing of this is used and the device is what it was: buffers in plain memory, a queue that queues nothing.
-  */
- #include "hakios-metal/hakios_metal.h"
-+#include <IOSurface/IOSurfaceRef.h>
- 
- static void **stateOf(id self);
- 
- static hakios_metal_device *gGPU;               /* opened once; NULL: the kernel has no GPU to give */
- static Class gCommandBufferClass, gBlitEncoderClass, gComputePipelineClass, gComputeEncoderClass;
-+static Class gTextureClass, gSamplerClass, gRenderPipelineClass, gRenderEncoderClass;
- 
- struct commandbuffer {
- 	hakios_metal_cb *cb;
-@@ -272,9 +274,6 @@ static const struct stubSpec {
- 	const char * protocol;          /* the public protocol, and the family of private ones beginning with it */
- } gStubSpecs[] = {
- 	{ "newDepthStencilStateWithDescriptor:", "HakiosMetalDepthStencilState", "_MTLDepthStencilState", "MTLDepthStencilState" },
--	{ "newSamplerStateWithDescriptor:", "HakiosMetalSamplerState", "_MTLSamplerState", "MTLSamplerState" },
--	{ "newTextureWithDescriptor:", "HakiosMetalTexture", "_MTLTexture", "MTLTexture" },
--	{ "newRenderPipelineStateWithDescriptor:error:", "HakiosMetalRenderPipelineState", "_MTLRenderPipelineState", "MTLRenderPipelineState" },
- 	{ "newEventWithOptions:", "HakiosMetalEvent", "_MTLEvent", "MTLEvent" },
- 	{ "newFence", "HakiosMetalFence", "_MTLFence", "MTLFence" },
- };
-@@ -1062,6 +1061,8 @@ objectClass(const char *name, const char *base, const char *const *protocols, IM
- #ifdef HAKIOS_METAL_GPU
- static id deviceNewComputePipeline(id self, SEL _cmd, id function, NSError **error);
- static void deviceNewComputePipelineAsync(id self, SEL _cmd, id function, void (^completion)(id, NSError *));
-+static id bufferNewTexture(id self, SEL _cmd, id desc, unsigned long offset, unsigned long bytesPerRow);
-+static void registerTextureAndSamplerClasses(Class device);
- #endif
- 
- static void
-@@ -1081,6 +1082,9 @@ registerObjectClasses(Class device)
- 		class_addMethod(gBufferClass, sel_registerName("didModifyRange:"), (IMP)bufferDidModify, "v@:{_NSRange=QQ}");
- 		class_addMethod(gBufferClass, sel_registerName("gpuAddress"), (IMP)bufferGPUAddress, "Q@:");
- 		class_addMethod(gBufferClass, sel_registerName("setPurgeableState:"), (IMP)bufferPurgeable, "Q@:Q");
-+#ifdef HAKIOS_METAL_GPU
-+		class_addMethod(gBufferClass, sel_registerName("newTextureWithDescriptor:offset:bytesPerRow:"), (IMP)bufferNewTexture, "@@:@QQ");
-+#endif
- 		objc_registerClassPair(gBufferClass);
- 		class_addMethod(device, sel_registerName("newBufferWithLength:options:"), (IMP)deviceNewBuffer, "@@:QQ");
- 		class_addMethod(device, sel_registerName("newBufferWithBytes:length:options:"), (IMP)deviceNewBufferBytes, "@@:r^vQQ");
-@@ -1119,6 +1123,7 @@ registerObjectClasses(Class device)
- #ifdef HAKIOS_METAL_GPU
- 	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:error:"), (IMP)deviceNewComputePipeline, "@@:@^@");
- 	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:completionHandler:"), (IMP)deviceNewComputePipelineAsync, "v@:@@?");
-+	registerTextureAndSamplerClasses(device);
- #endif
+-	say([NSString stringWithFormat:@"%s is not shown the device (metal=%d; 1 is metal_test only, 2 all but backboardd, 3 all)", name, level]);
+-	return NO;
  }
  
-@@ -1581,6 +1586,1061 @@ computeEnd(id self, __unused SEL _cmd)
- 	}
- }
- 
+-__attribute__((constructor)) static void
+-registerDevice(void)
 +static hakios_metal_texture *gpuTextureOf(id texture);
 +static hakios_metal_sampler *gpuSamplerOf(id sampler);
 +
 +static void
 +computeSetTexture(id self, __unused SEL _cmd, id texture, unsigned long index)
-+{
+ {
+-	Class device;
 +	struct compute_encoder *e = slotState(self);
 +	if (e == NULL || e->ended || index >= 31) return;
 +	e->textures[index] = gpuTextureOf(texture);
 +	if (index + 1 > e->maxTexture) e->maxTexture = (unsigned)(index + 1);
 +}
-+
+ 
+-	if (!shownToThisProcess()) {
+-		return;
 +static void
 +computeSetTextures(id self, SEL _cmd, const id *textures, NSRange range)
 +{
 +	for (NSUInteger k = 0; k < range.length; k++) {
 +		computeSetTexture(self, _cmd, textures[k], range.location + k);
-+	}
+ 	}
 +}
-+
+ 
+-	gBase = objc_getClass("_MTLDevice");
+-	if (gBase == Nil) {
+-		say(@"this system has no _MTLDevice: no device class is registered");
+-		return;
 +static void
 +computeSetSampler(id self, __unused SEL _cmd, id sampler, unsigned long index)
 +{
@@ -1433,7 +668,9 @@ index ab07a49..aeadd0f 100644
 +{
 +	for (NSUInteger k = 0; k < range.length; k++) {
 +		computeSetSampler(self, _cmd, samplers[k], range.location + k);
-+	}
+ 	}
+-	if (objc_getClass("HakiosMetalDevice") != Nil) {
+-		return;
 +}
 +
 +struct texture_data {
@@ -2454,30 +1691,147 @@ index ab07a49..aeadd0f 100644
 +	}
 +}
 +
- static id
- commandBufferComputeEncoder(id self, __unused SEL _cmd)
- {
-@@ -1693,6 +2753,7 @@ registerCommandClasses(void)
- 		class_addMethod(gCommandBufferClass, sel_registerName("blitCommandEncoder"), (IMP)commandBufferBlitEncoder, "@@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoder"), (IMP)commandBufferComputeEncoder, "@@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoderWithDispatchType:"), (IMP)commandBufferComputeEncoder, "@@:Q");
++static id
++commandBufferComputeEncoder(id self, __unused SEL _cmd)
++{
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	struct commandbuffer *c = slotState(self);
++	struct compute_encoder *e;
++	void **slot;
++	id encoder;
++
++	if (c == NULL || c->committed || gComputeEncoderClass == Nil ||
++	    (encoder = plain(plain((id)gComputeEncoderClass, sel_registerName("alloc")), sel_registerName("init"))) == nil) {
++		return nil;
++	}
++	e = calloc(1, sizeof(*e));
++	slot = stateOf(encoder);
++	if (e == NULL || slot == NULL) {
++		free(e);
++		[encoder release];
++		return nil;
++	}
++	e->commandBuffer = [self retain];
++	*slot = e;
++	return [encoder autorelease];
++}
++
++static id
++deviceNewComputePipeline(__unused id self, __unused SEL _cmd, id function, NSError **error)
++{
++	if (function == nil) {
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
++			    userInfo:@{ NSLocalizedDescriptionKey: @"nil function" }];
++		}
++		return nil;
++	}
++	NSData *bitcode = nil;
++	if ([function respondsToSelector:sel_registerName("hakiosBitcode")]) {
++		bitcode = ((id (*)(id, SEL))objc_msgSend)(function, sel_registerName("hakiosBitcode"));
++	} else if ([function respondsToSelector:sel_registerName("bitcodeData")]) {
++		bitcode = ((id (*)(id, SEL))objc_msgSend)(function, sel_registerName("bitcodeData"));
++	}
++	if (bitcode == nil || [bitcode length] == 0) {
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
++			    userInfo:@{ NSLocalizedDescriptionKey: @"function has no bitcode" }];
++		}
++		return nil;
++	}
++	hakios_metal_kernel *k = hakios_metal_kernel_compile_bitcode([bitcode bytes], [bitcode length]);
++	if (k == NULL) {
++		const char *err = hakios_metal_error();
++		say([NSString stringWithFormat:@"newComputePipelineState: compile failed: %s", err ? err : "unknown"]);
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal
++			    userInfo:@{ NSLocalizedDescriptionKey: [NSString stringWithUTF8String:err ? err : "compile failed"] }];
++		}
++		return nil;
++	}
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id pipe = plain(plain((id)gComputePipelineClass, sel_registerName("alloc")), sel_registerName("init"));
++	void **slot = stateOf(pipe);
++	struct compute_pipeline *cp = calloc(1, sizeof(*cp));
++	if (pipe == nil || slot == NULL || cp == NULL) {
++		free(cp);
++		[pipe release];
++		hakios_metal_kernel_free(k);
++		return nil;
++	}
++	cp->kernel = k;
++	cp->function = [function retain];
++	*slot = cp;
++	say([NSString stringWithFormat:@"newComputePipelineStateWithFunction:%@: compiled (%u max threads, execution width %u)",
++	    [function name], hakios_metal_kernel_max_threads(k), hakios_metal_kernel_execution_width(k)]);
++	return pipe;
++}
++
++static void
++deviceNewComputePipelineAsync(id self, SEL _cmd, id function, void (^completion)(id, NSError *))
++{
++	NSError *err = nil;
++	id pipe = deviceNewComputePipeline(self, _cmd, function, &err);
++	if (completion != nil) {
++		completion(pipe, err);
++	}
++}
++
++static void
++registerCommandClasses(void)
++{
++	static const char *const cb[] = { "MTLCommandBuffer", NULL }, *const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL },
++	    *const computeEnc[] = { "MTLComputeCommandEncoder", "MTLCommandEncoder", NULL },
++	    *const computePipe[] = { "MTLComputePipelineState", NULL };
++
++	if ((gComputePipelineClass = objectClass("HakiosMetalComputePipelineState", "_MTLComputePipelineState", computePipe, (IMP)computePipelineDealloc)) != Nil) {
++		class_addMethod(gComputePipelineClass, sel_registerName("maxTotalThreadsPerThreadgroup"), (IMP)computePipelineMaxThreads, "Q@:");
++		class_addMethod(gComputePipelineClass, sel_registerName("threadExecutionWidth"), (IMP)computePipelineExecutionWidth, "Q@:");
++		class_addMethod(gComputePipelineClass, sel_registerName("staticThreadgroupMemoryLength"), (IMP)computePipelineThreadgroupMemory, "Q@:");
++		objc_registerClassPair(gComputePipelineClass);
++	}
++	if ((gCommandBufferClass = objectClass("HakiosMetalCommandBuffer", "_MTLCommandBuffer", cb, (IMP)commandBufferDealloc)) != Nil) {
++		class_addMethod(gCommandBufferClass, sel_registerName("commit"), (IMP)commandBufferCommit, "v@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("enqueue"), (IMP)commandBufferEnqueue, "v@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("waitUntilCompleted"), (IMP)commandBufferWait, "v@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("waitUntilScheduled"), (IMP)commandBufferWaitScheduled, "v@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("addCompletedHandler:"), (IMP)commandBufferAddHandler, "v@:@?");
++		class_addMethod(gCommandBufferClass, sel_registerName("addScheduledHandler:"), (IMP)commandBufferAddScheduled, "v@:@?");
++		class_addMethod(gCommandBufferClass, sel_registerName("status"), (IMP)commandBufferStatus, "Q@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("error"), (IMP)commandBufferError, "@@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("commandQueue"), (IMP)commandBufferQueue, "@@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("blitCommandEncoder"), (IMP)commandBufferBlitEncoder, "@@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoder"), (IMP)commandBufferComputeEncoder, "@@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoderWithDispatchType:"), (IMP)commandBufferComputeEncoder, "@@:Q");
 +		class_addMethod(gCommandBufferClass, sel_registerName("renderCommandEncoderWithDescriptor:"), (IMP)commandBufferRenderEncoder, "@@:@");
- 		class_addMethod(gCommandBufferClass, sel_registerName("GPUStartTime"), (IMP)commandBufferNoTime, "d@:");
- 		class_addMethod(gCommandBufferClass, sel_registerName("GPUEndTime"), (IMP)commandBufferNoTime, "d@:");
- 		objc_registerClassPair(gCommandBufferClass);
-@@ -1709,11 +2770,39 @@ registerCommandClasses(void)
- 		class_addMethod(gComputeEncoderClass, sel_registerName("setComputePipelineState:"), (IMP)computeSetPipeline, "v@:@");
- 		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffer:offset:atIndex:"), (IMP)computeSetBuffer, "v@:@QQ");
- 		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffers:offsets:withRange:"), (IMP)computeSetBuffers, "v@:r^@r^Q{_NSRange=QQ}");
++		class_addMethod(gCommandBufferClass, sel_registerName("presentDrawable:"), (IMP)commandBufferPresentDrawable, "v@:@");
++		class_addMethod(gCommandBufferClass, sel_registerName("presentDrawable:atTime:"), (IMP)commandBufferPresentDrawableAtTime, "v@:@d");
++		class_addMethod(gCommandBufferClass, sel_registerName("presentDrawable:afterMinimumDuration:"), (IMP)commandBufferPresentDrawableAfterDuration, "v@:@d");
++		class_addMethod(gCommandBufferClass, sel_registerName("GPUStartTime"), (IMP)commandBufferNoTime, "d@:");
++		class_addMethod(gCommandBufferClass, sel_registerName("GPUEndTime"), (IMP)commandBufferNoTime, "d@:");
++		objc_registerClassPair(gCommandBufferClass);
++	}
++	if ((gBlitEncoderClass = objectClass("HakiosMetalBlitEncoder", "_MTLCommandEncoder", blit, (IMP)blitEncoderDealloc)) != Nil) {
++		class_addMethod(gBlitEncoderClass, sel_registerName("copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:"),
++		    (IMP)blitCopy, "v@:@Q@QQ");
++		class_addMethod(gBlitEncoderClass, sel_registerName("fillBuffer:range:value:"), (IMP)blitFill, "v@:@{_NSRange=QQ}C");
++		class_addMethod(gBlitEncoderClass, sel_registerName("endEncoding"), (IMP)blitEnd, "v@:");
++		class_addMethod(gBlitEncoderClass, sel_registerName("synchronizeResource:"), (IMP)blitNothing, "v@:@");
++		objc_registerClassPair(gBlitEncoderClass);
++	}
++	if ((gComputeEncoderClass = objectClass("HakiosMetalComputeEncoder", "_MTLCommandEncoder", computeEnc, (IMP)computeEncoderDealloc)) != Nil) {
++		class_addMethod(gComputeEncoderClass, sel_registerName("setComputePipelineState:"), (IMP)computeSetPipeline, "v@:@");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffer:offset:atIndex:"), (IMP)computeSetBuffer, "v@:@QQ");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffers:offsets:withRange:"), (IMP)computeSetBuffers, "v@:r^@r^Q{_NSRange=QQ}");
 +		class_addMethod(gComputeEncoderClass, sel_registerName("setTexture:atIndex:"), (IMP)computeSetTexture, "v@:@Q");
 +		class_addMethod(gComputeEncoderClass, sel_registerName("setTextures:withRange:"), (IMP)computeSetTextures, "v@:r^@{_NSRange=QQ}");
 +		class_addMethod(gComputeEncoderClass, sel_registerName("setSamplerState:atIndex:"), (IMP)computeSetSampler, "v@:@Q");
 +		class_addMethod(gComputeEncoderClass, sel_registerName("setSamplerStates:withRange:"), (IMP)computeSetSamplers, "v@:r^@{_NSRange=QQ}");
- 		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"), (IMP)computeDispatch, "v@:{?=QQQ}{?=QQQ}");
- 		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), (IMP)computeDispatchThreads, "v@:{?=QQQ}{?=QQQ}");
- 		class_addMethod(gComputeEncoderClass, sel_registerName("endEncoding"), (IMP)computeEnd, "v@:");
- 		objc_registerClassPair(gComputeEncoderClass);
- 	}
++		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"), (IMP)computeDispatch, "v@:{?=QQQ}{?=QQQ}");
++		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), (IMP)computeDispatchThreads, "v@:{?=QQQ}{?=QQQ}");
++		class_addMethod(gComputeEncoderClass, sel_registerName("endEncoding"), (IMP)computeEnd, "v@:");
++		objc_registerClassPair(gComputeEncoderClass);
++	}
 +	static const char *const renderEnc[] = { "MTLRenderCommandEncoder", "MTLCommandEncoder", NULL };
 +	if ((gRenderEncoderClass = objectClass("HakiosMetalRenderEncoder", "_MTLCommandEncoder", renderEnc, (IMP)renderEncoderDealloc)) != Nil) {
 +		class_addMethod(gRenderEncoderClass, sel_registerName("setRenderPipelineState:"), (IMP)renderSetPipeline, "v@:@");
@@ -2502,9 +1856,854 @@ index ab07a49..aeadd0f 100644
 +		class_addMethod(gRenderEncoderClass, sel_registerName("endEncoding"), (IMP)renderEnd, "v@:");
 +		objc_registerClassPair(gRenderEncoderClass);
 +	}
++}
++#endif
++
++static void
++registerQueueClass(void)
++{
++	Class base = objc_getClass("_MTLCommandQueue");
++	Protocol * protocol = @protocol(MTLCommandQueue);
++
++	if (base == Nil) {
++		say(@"this system has no _MTLCommandQueue: no queue class is registered");
++		return;
++	}
++	gQueueClass = objc_allocateClassPair(base, "HakiosMetalQueue", 0);
++	if (gQueueClass == Nil) {
++		say(@"could not make the class HakiosMetalQueue");
++		return;
++	}
++	class_addProtocol(gQueueClass, protocol);
++	if (gProtocolCount < sizeof(gProtocols) / sizeof(gProtocols[0])) {
++		gProtocols[gProtocolCount++] = protocol;
++	}
++	/*
++	 * The third run: -setCompletionQueue: is not in MTLCommandQueue but in a private protocol of Metal's own (as MTLDeviceSPI is
++	 * for the device), and the window server sends it. Every protocol of this process whose name begins with MTLCommandQueue is
++	 * taken, so that the stub answers what any of them declares; their names go to the log, which is how the next one is found.
++	 */
++	unsigned int count = 0;
++	Protocol * __unsafe_unretained * all = objc_copyProtocolList(&count);
++
++	for (unsigned int i = 0; i < count; i++) {
++		const char * name = protocol_getName(all[i]);
++
++		if (strncmp(name, "MTLCommandQueue", 15) == 0 && all[i] != protocol && gProtocolCount < sizeof(gProtocols) / sizeof(gProtocols[0])) {
++			class_addProtocol(gQueueClass, all[i]);
++			gProtocols[gProtocolCount++] = all[i];
++			say([NSString stringWithFormat:@"the queue also declares the protocol %s", name]);
++		}
++	}
++	free(all);
++	class_addMethod(gQueueClass, sel_registerName("device"), (IMP)queueDevice, "@@:");
++	class_addMethod(gQueueClass, sel_registerName("label"), (IMP)queueLabel, "@@:");
++	class_addMethod(gQueueClass, sel_registerName("setGPUPriority:"), (IMP)queueSetGPUPriority, "v@:Q");
++	class_addMethod(gQueueClass, sel_registerName("methodSignatureForSelector:"), (IMP)deviceSignature, "@@::");
++	class_addMethod(gQueueClass, sel_registerName("forwardInvocation:"), (IMP)deviceForward, "v@:@");
++	class_addMethod(gQueueClass, sel_registerName("dealloc"), (IMP)queueDealloc, "v@:");
++#ifdef HAKIOS_METAL_GPU
++	class_addIvar(gQueueClass, "_hakios", sizeof(void *), sizeof(void *) == 8 ? 3 : 2, "^v");
++	class_addMethod(gQueueClass, sel_registerName("commandBuffer"), (IMP)queueCommandBuffer, "@@:");
++	class_addMethod(gQueueClass, sel_registerName("commandBufferWithUnretainedReferences"), (IMP)queueCommandBuffer, "@@:");
++	class_addMethod(gQueueClass, sel_registerName("commandBufferWithDescriptor:"), (IMP)queueCommandBuffer, "@@:@");
++#endif
++	objc_registerClassPair(gQueueClass);
++	say(@"the class HakiosMetalQueue is registered (a subclass of _MTLCommandQueue)");
++#ifdef HAKIOS_METAL_GPU
++	registerCommandClasses();
++#endif
++}
++
++/*
++ * Whether this process may be shown the device, by the level of boot-arg metal (read from sysctl kern.bootargs):
++ *
++ *   metal=1  only the program metal_test (userland/src/metal_test.m): the safe level, for seeing what Metal does with the device
++ *   metal=2  every process but backboardd
++ *   metal=3  every process, backboardd too, to find out what the window server asks
++ *
++ * Why not simply everyone. CoreAnimation's window server tries Metal FIRST and goes to its OpenGL ES path (which works on this port)
++ * only when no Metal device exists; with ours it takes Metal and stops on "metallib_url != nil": its own shader library,
++ * QuartzCore.framework/default.metallib, is not in this system image (the framework has only a default.pipelinelib that names
++ * it), so the window server cannot run on Metal here at all. And mediaserverd, given a device that cannot do anything, ends and
++ * is started again. A device that is shown to a process that cannot use it costs that process, so it is shown to as few as the
++ * experiment needs.
++ *
++ * Besides the level, a file HakiosMetal.clients beside the bundle (the way UniXNU's AdrenoMetal chooses its clients) names more
++ * processes, one per line, "*" for every one: an image can show the device to the one program being worked on without a boot-arg.
++ */
++static BOOL
++listedBesideTheBundle(const char *name)
++{
++	Dl_info info;
++	char path[1024], line[256];
++	char *slash;
++	FILE *file;
++	BOOL listed = NO;
++
++	if (dladdr((const void *)&listedBesideTheBundle, &info) == 0 || info.dli_fname == NULL) {
++		return NO;
++	}
++	strlcpy(path, info.dli_fname, sizeof(path));            /* <Extensions>/HakiosMetal.bundle/HakiosMetal */
++	if ((slash = strrchr(path, '/')) == NULL) {
++		return NO;
++	}
++	*slash = '\0';
++	if ((slash = strrchr(path, '/')) == NULL) {
++		return NO;
++	}
++	strlcpy(slash + 1, "HakiosMetal.clients", sizeof(path) - (size_t)(slash + 1 - path));
++	if ((file = fopen(path, "r")) == NULL) {
++		return NO;
++	}
++	while (!listed && fgets(line, sizeof(line), file) != NULL) {
++		line[strcspn(line, " \t\r\n#")] = '\0';
++		listed = strcmp(line, "*") == 0 || (line[0] != '\0' && strcmp(line, name) == 0);
++	}
++	fclose(file);
++	return listed;
++}
++
++static BOOL
++shownToThisProcess(void)
++{
++	char args[1024] = "";
++	size_t size = sizeof(args) - 1;
++	const char * name = getprogname();
++	int level = 1;
++
++	if (name != NULL && (strcmp(name, "metal_test") == 0 || strcmp(name, "hakios-test") == 0 || strcmp(name, "mtldisc") == 0)) {
++		return YES;
++	}
++	if (getenv("HAKIOS_METAL_ENABLE") != NULL || getenv("USE_HAKIOS") != NULL) {
++		return YES;
++	}
++	FILE *cf = fopen("/var/jb/etc/hakiosmetal.clients", "r");
++	if (cf == NULL) cf = fopen("/var/jb/etc/sweetmetal.clients", "r");
++	if (cf != NULL) {
++		char line[256];
++		BOOL ok = NO;
++		while (!ok && fgets(line, sizeof(line), cf) != NULL) {
++			line[strcspn(line, " \t\r\n#")] = '\0';
++			ok = strcmp(line, "*") == 0 || (line[0] != '\0' && name != NULL && strcmp(line, name) == 0);
++		}
++		fclose(cf);
++		if (ok) return YES;
++	}
++
++	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0) {
++		const char * at = strstr(args, "metal=");
++
++		if (at != NULL) {
++			level = atoi(at + 6);
++		}
++	}
++	if (name == NULL) {
++		return NO;
++	}
++	if (level >= 3 || (level == 2 && strcmp(name, "backboardd") != 0) || (level == 1 && strcmp(name, "metal_test") == 0)) {
++		return YES;
++	}
++	if (listedBesideTheBundle(name)) {
++		say([NSString stringWithFormat:@"%s is shown the device: HakiosMetal.clients beside the bundle names it", name]);
++		return YES;
++	}
++	say([NSString stringWithFormat:@"%s is not shown the device (metal=%d; 1 is metal_test only, 2 all but backboardd, 3 all)", name, level]);
++	return NO;
++}
++
++static void
++doRegisterDevice(void)
++{
++	Class device;
++
++	gBase = objc_getClass("_MTLDevice");
++	if (gBase == Nil) {
++		say(@"this system has no _MTLDevice: no device class is registered");
++		return;
++	}
++	if (objc_getClass("HakiosMetalDevice") != Nil) {
++		return;
+ 	}
+ 	device = objc_allocateClassPair(gBase, "HakiosMetalDevice", 0);
+ 	if (device == Nil) {
+@@ -1629,11 +3067,47 @@ registerDevice(void)
+ 	class_addMethod(device, sel_registerName("maxThreadsPerThreadgroup"), (IMP)deviceMaxThreadsPerThreadgroup, "{?=QQQ}@:");
+ 	class_addMethod(device, sel_registerName("newCommandQueue"), (IMP)deviceNewQueue, "@@:");
+ 	class_addMethod(device, sel_registerName("newCommandQueueWithMaxCommandBufferCount:"), (IMP)deviceNewQueueMax, "@@:Q");
++	class_addMethod(device, sel_registerName("newCommandQueueWithDescriptor:"), (IMP)deviceNewQueue, "@@:@");
+ 	class_addMethod(device, sel_registerName("methodSignatureForSelector:"), (IMP)deviceSignature, "@@::");
+ 	class_addMethod(device, sel_registerName("forwardInvocation:"), (IMP)deviceForward, "v@:@");
+ 	objc_registerClassPair(device);
+ 	say(@"the class HakiosMetalDevice is registered (a subclass of _MTLDevice)");
++	if (objc_getClass("SweetMetalDevice") == Nil) {
++		Class sweet = objc_allocateClassPair(device, "SweetMetalDevice", 0);
++		if (sweet != Nil) {
++			objc_registerClassPair(sweet);
++			say(@"the class SweetMetalDevice is registered (a subclass of HakiosMetalDevice)");
++		}
++	}
+ 	registerQueueClass();
+ 	registerStubClasses(device);
+ 	registerObjectClasses(device);
  }
- #endif
++
++__attribute__((constructor)) static void
++registerDevice(void)
++{
++	if (!shownToThisProcess()) {
++		return;
++	}
++	doRegisterDevice();
++}
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++__attribute__((visibility("default"))) id
++hakios_metal_open_device(unsigned int port)
++{
++	Class cls = objc_getClass("HakiosMetalDevice");
++	if (cls == Nil) {
++		doRegisterDevice();
++		cls = objc_getClass("HakiosMetalDevice");
++	}
++	if (cls == Nil) cls = objc_getClass("SweetMetalDevice");
++	if (cls == Nil) return nil;
++	return ((id (*)(id, SEL, unsigned int))objc_msgSend)([cls alloc], sel_registerName("initWithAcceleratorPort:"), port);
++}
++#ifdef __cplusplus
++}
++#endif
+diff --git a/plugin/hakios_metallib.h b/plugin/hakios_metallib.h
+index 80d4c14..b1c2c0a 100644
+--- a/plugin/hakios_metallib.h
++++ b/plugin/hakios_metallib.h
+@@ -13,6 +13,10 @@
+ #include <stddef.h>
+ #include <stdint.h>
  
--- 
-2.55.0
-
++#ifdef __cplusplus
++extern "C" {
++#endif
++
+ /* the TYPE tag (tools/metallib.py, checked against the metadata of the system's 456 modules) */
+ enum hakios_metallib_type {
+ 	HAKIOS_METALLIB_VERTEX = 0,
+@@ -65,4 +69,8 @@ const char *hakios_metallib_type_name(uint8_t type);
+ int hakios_metallib_bitcode(const uint8_t *data, size_t size, const struct hakios_metallib_function *function,
+     const uint8_t **bitcode, uint64_t *length);
+ 
++#ifdef __cplusplus
++}
++#endif
++
+ #endif
+diff --git a/src/command.cpp b/src/command.cpp
+index 06b5407..d29bb5d 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -556,9 +556,9 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
+ }
+ 
+ namespace {
+-// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
+-constexpr uint32_t kSpCores = 2;
+-constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
++// the chip's SP cores and fibers an SP (a6xx.hpp, from freedreno_devices.py)
++constexpr uint32_t kSpCores = a6xx::kNumSpCores;
++constexpr uint32_t kFibersPerSp = a6xx::kFibersPerSp;
+ }  // namespace
+ 
+ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
+diff --git a/src/fake_gpu.cpp b/src/fake_gpu.cpp
+index 4fb84ff..81a51c6 100644
+--- a/src/fake_gpu.cpp
++++ b/src/fake_gpu.cpp
+@@ -667,11 +667,16 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
+         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
+         return false;
+     }
+-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
++    if (!kHasLpac) {
++        // a chip without LPAC (the A618) has no second copies: turnip never writes them there
++        if (reg(REG_A6XX_SP_CS_CNTL_0) != 0 || reg(REG_A6XX_SP_CS_CNTL_1) != 0 || reg(REG_A6XX_HLSQ_CS_CTRL_REG1) != 0) {
++            fault("SP_CS_CNTL_0/1 or HLSQ_CS_CTRL_REG1 written on a chip without LPAC (has_lpac is gen4's)");
++            return false;
++        }
++    } else if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
+         return false;
+-    }
+-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
++    } else if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
+         return false;
+     }
+diff --git a/src/iokit_transport.cpp b/src/iokit_transport.cpp
+index 48ef40e..8a5b86f 100644
+--- a/src/iokit_transport.cpp
++++ b/src/iokit_transport.cpp
+@@ -66,6 +66,10 @@ private:
+ 
+ std::unique_ptr<Transport> openKernelGpu(std::string* why) {
+     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
++    if (s == 0) {
++        // ios-sunfish's kernel: SweetGPU, a port of this same driver (the same requests and structures)
++        s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
++    }
+     if (s == 0) {
+         *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
+         return nullptr;
+diff --git a/tests/a6xx_test.cpp b/tests/a6xx_test.cpp
+index d46ceaa..e187851 100644
+--- a/tests/a6xx_test.cpp
++++ b/tests/a6xx_test.cpp
+@@ -110,8 +110,8 @@ TEST(a6xx_load_state6_word_0) {
+     // one IBO descriptor: ST6_IBO (3) << 14 = 0xc000 | 0x20000 | 0x340000 | 1 << 22 = 0x400000
+     CHECK_EQ(loadState6_0(0, ST6_IBO, SS6_INDIRECT, SB6_CS_SHADER, 1), 0x0076c000u);
+     // the shader preload is capped at the instruction cache, and that fits the 10-bit NUM_UNIT
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
+-    CHECK_EQ(kInstrCacheSize, 127u);
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (test::kA618 ? 64u : 127u) << 22);
++    CHECK_EQ(kInstrCacheSize, test::kA618 ? 64u : 127u);
+     // the source address: the low word keeps bits 31:2, the high word is whole
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1000), 0x1000u);
+     CHECK_EQ(CP_LOAD_STATE6_1_EXT_SRC_ADDR(0x1003), 0x1000u);
+@@ -283,9 +283,10 @@ TEST(a6xx_private_memory_fields_are_scaled) {
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x800), 1u);
+     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
+     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
+-    CHECK_EQ(kFibersPerSp, 4096u);
+-    CHECK_EQ(kNumSpCores, 2u);
+-    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
++    // (the A618: 2048 fibers, 1 SP; 512 bytes a fiber is 1 MiB, field 256)
++    CHECK_EQ(kFibersPerSp, test::kTestFibers);
++    CHECK_EQ(kNumSpCores, test::kTestSpCores);
++    CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), test::kA618 ? 256u : 512u);
+ }
+ 
+ TEST(a6xx_dispatch_words) {
+@@ -333,7 +334,8 @@ TEST(a6xx_batch_start_words) {
+     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
+     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
+     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
+-    CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
++    // (the A618: num_ccu 1 * 64 KiB = 0x10000: 0x10 << 23 = 0x08000000)
++    CHECK_EQ(rbCcuCntlSysmem(), test::kA618 ? 0x08000000u : 0x10000000u);
+     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
+     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
+     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
+@@ -365,7 +367,7 @@ TEST(a6xx_batch_start_words) {
+     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
+     CHECK_EQ(kStaticState[1].value, 0x8u);
+     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
+-    CHECK_EQ(kStaticState[5].value, 0x05008000u);
++    CHECK_EQ(kStaticState[5].value, test::kA618 ? 0x00108000u : 0x05008000u);
+     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
+     CHECK_EQ(kStaticState[19].value, 0x5u);
+     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
+@@ -386,11 +388,12 @@ TEST(a6xx_batch_start_words) {
+     for (const RegWrite& w : kStaticState) {
+         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
+     }
+-    CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
++    // (the A618's: freedreno_devices.py 25.0.7, GPUId(618) magic_regs)
++    CHECK_EQ(kMagicTpl1DbgEcoCntl, test::kA618 ? 0x00108000u : 83918848u);
+     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
+-    CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
+-    CHECK_EQ(kMagicSpChickenBits, 5120u);
+-    CHECK_EQ(kMagicUcheClientPf, 132u);
++    CHECK_EQ(kMagicVpcDbgEcoCntl, test::kA618 ? 0u : 33554432u);
++    CHECK_EQ(kMagicSpChickenBits, test::kA618 ? 0x430u : 5120u);
++    CHECK_EQ(kMagicUcheClientPf, test::kA618 ? 4u : 132u);
+     CHECK_EQ(kBorderColorBytes, 32768u);
+ }
+ 
+@@ -744,7 +747,7 @@ TEST(a6xx_first_draw_program_words) {
+     CHECK_EQ(hlsqFsCntl0(THREAD128, true), 0x3u);
+     CHECK_EQ(hlsqFsCntl0(THREAD64, false), 0u);
+     // the stage loads: NUM_UNIT is capped at the instruction cache, as compute's is
+-    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), 127u << 22);
++    CHECK_EQ(CP_LOAD_STATE6_0_NUM_UNIT(kInstrCacheSize), (test::kA618 ? 64u : 127u) << 22);
+     // the private memory words are the compute ones' twins (same scales)
+     CHECK_EQ(A6XX_SP_VS_PVT_MEM_PARAM_MEMSIZEPERITEM(512), 1u);
+     CHECK_EQ(A6XX_SP_FS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(0x1000), 1u);
+diff --git a/tests/compute_test.cpp b/tests/compute_test.cpp
+index c7f9c6f..a079d8f 100644
+--- a/tests/compute_test.cpp
++++ b/tests/compute_test.cpp
+@@ -162,8 +162,8 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
+     auto at = [&](uint32_t reg) { size_t i = e.findReg(reg); return i == size_t(-1) ? 0xdeadbeefu : e.stream.words()[i]; };
+     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
+     CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 1), uint32_t(scratch->gpuAddress()));
+-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * 4096u) >> 12);
+-    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
++    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_PARAM + 3), (512u * test::kTestFibers) >> 12);
++    CHECK_EQ(at(REG_A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET), (512u * test::kTestFibers) >> 11);
+     // through a command buffer the queue's own is bound, and the fake takes the dispatch
+     auto cb = r.queue->commandBuffer();
+     CHECK(cb->dispatch(k, kGroups16, nullptr, {Binding{out.get(), 0}}));
+@@ -180,7 +180,11 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
+     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(big.ok);
+     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
+-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    if (test::kA618) {
++        CHECK(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1) == size_t(-1));   // no LPAC: no HLSQ copy
++    } else {
++        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
++    }
+     tg.sharedBytes = 32 * 1024 + 1;
+     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
+     CHECK(!over.ok);
+@@ -532,6 +536,15 @@ TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
+         }
+         i += 1 + h.count;
+     }
++    if (test::kA618) {
++        // no LPAC: the encoder writes no SP_CS_CNTL_0, and one written anyway is refused
++        CHECK(!changed);
++        words.insert(words.begin(), {pm4::type4(a6xx::REG_A6XX_SP_CS_CNTL_0, 1), a6xx::A6XX_SP_CS_CNTL_0_LOCALIDREGID(0x4)});
++        Raw raw(r);
++        CHECK_EQ(raw.submit(words), ETIMEDOUT);
++        CHECK(r.fake->stats().lastFault.find("written on a chip without LPAC") != std::string::npos);
++        return;
++    }
+     CHECK(changed);
+     Raw raw(r);
+     CHECK_EQ(raw.submit(words), ETIMEDOUT);
+@@ -1187,10 +1200,16 @@ TEST(a_kernel_longer_than_the_instruction_cache_gets_the_instrlen_workaround) {
+     {
+         Encoded e(r, kernels::chain160_air, kGroups16, local, b);
+         CHECK(e.ok);
+-        CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
+         size_t before = 0, after = 0;
+         labels(e, &before, &after);
+-        CHECK_EQ(before + after, size_t(0));
++        if (test::kA618) {
++            // 96 units are more than the A618's 64: the workaround, as long_chain_air's above
++            CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) != size_t(-1));
++            CHECK_EQ(before + after, size_t(2));
++        } else {
++            CHECK(e.findReg(a6xx::REG_A6XX_SP_FS_INSTRLEN) == size_t(-1));
++            CHECK_EQ(before + after, size_t(0));
++        }
+         // the same kernel with its preload cut below its length is fetched past the preload, and gets it
+         compute::Options cut;
+         cut.preloadCap = 64;
+diff --git a/tests/render_test.cpp b/tests/render_test.cpp
+index 3868c9f..fdaf997 100644
+--- a/tests/render_test.cpp
++++ b/tests/render_test.cpp
+@@ -660,7 +660,7 @@ TEST(render_encodes_the_first_triangles_registers) {
+     {
+         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
+         CHECK(ccu != size_t(-1));
+-        CHECK_EQ(w[ccu], 0x10000000u);
++        CHECK_EQ(w[ccu], test::kA618 ? 0x08000000u : 0x10000000u);
+         pm4::Header before = pm4::decode(w[ccu - 2]);
+         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
+     }
+@@ -964,7 +964,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
+         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
+         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
+         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
+-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
++        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), test::kA618 ? 0x08000000u : 0x10000000u);   // ccuCntl is its own group
+         CHECK(e.stream.size() < whole.stream.size());
+     }
+     {
+@@ -974,7 +974,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
+     }
+     {
+         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
+-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
++        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), test::kA618 ? 0x08000004u : 0x10000004u);
+     }
+     {
+         Encoded e = with([](render::Options& o) { o.passBegin = false; });
+@@ -1851,7 +1851,8 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
+         Twin w;
+         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
+         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
+-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
++        CHECK(has(w.fault(), test::kA618 ? "RB_CCU_CNTL (0x8000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"
++                                         : "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
+     }
+     {
+         Twin w;
+@@ -2147,8 +2148,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
+     auto scratch = r.queue->privateMemory(64, false, &pm, &why);
+     CHECK(scratch != nullptr);
+     CHECK_EQ(pm.perFiber, 512u);
+-    CHECK_EQ(pm.perSp, 512u * 4096u);
+-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
++    CHECK_EQ(pm.perSp, 512u * test::kTestFibers);
++    CHECK_EQ(scratch->length(), uint64_t(test::kTestSpCores) * 512u * test::kTestFibers);
+     Bindings fsb;
+     fsb.privateMemory = pm;
+     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
+@@ -2156,8 +2157,8 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
+     if (!e.ok) std::printf("       %s\n", e.error.c_str());
+     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 3), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(512));
+     CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 4), uint32_t(scratch->gpuAddress()));
+-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * 4096u) >> 12);
+-    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * 4096u) >> 11);
++    CHECK_EQ(e.reg(REG_A6XX_SP_FS_OBJ_FIRST_EXEC_OFFSET + 6), (512u * test::kTestFibers) >> 12);
++    CHECK_EQ(e.reg(REG_A6XX_SP_FS_PVT_MEM_HW_STACK_OFFSET), (512u * test::kTestFibers) >> 11);
+     CHECK_EQ(e.reg(REG_A6XX_SP_VS_OBJ_FIRST_EXEC_OFFSET + 4), 0u);
+     CHECK_EQ(e.reg(REG_A6XX_SP_VS_PVT_MEM_HW_STACK_OFFSET), 0u);
+     auto cb = drawOnce(r, p, pass, wholeDraw(3));
+@@ -4648,7 +4649,7 @@ TEST(a_program_longer_than_the_instruction_cache_is_preloaded_in_part) {
+         const uint32_t type = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_TYPE__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_TYPE__SHIFT;
+         const uint32_t block = (d0 & a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__MASK) >> a6xx::CP_LOAD_STATE6_0_STATE_BLOCK__SHIFT;
+         if (type == a6xx::ST6_SHADER && block == a6xx::SB6_FS_SHADER) {
+-            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, 127u);
++            CHECK_EQ((d0 & a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) >> a6xx::CP_LOAD_STATE6_0_NUM_UNIT__SHIFT, test::kA618 ? 64u : 127u);
+             w[i + 1] = (d0 & ~a6xx::CP_LOAD_STATE6_0_NUM_UNIT__MASK) | a6xx::CP_LOAD_STATE6_0_NUM_UNIT(128);
+             found = true;
+         }
+@@ -5345,7 +5346,9 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
+         a.color0 = t.get();
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
+-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
++        // (the A618: 0x7c000 / 2304 = 220 rows, 192 in 32-row granules: 13 rows of 192)
++        CHECK(test::kA618 ? (p.cols == 2 && p.rows == 13 && p.binW == 576 && p.binH == 192)
++                          : (p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208));
+     }
+     // what stays in sysmem: a second colour attachment of another size, an integer target
+     {
+@@ -5462,7 +5465,10 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
+         a.more[0].load = LoadAction::kLoad;
+         render::GmemPlan p;
+         CHECK(render::gmemPlan(a, &p, nullptr));
+-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
++        // (the A618: GMEM below the colour cache is 0x7c000, so the second share is 0x7c000 - 0x3c000 = 0x40000; the
++        // bins stay 576 x 96: 0x3c000 / (576 * 4) = 106 rows, 96 in whole 32-row granules)
++        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 &&
++              p.room[1] == (test::kA618 ? 0x40000u : 0x3c000u));
+         auto cb = r.queue->commandBuffer();
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
+diff --git a/tests/test.hpp b/tests/test.hpp
+index 85c086a..dcae6fd 100644
+--- a/tests/test.hpp
++++ b/tests/test.hpp
+@@ -8,6 +8,16 @@
+ 
+ namespace test {
+ 
++// the chip the tests are built for: HAKIOS_METAL_A618 (make CHIP=618) is ios-sunfish's Adreno 618, whose values the
++// tests below give beside the A635's, each worked out from Mesa 25.0.7 as the A635's were
++#if defined(HAKIOS_METAL_A618)
++inline constexpr bool kA618 = true;
++#else
++inline constexpr bool kA618 = false;
++#endif
++// fibers an SP times SPs: 4096 x 2 on the A635, 2048 x 1 on the A618 (freedreno_devices.py fibers_per_sp, num_ccu)
++inline constexpr unsigned kTestFibers = kA618 ? 2048u : 4096u, kTestSpCores = kA618 ? 1u : 2u;
++
+ struct Case {
+     const char* name;
+     std::function<void()> run;
+diff --git a/tools/probe.cpp b/tools/probe.cpp
+index 89cc762..276bb8e 100644
+--- a/tools/probe.cpp
++++ b/tools/probe.cpp
+@@ -374,13 +374,23 @@ static const char* dimName(uint8_t dim) {
+ }
+ 
+ int main(int argc, char** argv) {
+-    bool recover = false, bisect = false, binTrace = false;
++    bool recover = false, bisect = false, binTrace = false, blitsOnly = false;
++#if defined(HAKIOS_METAL_A618)
++    bool compiledOnly = true;   // on A618, default to compiled stages only (fixtures are A635)
++#else
++    bool compiledOnly = false;
++#endif
+     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
+     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
+     for (int i = 1; i < argc; i++) {
+         recover = recover || strcmp(argv[i], "--recover") == 0;
+         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
+         binTrace = binTrace || strcmp(argv[i], "--bin-trace") == 0;
++        // --blits-only: stages 1-4 (the command processor's copies and fills, no shader), for a GPU this driver has
++        // not run on yet (ios-sunfish's A618: the fixtures' machine code is the A635's)
++        blitsOnly = blitsOnly || strcmp(argv[i], "--blits-only") == 0;
++        compiledOnly = compiledOnly || strcmp(argv[i], "--compiled-only") == 0 || strcmp(argv[i], "--skip-fixtures") == 0;
++        if (strcmp(argv[i], "--all-stages") == 0 || strcmp(argv[i], "--fixtures") == 0) compiledOnly = false;
+         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
+         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
+         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
+@@ -522,9 +532,16 @@ int main(int argc, char** argv) {
+         }
+     }
+ 
++    if (blitsOnly) {
++        std::printf("probe: --blits-only, stopping before stage 5\n");
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
+     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
+     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
+-    {
++    if (compiledOnly) {
++        std::printf("probe: (--compiled-only: skipping stage 5 A635 fixtures)\n");
++    } else {
+         const uint32_t words = 1024, c = 0x00001234;
+         const uint32_t canary = canaryFor(words, c);
+         auto out = newBuffer(gpu, 4 * words, &why);
+@@ -782,10 +799,17 @@ int main(int argc, char** argv) {
+                               a.localIdRegid == b.localIdRegid && a.workGroupIdRegid == b.workGroupIdRegid &&
+                               a.driverParamsOffsetVec4 == b.driverParamsOffsetVec4 && a.numUboRanges == b.numUboRanges &&
+                               a.immediatesOffsetVec4 == b.immediatesOffsetVec4 && a.numIbos == b.numIbos;
++#if defined(HAKIOS_METAL_A618)
++            report(compiled != nullptr, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words" +
++                                            (sameWords ? ", same as A635" : ", A618 ir3 output") +
++                                            ", layout " + (sameLayout ? "same" : "A618") +
++                                            " (instrlen " + std::to_string(a.instrlen) + ", constlen " + std::to_string(a.constlen) + ")");
++#else
+             report(sameWords && sameLayout, "compile fill_id.ll on the phone: " + std::to_string(a.numWords) + " words, " +
+                                                 (sameWords ? "the same as the host's" : "DIFFERENT from the host's") + ", layout " +
+                                                 (sameLayout ? "the same" : "DIFFERENT") + " (instrlen " + std::to_string(a.instrlen) +
+                                                 ", constlen " + std::to_string(a.constlen) + ")");
++#endif
+             const uint32_t words = 1024, c = 0x00004321;
+             const uint32_t canary = canaryFor(words, c);
+             auto out = newBuffer(gpu, 4 * words, &why);
+@@ -867,7 +891,9 @@ int main(int argc, char** argv) {
+ 
+     // 6z. private memory in a dispatch: pvt_fill keeps a[128] a fiber (512 bytes, stp/ldp), each thread's own values,
+     // and writes a[gid & 127]; 4096 threads, every word 3 (gid & 127) + (gid >> 7) + 1, and the canary past the grid
+-    {
++    if (compiledOnly) {
++        std::printf("probe: (--compiled-only: skipping stages 6z, 6y, 6x A635 fixtures)\n");
++    } else {
+         auto out = newBuffer(gpu, 4 * 4096 + 256, &why);
+         if (out == nullptr) {
+             report(false, "private memory in a dispatch: the buffer: " + why);
+@@ -887,68 +913,68 @@ int main(int argc, char** argv) {
+                    "private memory in a dispatch, a[128] a fiber read at gid & 127: " + std::to_string(right) + " of 4096 words 3 (gid & 127) + (gid >> 7) + 1, " +
+                        std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+-    }
+ 
+-    // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
+-    // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
+-    // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
+-    // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
+-    {
+-        auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
+-        if (out == nullptr) {
+-            report(false, "threadgroup argument: the buffer: " + why);
+-        } else {
+-            uint32_t* w = static_cast<uint32_t*>(out->contents());
+-            for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
+-            const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
+-            Bindings b;
+-            b.buffers = {Binding{out.get(), 0}};
+-            b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
+-            auto cb = queue->commandBuffer();
+-            if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
+-                cb->commit();
+-                cb->waitUntilCompleted();
+-            }
+-            uint32_t right = 0, tail = 0;
+-            for (uint32_t g = 0; g < 1024; g++) {
+-                const uint32_t n = ((g % 64) + 1) & 63;
+-                right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
++        // 6y. threadgroup memory the encoder sizes: tg_arg's argument t starts past its static s[64] (256 bytes in) and its
++        // 64 words lie 128 bytes apart, 8 KiB of it, so the dispatch is given 256 + 8192 (Bindings::sharedBytes). Each
++        // thread reads its neighbour's s and t: every pair (n + 1000, n + 2000) for n = (lid + 1) & 63, which an argument
++        // aliasing s (n + 2000 twice) or a group given only the 2 KiB floor (the far t words lost) does not give
++        {
++            auto out = newBuffer(gpu, 8 * 1024 + 256, &why);
++            if (out == nullptr) {
++                report(false, "threadgroup argument: the buffer: " + why);
++            } else {
++                uint32_t* w = static_cast<uint32_t*>(out->contents());
++                for (uint32_t i = 0; i < 2048 + 64; i++) w[i] = 0x5a5a5a5au;
++                const uint32_t groups[3] = {16, 1, 1}, local[3] = {64, 1, 1};
++                Bindings b;
++                b.buffers = {Binding{out.get(), 0}};
++                b.sharedBytes = kernels::tg_arg_air.sharedSize + 8192;
++                auto cb = queue->commandBuffer();
++                if (cb->dispatch(kernels::tg_arg_air, groups, local, b)) {
++                    cb->commit();
++                    cb->waitUntilCompleted();
++                }
++                uint32_t right = 0, tail = 0;
++                for (uint32_t g = 0; g < 1024; g++) {
++                    const uint32_t n = ((g % 64) + 1) & 63;
++                    right += w[2 * g] == n + 1000 && w[2 * g + 1] == n + 2000;
++                }
++                for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
++                report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
++                       "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
++                           std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+             }
+-            for (uint32_t i = 2048; i < 2048 + 64; i++) tail += w[i] == 0x5a5a5a5au;
+-            report(cb->status() == CommandBuffer::kCompleted && right == 1024 && tail == 64,
+-                   "threadgroup argument past s[64], 8 KiB of it: " + std::to_string(right) + " of 1024 threads read (n + 1000, n + 2000), " +
+-                       std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+-    }
+ 
+-    // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
+-    // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
+-    // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
+-    {
+-        auto in = newBuffer(gpu, 4 * 1024, &why);
+-        auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
+-        if (out == nullptr) {
+-            report(false, "pointer phis: the buffers: " + why);
+-        } else {
+-            uint32_t* iw = static_cast<uint32_t*>(in->contents());
+-            for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
+-            uint32_t* ow = static_cast<uint32_t*>(out->contents());
+-            for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
+-            const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
+-            auto cb = queue->commandBuffer();
+-            if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
+-                cb->commit();
+-                cb->waitUntilCompleted();
+-            }
+-            uint32_t chosen = 0, summed = 0, tail = 0;
+-            for (uint32_t g = 0; g < 256; g++) {
+-                chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
+-                summed += ow[2 * g + 1] == 12 * g + 46;
++        // 6x. pointer phis into one buffer: ptr_phi reads in + gid or in + gid + 64 by gid's parity (a phi of two GEPs) and
++        // sums in[gid .. gid + 3] through a pointer stepped round a loop. With in[w] = 3w + 7: out[2g] = in[g] for odd g and
++        // in[g + 64] for even g, out[2g + 1] = 12g + 46 -- an offset register stuck at one edge's value moves either
++        {
++            auto in = newBuffer(gpu, 4 * 1024, &why);
++            auto out = in ? newBuffer(gpu, 8 * 256 + 256, &why) : nullptr;
++            if (out == nullptr) {
++                report(false, "pointer phis: the buffers: " + why);
++            } else {
++                uint32_t* iw = static_cast<uint32_t*>(in->contents());
++                for (uint32_t w = 0; w < 1024; w++) iw[w] = 3 * w + 7;
++                uint32_t* ow = static_cast<uint32_t*>(out->contents());
++                for (uint32_t i = 0; i < 512 + 64; i++) ow[i] = 0x5a5a5a5au;
++                const uint32_t groups[3] = {4, 1, 1}, local[3] = {64, 1, 1};
++                auto cb = queue->commandBuffer();
++                if (cb->dispatch(kernels::ptr_phi_air, groups, local, {Binding{in.get(), 0}, Binding{out.get(), 0}})) {
++                    cb->commit();
++                    cb->waitUntilCompleted();
++                }
++                uint32_t chosen = 0, summed = 0, tail = 0;
++                for (uint32_t g = 0; g < 256; g++) {
++                    chosen += ow[2 * g] == iw[(g & 1) ? g : g + 64];
++                    summed += ow[2 * g + 1] == 12 * g + 46;
++                }
++                for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
++                report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
++                       "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
++                           " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+             }
+-            for (uint32_t i = 512; i < 512 + 64; i++) tail += ow[i] == 0x5a5a5a5au;
+-            report(cb->status() == CommandBuffer::kCompleted && chosen == 256 && summed == 256 && tail == 64,
+-                   "pointer phis into one buffer: " + std::to_string(chosen) + " of 256 branch-chosen words, " + std::to_string(summed) +
+-                       " of 256 loop sums 12g + 46, " + std::to_string(tail) + " of 64 past the grid canary" + status(*cb, gpu));
+         }
+     }
+ 
+@@ -1078,6 +1104,9 @@ int main(int argc, char** argv) {
+                 reportPadding(label, r);
+                 return t;
+             };
++            if (compiledOnly) {
++                std::printf("probe: (--compiled-only: skipping stage 7a-7c A635 fixtures)\n");
++            } else {
+             auto fill64 = texFill(kernels::tex_fill_air, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c1,
+                                   "tex_fill R32Uint 64x32, (8,4,1) groups of (8,8,1), c = 0x5678");
+             // the controls: half the grid along x (grid.x = 32, so other words too) leaves the right half canary; another c
+@@ -1483,7 +1512,7 @@ int main(int argc, char** argv) {
+                 const uint64_t words = t->buffer()->length() / 4;
+                 for (uint64_t i = 0; i < words; i++) w[i] = canary;
+                 const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
+-                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, Bindings{{}, {t.get()}});
++                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, [&] { Bindings b; b.textures = {t.get()}; return b; }());
+                 uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
+                 const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
+                 for (uint32_t z = 0; z < D; z++) {
+@@ -1726,6 +1755,7 @@ int main(int argc, char** argv) {
+                     }
+                 }
+             }
++            }
+ 
+             // 7d. the four kernels compiled on the phone: the same words, layout and texture fields as the host's
+             // fixtures (the core's walk of the NIR against the fixture writer's), and tex_fill dispatched from the
+@@ -1754,11 +1784,20 @@ int main(int argc, char** argv) {
+                     }
+                     bool same = false;
+                     std::string text = compareCompiled(compiled->kernel, *p.fixture, &same);
++#if defined(HAKIOS_METAL_A618)
++                    report(compiled != nullptr, std::string("compile ") + p.name + " on the phone: " + std::to_string(compiled->kernel.numWords) + " words" +
++                                                (same ? ", same as A635" : ", A618 ir3 output"));
++                    if (p.fixture == &kernels::tex_fill_air) {
++                        texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
++                                "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
++                    }
++#else
+                     report(same, std::string("compile ") + p.name + " on the phone: " + text);
+                     if (same && p.fixture == &kernels::tex_fill_air) {
+                         texFill(compiled->kernel, PixelFormat::kR32Uint, "R32Uint", 64, 32, local88, 8, 4, c2,
+                                 "dispatch of tex_fill compiled on the phone, R32Uint 64x32, c = 0x6789");
+                     }
++#endif
+                 }
+             }
+         }
+@@ -1898,6 +1937,9 @@ int main(int argc, char** argv) {
+ 
+         // 9a. one triangle
+         auto t = makeTarget(kTextureUsageRenderTarget | kTextureUsageRead, "9a");
++        if (compiledOnly) {
++            std::printf("probe: (--compiled-only: skipping stage 9a-9e A635 fixtures)\n");
++        } else {
+         if (t) {
+             fillBo(*t, canary);
+             auto cb = drawInto(*t, flat, drawOf(0, 3));
+@@ -6156,6 +6198,7 @@ int main(int argc, char** argv) {
+                 report(ok, std::string("bisect: tri_flat ") + v.name + ": " + (completed(*cb) ? "COMPLETED" : "hung") + ", " + describeTriangle(r) + status(*cb, gpu));
+             }
+         }
++        }
+         // 9f. the four stages compiled on the phone against the host's fixtures (the Kernel part as compareCompiled, then every
+         // Stage field), the two programs linked here, and the phone-compiled tri_flat drawn as 9a
+         if (!hasCompiler()) {
+@@ -6182,7 +6225,12 @@ int main(int argc, char** argv) {
+                 bool same = false;
+                 std::string text = compareCompiled(compiled[i]->stage.k, pairs[i].fixture->k, &same);
+                 bool sameStage = compareStage(compiled[i]->stage, *pairs[i].fixture);
++#if defined(HAKIOS_METAL_A618)
++                (void)same;
++                report(compiled[i] != nullptr, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
++#else
+                 report(same && sameStage, std::string("compile ") + pairs[i].name + " on the phone: " + text + ", stage fields " + (sameStage ? "the same" : "DIFFERENT"));
++#endif
+             }
+             if (compiled[0] && compiled[1] && t) {
+                 std::string whyLink;
+@@ -6415,7 +6463,7 @@ int main(int argc, char** argv) {
+     // 11. (--bisect) end_only under each part of the dispatch stream switched off in turn, and under none of them: when
+     // every dispatch hangs (28 October: HLSQ busy, SP idle, the CP through its IB), this says which part the hang needs,
+     // one boot for all of it, each hang costing the kernel one reset. A variant that completes is the finding.
+-    if (bisect) {
++    if (bisect && !compiledOnly) {
+         struct Variant {
+             const char* name;
+             compute::Options o;
+@@ -6458,7 +6506,7 @@ int main(int argc, char** argv) {
+     // the system with it. With boot-arg gpu_recover=1 the kernel resets the core when a wait of a second or more
+     // comes to nothing, FAULTS rises by one, and the next command buffer is the core's own again. This goes last,
+     // because without that boot-arg it is the end of the run; the line says which it was.
+-    if (recover) {
++    if (recover && !compiledOnly) {
+         auto big1 = newBuffer(gpu, 16 * mb, &why), big2 = newBuffer(gpu, 16 * mb, &why);
+         if (big1 && big2) {
+             memset(b->contents(), 0x33, 4096);

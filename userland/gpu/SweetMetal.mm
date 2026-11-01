@@ -78,6 +78,29 @@ missing(const char *cls, const char *sel)
 	os_log(sweet_log(), "SweetMetal: %{public}s has no %{public}s", cls ? cls : "?", sel ? sel : "?");
 }
 
+/* Is this process in /var/jb/etc/hakiosmetal.clients or environment? */
+static bool
+hakios_listed(void)
+{
+	if (getenv("HAKIOS_METAL_ENABLE") != NULL || getenv("USE_HAKIOS") != NULL) {
+		return true;
+	}
+	const char *me = getprogname();
+	FILE *f = fopen("/var/jb/etc/hakiosmetal.clients", "r");
+	char line[256];
+	bool yes = false;
+
+	if (f == NULL) {
+		return false;
+	}
+	while (!yes && fgets(line, sizeof(line), f) != NULL) {
+		line[strcspn(line, "\r\n \t#")] = 0;
+		yes = line[0] != 0 && (strcmp(line, "*") == 0 || (me != NULL && strcmp(line, me) == 0));
+	}
+	fclose(f);
+	return yes;
+}
+
 /* Is this process in /var/jb/etc/sweetmetal.clients? */
 static bool
 listed(void)
@@ -130,6 +153,36 @@ beside(const char *name, char *path, size_t size)
 	 * released: one leaked, empty object per process that asks.
 	 */
 	(void)CFBridgingRetain(self);
+
+	/*
+	 * Pure native HakiOS Metal path for processes listed in /var/jb/etc/hakiosmetal.clients.
+	 * Bypasses Turnip, Vulkan, and metal2vulkan.
+	 */
+	if (hakios_listed()) {
+		char hakios_core[1024];
+		if (beside("HakiosMetalCore.dylib", hakios_core, sizeof(hakios_core))) {
+			void *hhandle = dlopen(hakios_core, RTLD_NOW | RTLD_GLOBAL);
+			if (hhandle != NULL) {
+				typedef id (*hakios_open_fn)(unsigned int port);
+				hakios_open_fn hakios_open = (hakios_open_fn)dlsym(hhandle, "hakios_metal_open_device");
+				if (hakios_open != NULL) {
+					id hdev = hakios_open(port);
+					if (hdev != nil) {
+						os_log(sweet_log(), "SweetMetal: %{public}s gets HakiOS Metal device %{public}@",
+						       getprogname(), [hdev name]);
+						return hdev;
+					}
+				} else {
+					os_log_error(sweet_log(), "SweetMetal: dlsym hakios_metal_open_device failed: %{public}s", dlerror());
+				}
+			} else {
+				os_log_error(sweet_log(), "SweetMetal: dlopen %{public}s failed: %{public}s", hakios_core, dlerror());
+			}
+		} else {
+			os_log_error(sweet_log(), "SweetMetal: HakiosMetalCore.dylib not found beside plugin");
+		}
+	}
+
 	if (!listed()) {
 		return nil;
 	}

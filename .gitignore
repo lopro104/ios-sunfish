@@ -14,3 +14,7 @@ mesa/out/
 jb/
 COMMS.md
 .comms-seen/
+userland/gpu/HakiosMetalCore.dylib
+userland/gpu/SweetMetal
+userland/gpu/hakios-metal-client
+userland/gpu/hakios-test

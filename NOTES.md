@@ -1,5 +1,27 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-01 ~20:20 HANDOFF (Antigravity): HAKIOS METAL CORE DYLIB & SYSTEM CLIENT ROUTING OPERATIONAL
+- **Milestone Reached**:
+  - Standalone dynamic driver plugin `HakiosMetalCore.dylib` (8.1 MB, replacing 39 MB Turnip/m2v) compiled and deployed to `/System/Library/Extensions/SweetMetal.bundle/HakiosMetalCore.dylib`.
+  - Updated `userland/gpu/SweetMetal.mm` loader: processes listed in `/var/jb/etc/hakiosmetal.clients` (or with `HAKIOS_METAL_ENABLE=1`) are dynamically routed to `HakiosMetalCore.dylib` (`hakios_metal_open_device`), completely bypassing Turnip, Vulkan, and metal2vulkan.
+  - Processes in `/var/jb/etc/sweetmetal.clients` (such as `backboardd`) continue running unaffected on the stable Turnip/SweetMetal/GL stack.
+  - Zero code signature issues: verified ld64 creates ad-hoc signature directly; omitted unnecessary `ldid -S` on the dylib.
+  - Verified on physical hardware via Apple's standard public `MTLCreateSystemDefaultDevice()` (`mtldisc` and `hakios-metal-client`):
+    - `mtldisc`: `MTLCreateSystemDefaultDevice: HakiOS Adreno 618`, 1 MB blit fill 0 bytes wrong in **2.8 ms**.
+    - `hakios-metal-client` (pure public Metal API, no private headers):
+      1. Blit engine: 1 MB fill in **2.7 ms**, status = 4.
+      2. Compute pipeline: Apple CoreImage `MetalFaceMask_InitMinMax` compiled from AIR in **6.0 ms**, executed in **580 us**, verified INT_MAX/MIN hardware output.
+      3. Textures: 64x64 RGBA8Unorm `replaceRegion:` & `getBytes:` 0 errors.
+      4. Hardware clear pass: executed on GPU in **580 us**.
+      5. Zero-copy IOSurface: BGRA cleared on Adreno 618 in **256 us**, verified direct CPU readback.
+      6. QuartzCore UI render pipelines: loaded `/System/Library/Frameworks/QuartzCore.framework/default.metallib` (141 functions); **20 of 20** UI vertex/fragment render pipelines compiled and linked into `MTLRenderPipelineState` on-device with **0 failures** (upsample, ASG, variable blur, path rect, stroke lines, miter joins, round joins, blits).
+      7. GPU Family support: `supportsFamily:` returns YES for `MTLGPUFamilyCommon1/2/3` and `MTLGPUFamilyApple1/2/3`.
+  - Added `presentDrawable:`, `presentDrawable:atTime:`, `presentDrawable:afterMinimumDuration:`, `commandBufferWithDescriptor:`, and `newCommandQueueWithDescriptor:` to `HakiosMetal.m`.
+  - Reproducible build script added: `userland/gpu/build-hakios-metal.sh`.
+- **Next Concrete Actions**:
+  1. Test application UI presentation through `CAMetalLayer` with HakiOS Metal (e.g. `Preferences`, simple UIKit app).
+  2. Transition `backboardd` to HakiOS Metal once window server layer presentation is validated.
+
 ## 2026-11-01 ~19:50 HANDOFF (Antigravity): FULL GRAPHICS & COMPUTE METAL PIPELINE VERIFIED ON ADRENO 618
 - **Milestone Reached**:
   - Full graphics and compute pipeline working natively on the Adreno 618 (`sunfish`) with **0 failures**:
