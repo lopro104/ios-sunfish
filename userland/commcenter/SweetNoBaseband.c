@@ -13,6 +13,14 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <syslog.h>
+#include <unistd.h>
+#include <Security/Security.h>
+
+/* diagnostics: what the kernel tells this process about its own signature (sys/codesign.h) */
+extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+typedef struct __SecTask *SecTaskRef;
+extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
+extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
 #define kIOReturnNotFound 0xe00002f0
 
@@ -34,7 +42,18 @@ static const char *calls[] = {
 __attribute__((constructor)) static void
 sweet_no_baseband(void)
 {
-	hook_fn hook = (hook_fn)dlsym(RTLD_DEFAULT, "MSHookFunction");
+	uint32_t flags = 0;
+	uint8_t blob[16] = {0};
+	int st = csops(getpid(), 0 /* CS_OPS_STATUS */, &flags, sizeof(flags));
+	int ent = csops(getpid(), 7 /* CS_OPS_ENTITLEMENTS_BLOB */, blob, sizeof(blob));
+	int der = csops(getpid(), 16 /* CS_OPS_DER_ENTITLEMENTS_BLOB */, blob, sizeof(blob));
+	SecTaskRef task = SecTaskCreateFromSelf(NULL);
+	CFTypeRef v = task != NULL ? SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.developer.icloud-services"), NULL) : NULL;
+	syslog(LOG_NOTICE, "SweetNoBaseband: csops status %d flags 0x%x, entitlements blob %d, der blob %d, icloud-services %s",
+	    st, flags, ent, der, v != NULL ? "present" : "MISSING");
+	/* the injector loads a tweak without ElleKit's own library: open it for MSHookFunction (libsubstrate is its link) */
+	void *ellekit = dlopen("/var/jb/usr/lib/libellekit.dylib", RTLD_NOW);
+	hook_fn hook = (hook_fn)dlsym(ellekit != NULL ? ellekit : RTLD_DEFAULT, "MSHookFunction");
 	void *pdp = dlopen("/System/Library/PrivateFrameworks/ApplePDPHelper.framework/ApplePDPHelper", RTLD_NOW | RTLD_NOLOAD);
 
 	if (pdp == NULL) {

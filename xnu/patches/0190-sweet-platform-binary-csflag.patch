@@ -1,0 +1,33 @@
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -286,7 +286,10 @@
+ 	} else {
+ 		if (flags & CS_VALID) {
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-			/* On sweet/sunfish, do not strip CS_VALID from platform binaries when tweaks are injected */
++			/*
++			 * On sweet/sunfish, do not strip CS_VALID from platform binaries when tweaks are injected
++			 * (CS_PLATFORM_BINARY is put in the process's flags at exec for that: kern_exec.c, xnu 0190)
++			 */
+ 			if (!(flags & CS_PLATFORM_BINARY)) {
+ 				flags &= ~CS_VALID;
+ 				cs_procs_invalidated++;
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1394,6 +1394,16 @@
+ 	} else {
+ 		imgp->ip_csflags &= ~CS_VALID;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * The signature's platform-binary bit in the process's own flags, which stock XNU never sets (CS_OPS_STATUS
++	 * adds it from the blob): 0189's cs_invalid_page and csops tests read the flags, and without it every process
++	 * ElleKit hooks lost CS_VALID and with it its entitlements (CommCenter: CloudKit's entitlement trap).
++	 */
++	if ((load_result.csflags & CS_VALID) && load_result.platform_binary) {
++		imgp->ip_csflags |= CS_PLATFORM_BINARY;
++	}
++#endif
+ 
+ 	if (proc_getcsflags(p) & CS_EXEC_SET_HARD) {
+ 		imgp->ip_csflags |= CS_HARD;
