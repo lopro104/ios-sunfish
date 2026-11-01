@@ -1,7 +1,7 @@
 From 18a0bd202b0601c87d719d683ce414e3d9c63b51 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:07:49 +0200
-Subject: [PATCH 1/5] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
+Subject: [PATCH 1/6] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
  values from Mesa 25.0.7, no LPAC copies, GMEM CCU check per chip
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -187,7 +187,7 @@ index 4fb84ff..81a51c6 100644
 From 8d5547cccc1a33bb2284027514e4c1fcb25644d2 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:10:39 +0200
-Subject: [PATCH 2/5] SweetGPU as a second service name; out/ios-a618 for
+Subject: [PATCH 2/6] SweetGPU as a second service name; out/ios-a618 for
  CHIP=618; probe --blits-only; probe builds with clang 23
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -314,7 +314,7 @@ index 89cc762..05d2037 100644
 From 13748695d7bdeca63374e484cd0f514dbb061adb Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:33:23 +0200
-Subject: [PATCH 3/5] tests: the A618's values beside the A635's (test::kA618),
+Subject: [PATCH 3/6] tests: the A618's values beside the A635's (test::kA618),
  each worked out from Mesa 25.0.7; CHIP=618 253/0
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -586,7 +586,7 @@ index 85c086a..dcae6fd 100644
 From 0b758e0bc480275d898e0b985e53fa0af0df2c8d Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 19:05:14 +0200
-Subject: [PATCH 4/5] probe: add --compiled-only / --skip-fixtures for A618 and
+Subject: [PATCH 4/6] probe: add --compiled-only / --skip-fixtures for A618 and
  adapt compiler stages
 
 ---
@@ -879,7 +879,7 @@ index 05d2037..276bb8e 100644
 From fcd029754aded05360a515a3a40803db97be25cd Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 19:28:13 +0200
-Subject: [PATCH 5/5] plugin: implement HakiosMetalComputePipelineState and
+Subject: [PATCH 5/6] plugin: implement HakiosMetalComputePipelineState and
  HakiosMetalComputeEncoder
 
 ---
@@ -1325,6 +1325,1186 @@ index 80d4c14..b1c2c0a 100644
 +#endif
 +
  #endif
+-- 
+2.55.0
+
+
+From 8e895d3c651e9ae0ceca195cdad9771cddef0abd Mon Sep 17 00:00:00 2001
+From: Lopro <lopro104@outlook.com>
+Date: Sun, 1 Nov 2026 19:47:28 +0200
+Subject: [PATCH 6/6] plugin: implement HakiosMetalTexture,
+ HakiosMetalSamplerState, HakiosMetalRenderPipelineState, and
+ HakiosMetalRenderEncoder
+
+---
+ plugin/HakiosMetal.m | 1095 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1092 insertions(+), 3 deletions(-)
+
+diff --git a/plugin/HakiosMetal.m b/plugin/HakiosMetal.m
+index ab07a49..aeadd0f 100644
+--- a/plugin/HakiosMetal.m
++++ b/plugin/HakiosMetal.m
+@@ -103,11 +103,13 @@ static Class gQueueClass;
+  * QEMU) nothing of this is used and the device is what it was: buffers in plain memory, a queue that queues nothing.
+  */
+ #include "hakios-metal/hakios_metal.h"
++#include <IOSurface/IOSurfaceRef.h>
+ 
+ static void **stateOf(id self);
+ 
+ static hakios_metal_device *gGPU;               /* opened once; NULL: the kernel has no GPU to give */
+ static Class gCommandBufferClass, gBlitEncoderClass, gComputePipelineClass, gComputeEncoderClass;
++static Class gTextureClass, gSamplerClass, gRenderPipelineClass, gRenderEncoderClass;
+ 
+ struct commandbuffer {
+ 	hakios_metal_cb *cb;
+@@ -272,9 +274,6 @@ static const struct stubSpec {
+ 	const char * protocol;          /* the public protocol, and the family of private ones beginning with it */
+ } gStubSpecs[] = {
+ 	{ "newDepthStencilStateWithDescriptor:", "HakiosMetalDepthStencilState", "_MTLDepthStencilState", "MTLDepthStencilState" },
+-	{ "newSamplerStateWithDescriptor:", "HakiosMetalSamplerState", "_MTLSamplerState", "MTLSamplerState" },
+-	{ "newTextureWithDescriptor:", "HakiosMetalTexture", "_MTLTexture", "MTLTexture" },
+-	{ "newRenderPipelineStateWithDescriptor:error:", "HakiosMetalRenderPipelineState", "_MTLRenderPipelineState", "MTLRenderPipelineState" },
+ 	{ "newEventWithOptions:", "HakiosMetalEvent", "_MTLEvent", "MTLEvent" },
+ 	{ "newFence", "HakiosMetalFence", "_MTLFence", "MTLFence" },
+ };
+@@ -1062,6 +1061,8 @@ objectClass(const char *name, const char *base, const char *const *protocols, IM
+ #ifdef HAKIOS_METAL_GPU
+ static id deviceNewComputePipeline(id self, SEL _cmd, id function, NSError **error);
+ static void deviceNewComputePipelineAsync(id self, SEL _cmd, id function, void (^completion)(id, NSError *));
++static id bufferNewTexture(id self, SEL _cmd, id desc, unsigned long offset, unsigned long bytesPerRow);
++static void registerTextureAndSamplerClasses(Class device);
+ #endif
+ 
+ static void
+@@ -1081,6 +1082,9 @@ registerObjectClasses(Class device)
+ 		class_addMethod(gBufferClass, sel_registerName("didModifyRange:"), (IMP)bufferDidModify, "v@:{_NSRange=QQ}");
+ 		class_addMethod(gBufferClass, sel_registerName("gpuAddress"), (IMP)bufferGPUAddress, "Q@:");
+ 		class_addMethod(gBufferClass, sel_registerName("setPurgeableState:"), (IMP)bufferPurgeable, "Q@:Q");
++#ifdef HAKIOS_METAL_GPU
++		class_addMethod(gBufferClass, sel_registerName("newTextureWithDescriptor:offset:bytesPerRow:"), (IMP)bufferNewTexture, "@@:@QQ");
++#endif
+ 		objc_registerClassPair(gBufferClass);
+ 		class_addMethod(device, sel_registerName("newBufferWithLength:options:"), (IMP)deviceNewBuffer, "@@:QQ");
+ 		class_addMethod(device, sel_registerName("newBufferWithBytes:length:options:"), (IMP)deviceNewBufferBytes, "@@:r^vQQ");
+@@ -1119,6 +1123,7 @@ registerObjectClasses(Class device)
+ #ifdef HAKIOS_METAL_GPU
+ 	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:error:"), (IMP)deviceNewComputePipeline, "@@:@^@");
+ 	class_addMethod(device, sel_registerName("newComputePipelineStateWithFunction:completionHandler:"), (IMP)deviceNewComputePipelineAsync, "v@:@@?");
++	registerTextureAndSamplerClasses(device);
+ #endif
+ }
+ 
+@@ -1581,6 +1586,1061 @@ computeEnd(id self, __unused SEL _cmd)
+ 	}
+ }
+ 
++static hakios_metal_texture *gpuTextureOf(id texture);
++static hakios_metal_sampler *gpuSamplerOf(id sampler);
++
++static void
++computeSetTexture(id self, __unused SEL _cmd, id texture, unsigned long index)
++{
++	struct compute_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 31) return;
++	e->textures[index] = gpuTextureOf(texture);
++	if (index + 1 > e->maxTexture) e->maxTexture = (unsigned)(index + 1);
++}
++
++static void
++computeSetTextures(id self, SEL _cmd, const id *textures, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		computeSetTexture(self, _cmd, textures[k], range.location + k);
++	}
++}
++
++static void
++computeSetSampler(id self, __unused SEL _cmd, id sampler, unsigned long index)
++{
++	struct compute_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 16) return;
++	e->samplers[index] = gpuSamplerOf(sampler);
++	if (index + 1 > e->maxSampler) e->maxSampler = (unsigned)(index + 1);
++}
++
++static void
++computeSetSamplers(id self, SEL _cmd, const id *samplers, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		computeSetSampler(self, _cmd, samplers[k], range.location + k);
++	}
++}
++
++struct texture_data {
++	hakios_metal_texture *tex;
++	id buffer;        /* MTLBuffer, if created over buffer */
++	id iosurface;     /* IOSurface, if created over IOSurface */
++	id parentTexture; /* MTLTexture, if created as view */
++	id label;
++};
++
++static void
++textureFree(void *state)
++{
++	struct texture_data *t = (struct texture_data *)state;
++	if (t->tex != NULL) {
++		hakios_metal_texture_free(t->tex);
++	}
++	[t->buffer release];
++	[t->iosurface release];
++	[t->parentTexture release];
++	[t->label release];
++	free(t);
++}
++
++static void
++textureDealloc(id self, SEL _cmd)
++{
++	deallocWith(self, _cmd, gTextureClass, textureFree);
++}
++
++static hakios_metal_texture *
++gpuTextureOf(id texture)
++{
++	if (texture == nil) return NULL;
++	void **slot = stateOf(texture);
++	if (slot == NULL || *slot == NULL) return NULL;
++	struct texture_data *t = (struct texture_data *)*slot;
++	return t->tex;
++}
++
++static unsigned long
++textureWidth(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_width(t) : 0;
++}
++
++static unsigned long
++textureHeight(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_height(t) : 0;
++}
++
++static unsigned long
++textureDepth(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_depth(t) : 1;
++}
++
++static unsigned long
++textureMipmapLevels(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_levels(t) : 1;
++}
++
++static unsigned long
++textureType(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_type(t) : 2 /* MTLTextureType2D */;
++}
++
++static unsigned long
++texturePixelFormat(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_format(t) : 0;
++}
++
++static unsigned long
++textureUsage(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_usage(t) : 0;
++}
++
++static unsigned long
++textureSamples(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_samples(t) : 1;
++}
++
++static unsigned long
++textureArrayLength(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL) return 1;
++	unsigned type = hakios_metal_texture_type(t);
++	return (type == 3 || type == 6) ? hakios_metal_texture_depth(t) : 1;
++}
++
++static unsigned long
++textureAllocatedSize(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_allocated_bytes(t) : 0;
++}
++
++static uint64_t
++textureGpuAddress(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_gpu_address(t) : 0;
++}
++
++static uint64_t
++textureBytesPerRow(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_bytes_per_row(t) : 0;
++}
++
++static id
++textureBuffer(id self, __unused SEL _cmd)
++{
++	void **slot = stateOf(self);
++	if (slot == NULL || *slot == NULL) return nil;
++	struct texture_data *t = (struct texture_data *)*slot;
++	return t->buffer;
++}
++
++static unsigned long
++textureBufferOffset(__unused id self, __unused SEL _cmd)
++{
++	return 0;
++}
++
++static id
++textureIOSurface(id self, __unused SEL _cmd)
++{
++	void **slot = stateOf(self);
++	if (slot == NULL || *slot == NULL) return nil;
++	struct texture_data *t = (struct texture_data *)*slot;
++	return t->iosurface;
++}
++
++static unsigned long
++textureIOSurfacePlane(__unused id self, __unused SEL _cmd)
++{
++	return 0;
++}
++
++static uint64_t
++textureGpuResourceID(id self, __unused SEL _cmd)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	return t ? hakios_metal_texture_resource_id(t) : 0;
++}
++
++static void
++textureReplaceRegion(id self, __unused SEL _cmd, MTLRegion region, unsigned long level, const void *bytes, unsigned long bytesPerRow)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL || bytes == NULL) return;
++	hakios_metal_texture_replace_level(t, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,
++	                                   (unsigned)region.size.width, (unsigned)region.size.height, bytes, bytesPerRow);
++}
++
++static void
++textureReplaceRegion3D(id self, __unused SEL _cmd, MTLRegion region, unsigned long level, unsigned long slice,
++                       const void *bytes, unsigned long bytesPerRow, unsigned long bytesPerImage)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL || bytes == NULL) return;
++	hakios_metal_texture_replace_3d(t, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,
++	                                (unsigned)(region.origin.z + slice), (unsigned)region.size.width, (unsigned)region.size.height,
++	                                (unsigned)region.size.depth, bytes, bytesPerRow, bytesPerImage);
++}
++
++static void
++textureGetBytes(id self, __unused SEL _cmd, void *bytes, unsigned long bytesPerRow, MTLRegion region, unsigned long level)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL || bytes == NULL) return;
++	hakios_metal_texture_read_level(t, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,
++	                                (unsigned)region.size.width, (unsigned)region.size.height, bytes, bytesPerRow);
++}
++
++static void
++textureGetBytes3D(id self, __unused SEL _cmd, void *bytes, unsigned long bytesPerRow, unsigned long bytesPerImage,
++                  MTLRegion region, unsigned long level, unsigned long slice)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL || bytes == NULL) return;
++	hakios_metal_texture_read_3d(t, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,
++	                             (unsigned)(region.origin.z + slice), (unsigned)region.size.width, (unsigned)region.size.height,
++	                             (unsigned)region.size.depth, bytes, bytesPerRow, bytesPerImage);
++}
++
++static id
++textureWrap(hakios_metal_texture *t, id buffer, id iosurface, id parent)
++{
++	if (t == NULL) return nil;
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id obj = plain(plain((id)gTextureClass, sel_registerName("alloc")), sel_registerName("init"));
++	if (obj == nil) {
++		hakios_metal_texture_free(t);
++		return nil;
++	}
++	void **slot = stateOf(obj);
++	struct texture_data *td = calloc(1, sizeof(*td));
++	if (td == NULL || slot == NULL) {
++		free(td);
++		[obj release];
++		hakios_metal_texture_free(t);
++		return nil;
++	}
++	td->tex = t;
++	td->buffer = [buffer retain];
++	td->iosurface = [iosurface retain];
++	td->parentTexture = [parent retain];
++	*slot = td;
++	return obj;
++}
++
++static id
++deviceNewTexture(__unused id self, __unused SEL _cmd, id desc)
++{
++	if (desc == nil || gGPU == NULL) return nil;
++	unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("textureType"));
++	unsigned long format = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("pixelFormat"));
++	unsigned long width = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("width"));
++	unsigned long height = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("height"));
++	unsigned long depth = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("depth"));
++	unsigned long levels = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("mipmapLevelCount"));
++	unsigned long samples = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("sampleCount"));
++	unsigned long usage = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("usage"));
++	unsigned long arrayLength = 1;
++	if ([desc respondsToSelector:sel_registerName("arrayLength")]) {
++		arrayLength = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("arrayLength"));
++	}
++
++	hakios_metal_texture *t = NULL;
++	if (samples > 1) {
++		t = hakios_metal_texture_new_multisample(gGPU, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)samples, (unsigned)usage);
++	} else if (type == 3 || type == 6 || type == 1) {
++		unsigned layers = (unsigned)(arrayLength > 1 ? arrayLength : (depth > 1 ? depth : 1));
++		if (levels > 1) {
++			t = hakios_metal_texture_new_layered(gGPU, (unsigned)type, (unsigned)format, (unsigned)width, (unsigned)height, layers, (unsigned)levels, (unsigned)usage);
++		} else {
++			t = hakios_metal_texture_new_layers(gGPU, (unsigned)type, (unsigned)format, (unsigned)width, (unsigned)height, layers, (unsigned)usage);
++		}
++	} else if (type == 5) {
++		t = hakios_metal_texture_new_cube(gGPU, (unsigned)format, (unsigned)width, (unsigned)usage);
++	} else if (type == 7) {
++		t = hakios_metal_texture_new_3d(gGPU, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)(depth ? depth : 1), (unsigned)usage);
++	} else if (levels > 1) {
++		t = hakios_metal_texture_new_levels(gGPU, (unsigned)type, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)levels, (unsigned)usage);
++	} else {
++		t = hakios_metal_texture_new(gGPU, (unsigned)type, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)usage);
++	}
++	if (t == NULL) {
++		say([NSString stringWithFormat:@"newTextureWithDescriptor: failed (%s)", hakios_metal_error()]);
++		return nil;
++	}
++	return textureWrap(t, nil, nil, nil);
++}
++
++static id
++deviceNewTextureIOSurface(__unused id self, __unused SEL _cmd, id desc, id iosurface, unsigned long plane)
++{
++	if (desc == nil || iosurface == nil || gGPU == NULL) return nil;
++	unsigned long format = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("pixelFormat"));
++	unsigned long width = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("width"));
++	unsigned long height = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("height"));
++	unsigned long usage = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("usage"));
++
++	uint32_t surfaceId = 0;
++	if ([iosurface respondsToSelector:sel_registerName("surfaceID")]) {
++		surfaceId = ((uint32_t (*)(id, SEL))objc_msgSend)(iosurface, sel_registerName("surfaceID"));
++	} else {
++		surfaceId = IOSurfaceGetID((IOSurfaceRef)iosurface);
++	}
++
++	hakios_metal_texture *t = hakios_metal_texture_new_iosurface(gGPU, surfaceId, (unsigned)plane, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)usage);
++	if (t == NULL) {
++		say([NSString stringWithFormat:@"newTextureWithDescriptor:iosurface: failed (%s)", hakios_metal_error()]);
++		return nil;
++	}
++	return textureWrap(t, nil, iosurface, nil);
++}
++
++static id
++bufferNewTexture(id self, __unused SEL _cmd, id desc, unsigned long offset, unsigned long bytesPerRow)
++{
++	if (desc == nil) return nil;
++	hakios_metal_buffer *b = gpuBufferOf(self);
++	if (b == NULL) return nil;
++	unsigned long type = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("textureType"));
++	unsigned long format = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("pixelFormat"));
++	unsigned long width = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("width"));
++	unsigned long height = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("height"));
++	unsigned long usage = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("usage"));
++
++	hakios_metal_texture *t = hakios_metal_texture_new_buffer(b, (unsigned)type, (unsigned)format, (unsigned)width, (unsigned)height, (unsigned)usage, offset, bytesPerRow);
++	if (t == NULL) {
++		say([NSString stringWithFormat:@"newTextureWithDescriptor:offset:bytesPerRow: failed (%s)", hakios_metal_error()]);
++		return nil;
++	}
++	return textureWrap(t, self, nil, nil);
++}
++
++static id
++textureNewView(id self, __unused SEL _cmd, unsigned long pixelFormat, unsigned long type, NSRange levels, NSRange slices)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL) return nil;
++	hakios_metal_texture *view = hakios_metal_texture_new_view(t, (unsigned)pixelFormat, (unsigned)type,
++	                                                          (unsigned)levels.location, (unsigned)levels.length,
++	                                                          (unsigned)slices.location, (unsigned)slices.length);
++	if (view == NULL) {
++		say([NSString stringWithFormat:@"newTextureViewWithPixelFormat:... failed (%s)", hakios_metal_error()]);
++		return nil;
++	}
++	return textureWrap(view, nil, nil, self);
++}
++
++static id
++textureNewViewFormat(id self, SEL _cmd, unsigned long pixelFormat)
++{
++	hakios_metal_texture *t = gpuTextureOf(self);
++	if (t == NULL) return nil;
++	unsigned type = hakios_metal_texture_type(t);
++	unsigned levels = hakios_metal_texture_levels(t);
++	unsigned depth = hakios_metal_texture_depth(t);
++	return textureNewView(self, _cmd, pixelFormat, type, NSMakeRange(0, levels), NSMakeRange(0, depth));
++}
++
++struct sampler_data {
++	hakios_metal_sampler *sampler;
++	id label;
++};
++
++static void
++samplerFree(void *state)
++{
++	struct sampler_data *s = (struct sampler_data *)state;
++	if (s->sampler != NULL) {
++		hakios_metal_sampler_free(s->sampler);
++	}
++	[s->label release];
++	free(s);
++}
++
++static void
++samplerDealloc(id self, SEL _cmd)
++{
++	deallocWith(self, _cmd, gSamplerClass, samplerFree);
++}
++
++static hakios_metal_sampler *
++gpuSamplerOf(id sampler)
++{
++	if (sampler == nil) return NULL;
++	void **slot = stateOf(sampler);
++	if (slot == NULL || *slot == NULL) return NULL;
++	struct sampler_data *s = (struct sampler_data *)*slot;
++	return s->sampler;
++}
++
++static uint64_t
++samplerGpuResourceID(id self, __unused SEL _cmd)
++{
++	hakios_metal_sampler *s = gpuSamplerOf(self);
++	return s ? hakios_metal_sampler_resource_id(s) : 0;
++}
++
++static id
++deviceNewSamplerState(__unused id self, __unused SEL _cmd, id desc)
++{
++	if (desc == nil || gGPU == NULL) return nil;
++	struct hakios_metal_sampler_desc sd;
++	memset(&sd, 0, sizeof(sd));
++
++	sd.min_filter = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("minFilter"));
++	sd.mag_filter = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("magFilter"));
++	sd.mip_filter = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("mipFilter"));
++	sd.s_address = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("sAddressMode"));
++	sd.t_address = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("tAddressMode"));
++	sd.r_address = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("rAddressMode"));
++	sd.normalized_coordinates = ((BOOL (*)(id, SEL))objc_msgSend)(desc, sel_registerName("normalizedCoordinates"));
++	sd.lod_min_clamp = ((float (*)(id, SEL))objc_msgSend)(desc, sel_registerName("lodMinClamp"));
++	sd.lod_max_clamp = ((float (*)(id, SEL))objc_msgSend)(desc, sel_registerName("lodMaxClamp"));
++	sd.max_anisotropy = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("maxAnisotropy"));
++	sd.compare_function = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("compareFunction"));
++	sd.border_color = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("borderColor"));
++
++	hakios_metal_sampler *s = hakios_metal_sampler_new(gGPU, &sd);
++	if (s == NULL) {
++		say([NSString stringWithFormat:@"newSamplerStateWithDescriptor: failed (%s)", hakios_metal_error()]);
++		return nil;
++	}
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id obj = plain(plain((id)gSamplerClass, sel_registerName("alloc")), sel_registerName("init"));
++	if (obj == nil) {
++		hakios_metal_sampler_free(s);
++		return nil;
++	}
++	void **slot = stateOf(obj);
++	struct sampler_data *sd_alloc = calloc(1, sizeof(*sd_alloc));
++	if (sd_alloc == NULL || slot == NULL) {
++		free(sd_alloc);
++		[obj release];
++		hakios_metal_sampler_free(s);
++		return nil;
++	}
++	sd_alloc->sampler = s;
++	*slot = sd_alloc;
++	return obj;
++}
++
++struct render_pipeline {
++	hakios_metal_program *program;
++	id vertexFunction;
++	id fragmentFunction;
++	id label;
++};
++
++static void
++renderPipelineFree(void *state)
++{
++	struct render_pipeline *rp = (struct render_pipeline *)state;
++	if (rp->program != NULL) {
++		hakios_metal_program_free(rp->program);
++	}
++	[rp->vertexFunction release];
++	[rp->fragmentFunction release];
++	[rp->label release];
++	free(rp);
++}
++
++static void
++renderPipelineDealloc(id self, SEL _cmd)
++{
++	deallocWith(self, _cmd, gRenderPipelineClass, renderPipelineFree);
++}
++
++static hakios_metal_program *
++gpuProgramOf(id obj)
++{
++	if (obj == nil) return NULL;
++	void **slot = stateOf(obj);
++	if (slot == NULL || *slot == NULL) return NULL;
++	struct render_pipeline *rp = (struct render_pipeline *)*slot;
++	return rp->program;
++}
++
++static unsigned long
++renderPipelineMaxThreads(__unused id self, __unused SEL _cmd)
++{
++	return 1024;
++}
++
++static id
++deviceNewRenderPipeline(__unused id self, __unused SEL _cmd, id desc, NSError **error)
++{
++	if (desc == nil || gGPU == NULL) {
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: @"nil descriptor or no GPU"}];
++		}
++		return nil;
++	}
++	id vs = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("vertexFunction"));
++	id fs = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("fragmentFunction"));
++	if (vs == nil) {
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: @"vertexFunction is required"}];
++		}
++		return nil;
++	}
++	NSData *vsBitcode = nil, *fsBitcode = nil;
++	if ([vs respondsToSelector:sel_registerName("hakiosBitcode")]) {
++		vsBitcode = ((id (*)(id, SEL))objc_msgSend)(vs, sel_registerName("hakiosBitcode"));
++	} else if ([vs respondsToSelector:sel_registerName("bitcodeData")]) {
++		vsBitcode = ((id (*)(id, SEL))objc_msgSend)(vs, sel_registerName("bitcodeData"));
++	}
++	if (fs != nil) {
++		if ([fs respondsToSelector:sel_registerName("hakiosBitcode")]) {
++			fsBitcode = ((id (*)(id, SEL))objc_msgSend)(fs, sel_registerName("hakiosBitcode"));
++		} else if ([fs respondsToSelector:sel_registerName("bitcodeData")]) {
++			fsBitcode = ((id (*)(id, SEL))objc_msgSend)(fs, sel_registerName("bitcodeData"));
++		}
++	}
++	if (vsBitcode == nil || [vsBitcode length] == 0) {
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: @"vertex function has no bitcode"}];
++		}
++		return nil;
++	}
++
++	unsigned colorPixelFormat = 70; /* RGBA8Unorm default */
++	id colorAttachments = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("colorAttachments"));
++	id ca0 = colorAttachments != nil ? ((id (*)(id, SEL, unsigned long))objc_msgSend)(colorAttachments, sel_registerName("objectAtIndexedSubscript:"), 0) : nil;
++	if (ca0 != nil) {
++		unsigned long fmt = ((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("pixelFormat"));
++		if (fmt != 0) colorPixelFormat = (unsigned)fmt;
++	}
++
++	hakios_metal_program *prog = hakios_metal_program_new_bitcode([vsBitcode bytes], [vsBitcode length],
++	                                                              fsBitcode ? [fsBitcode bytes] : NULL,
++	                                                              fsBitcode ? [fsBitcode length] : 0,
++	                                                              colorPixelFormat);
++	if (prog == NULL) {
++		const char *err = hakios_metal_error();
++		say([NSString stringWithFormat:@"newRenderPipelineState: compile failed (%s)", err ? err : "unknown"]);
++		if (error != NULL) {
++			*error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithUTF8String:err ? err : "compile failed"]}];
++		}
++		return nil;
++	}
++
++	id vdesc = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("vertexDescriptor"));
++	if (vdesc != nil) {
++		id attrs = ((id (*)(id, SEL))objc_msgSend)(vdesc, sel_registerName("attributes"));
++		id layouts = ((id (*)(id, SEL))objc_msgSend)(vdesc, sel_registerName("layouts"));
++		if (attrs != nil) {
++			for (unsigned i = 0; i < 31; i++) {
++				id a = ((id (*)(id, SEL, unsigned long))objc_msgSend)(attrs, sel_registerName("objectAtIndexedSubscript:"), i);
++				if (a != nil) {
++					unsigned long format = ((unsigned long (*)(id, SEL))objc_msgSend)(a, sel_registerName("format"));
++					if (format != 0) {
++						unsigned long offset = ((unsigned long (*)(id, SEL))objc_msgSend)(a, sel_registerName("offset"));
++						unsigned long bufIdx = ((unsigned long (*)(id, SEL))objc_msgSend)(a, sel_registerName("bufferIndex"));
++						hakios_metal_program_set_vertex_attribute(prog, i, (unsigned)format, (unsigned)offset, (unsigned)bufIdx);
++					}
++				}
++			}
++		}
++		if (layouts != nil) {
++			for (unsigned i = 0; i < 31; i++) {
++				id l = ((id (*)(id, SEL, unsigned long))objc_msgSend)(layouts, sel_registerName("objectAtIndexedSubscript:"), i);
++				if (l != nil) {
++					unsigned long stride = ((unsigned long (*)(id, SEL))objc_msgSend)(l, sel_registerName("stride"));
++					if (stride != 0) {
++						unsigned long stepFunc = ((unsigned long (*)(id, SEL))objc_msgSend)(l, sel_registerName("stepFunction"));
++						unsigned long stepRate = ((unsigned long (*)(id, SEL))objc_msgSend)(l, sel_registerName("stepRate"));
++						hakios_metal_program_set_vertex_layout(prog, i, (unsigned)stride, (unsigned)stepFunc, (unsigned)stepRate);
++					}
++				}
++			}
++		}
++	}
++
++	if (ca0 != nil) {
++		BOOL blendEnabled = ((BOOL (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("isBlendingEnabled"));
++		unsigned rgbOp = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("rgbBlendOperation"));
++		unsigned aOp = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("alphaBlendOperation"));
++		unsigned sRgb = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("sourceRGBBlendFactor"));
++		unsigned dRgb = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("destinationRGBBlendFactor"));
++		unsigned sA = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("sourceAlphaBlendFactor"));
++		unsigned dA = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("destinationAlphaBlendFactor"));
++		unsigned mask = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("writeMask"));
++		if (mask == 0) mask = 0xf;
++		hakios_metal_program_set_blend(prog, blendEnabled ? 1 : 0, rgbOp, aOp, sRgb, dRgb, sA, dA, mask);
++	}
++
++	unsigned long samples = ((unsigned long (*)(id, SEL))objc_msgSend)(desc, sel_registerName("rasterSampleCount"));
++	if (samples > 1) {
++		hakios_metal_program_set_samples(prog, (unsigned)samples);
++	}
++
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id obj = plain(plain((id)gRenderPipelineClass, sel_registerName("alloc")), sel_registerName("init"));
++	if (obj == nil) {
++		hakios_metal_program_free(prog);
++		return nil;
++	}
++	void **slot = stateOf(obj);
++	struct render_pipeline *rp = calloc(1, sizeof(*rp));
++	if (rp == NULL || slot == NULL) {
++		free(rp);
++		[obj release];
++		hakios_metal_program_free(prog);
++		return nil;
++	}
++	rp->program = prog;
++	rp->vertexFunction = [vs retain];
++	rp->fragmentFunction = [fs retain];
++	*slot = rp;
++	say([NSString stringWithFormat:@"newRenderPipelineStateWithDescriptor: compiled (vs: %@, fs: %@, format: %u)",
++	     [vs name], fs ? [fs name] : @"(none)", colorPixelFormat]);
++	return obj;
++}
++
++static void
++deviceNewRenderPipelineAsync(id self, SEL _cmd, id desc, void (^completion)(id, NSError *))
++{
++	NSError *err = nil;
++	id pipe = deviceNewRenderPipeline(self, _cmd, desc, &err);
++	if (completion != nil) {
++		completion(pipe, err);
++	}
++}
++
++struct render_encoder {
++	id commandBuffer;
++	id pipeline;
++	hakios_metal_program *program;
++	struct hakios_metal_render_pass pass;
++	struct hakios_metal_viewport viewport;
++	struct hakios_metal_scissor scissor;
++	BOOL hasViewport;
++	BOOL hasScissor;
++	unsigned drawsCount;
++	hakios_metal_buffer *vsBuffers[31];
++	uint64_t vsOffsets[31];
++	unsigned maxVsBuffer;
++	hakios_metal_buffer *fsBuffers[31];
++	uint64_t fsOffsets[31];
++	unsigned maxFsBuffer;
++	hakios_metal_texture *vsTextures[31];
++	unsigned maxVsTexture;
++	hakios_metal_sampler *vsSamplers[16];
++	unsigned maxVsSampler;
++	hakios_metal_texture *fsTextures[31];
++	unsigned maxFsTexture;
++	hakios_metal_sampler *fsSamplers[16];
++	unsigned maxFsSampler;
++	BOOL ended;
++	id label;
++};
++
++static void
++renderEncoderFree(void *state)
++{
++	struct render_encoder *e = (struct render_encoder *)state;
++	[e->commandBuffer release];
++	[e->pipeline release];
++	[e->label release];
++	free(e);
++}
++
++static void
++renderEncoderDealloc(id self, SEL _cmd)
++{
++	deallocWith(self, _cmd, gRenderEncoderClass, renderEncoderFree);
++}
++
++static void
++renderSetPipeline(id self, __unused SEL _cmd, id pipeline)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended) return;
++	[e->pipeline release];
++	e->pipeline = [pipeline retain];
++	e->program = gpuProgramOf(pipeline);
++}
++
++static void
++renderSetViewport(id self, __unused SEL _cmd, MTLViewport vp)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended) return;
++	e->viewport.x = vp.originX;
++	e->viewport.y = vp.originY;
++	e->viewport.width = vp.width;
++	e->viewport.height = vp.height;
++	e->viewport.znear = vp.znear;
++	e->viewport.zfar = vp.zfar;
++	e->hasViewport = YES;
++}
++
++static void
++renderSetScissor(id self, __unused SEL _cmd, MTLScissorRect sc)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended) return;
++	e->scissor.x = (unsigned)sc.x;
++	e->scissor.y = (unsigned)sc.y;
++	e->scissor.width = (unsigned)sc.width;
++	e->scissor.height = (unsigned)sc.height;
++	e->hasScissor = YES;
++}
++
++static void
++renderSetVertexBuffer(id self, __unused SEL _cmd, id buffer, unsigned long offset, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 31) return;
++	e->vsBuffers[index] = gpuBufferOf(buffer);
++	e->vsOffsets[index] = offset;
++	if (index + 1 > e->maxVsBuffer) e->maxVsBuffer = (unsigned)(index + 1);
++}
++
++static void
++renderSetVertexBuffers(id self, SEL _cmd, const id *buffers, const unsigned long *offsets, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		renderSetVertexBuffer(self, _cmd, buffers[k], offsets[k], range.location + k);
++	}
++}
++
++static void
++renderSetFragmentBuffer(id self, __unused SEL _cmd, id buffer, unsigned long offset, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 31) return;
++	e->fsBuffers[index] = gpuBufferOf(buffer);
++	e->fsOffsets[index] = offset;
++	if (index + 1 > e->maxFsBuffer) e->maxFsBuffer = (unsigned)(index + 1);
++}
++
++static void
++renderSetFragmentBuffers(id self, SEL _cmd, const id *buffers, const unsigned long *offsets, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		renderSetFragmentBuffer(self, _cmd, buffers[k], offsets[k], range.location + k);
++	}
++}
++
++static void
++renderSetVertexTexture(id self, __unused SEL _cmd, id texture, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 31) return;
++	e->vsTextures[index] = gpuTextureOf(texture);
++	if (index + 1 > e->maxVsTexture) e->maxVsTexture = (unsigned)(index + 1);
++}
++
++static void
++renderSetVertexTextures(id self, SEL _cmd, const id *textures, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		renderSetVertexTexture(self, _cmd, textures[k], range.location + k);
++	}
++}
++
++static void
++renderSetFragmentTexture(id self, __unused SEL _cmd, id texture, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 31) return;
++	e->fsTextures[index] = gpuTextureOf(texture);
++	if (index + 1 > e->maxFsTexture) e->maxFsTexture = (unsigned)(index + 1);
++}
++
++static void
++renderSetFragmentTextures(id self, SEL _cmd, const id *textures, NSRange range)
++{
++	for (NSUInteger k = 0; k < range.length; k++) {
++		renderSetFragmentTexture(self, _cmd, textures[k], range.location + k);
++	}
++}
++
++static void
++renderSetVertexSampler(id self, __unused SEL _cmd, id sampler, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 16) return;
++	e->vsSamplers[index] = gpuSamplerOf(sampler);
++	if (index + 1 > e->maxVsSampler) e->maxVsSampler = (unsigned)(index + 1);
++}
++
++static void
++renderSetFragmentSampler(id self, __unused SEL _cmd, id sampler, unsigned long index)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended || index >= 16) return;
++	e->fsSamplers[index] = gpuSamplerOf(sampler);
++	if (index + 1 > e->maxFsSampler) e->maxFsSampler = (unsigned)(index + 1);
++}
++
++static void
++renderSetCullMode(id self, __unused SEL _cmd, unsigned long cullMode)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended) return;
++	e->pass.cull_mode = (unsigned)cullMode;
++}
++
++static void
++renderSetWinding(id self, __unused SEL _cmd, unsigned long winding)
++{
++	struct render_encoder *e = slotState(self);
++	if (e == NULL || e->ended) return;
++	e->pass.winding = (unsigned)winding;
++}
++
++static void
++renderDrawPrimitives(id self, __unused SEL _cmd, unsigned long primitive, unsigned long vertexStart, unsigned long vertexCount, unsigned long instanceCount)
++{
++	struct render_encoder *e = slotState(self);
++	struct commandbuffer *c = e != NULL && !e->ended ? slotState(e->commandBuffer) : NULL;
++
++	if (c == NULL || e->program == NULL) {
++		say(@"drawPrimitives: no command buffer or no render pipeline set");
++		return;
++	}
++	hakios_metal_cb_set_vertex_textures(c->cb, e->vsTextures, e->maxVsTexture, e->vsSamplers, e->maxVsSampler);
++	int rc = hakios_metal_cb_draw2(c->cb, e->program, &e->pass,
++	                               e->hasViewport ? &e->viewport : NULL,
++	                               e->hasScissor ? &e->scissor : NULL,
++	                               (unsigned)primitive, (unsigned)vertexStart, (unsigned)vertexCount,
++	                               (unsigned)(instanceCount > 0 ? instanceCount : 1),
++	                               e->vsBuffers, e->vsOffsets, e->maxVsBuffer,
++	                               e->fsBuffers, e->fsOffsets, e->maxFsBuffer,
++	                               e->fsTextures, e->maxFsTexture,
++	                               e->fsSamplers, e->maxFsSampler);
++	if (rc != 0) {
++		say([NSString stringWithFormat:@"drawPrimitives: failed (%s)", hakios_metal_error()]);
++	}
++	e->drawsCount++;
++	if (e->pass.load_action == 2 /* Clear */) {
++		e->pass.load_action = 1;
++	}
++}
++
++static void
++renderDrawPrimitivesSimple(id self, SEL _cmd, unsigned long primitive, unsigned long vertexStart, unsigned long vertexCount)
++{
++	renderDrawPrimitives(self, _cmd, primitive, vertexStart, vertexCount, 1);
++}
++
++static void
++renderDrawIndexed(id self, __unused SEL _cmd, unsigned long primitive, unsigned long indexCount, unsigned long indexType,
++                  id indexBuffer, unsigned long indexOffset, unsigned long instanceCount)
++{
++	struct render_encoder *e = slotState(self);
++	struct commandbuffer *c = e != NULL && !e->ended ? slotState(e->commandBuffer) : NULL;
++	hakios_metal_buffer *ib = gpuBufferOf(indexBuffer);
++
++	if (c == NULL || e->program == NULL || ib == NULL) {
++		say(@"drawIndexedPrimitives: no command buffer, pipeline or index buffer");
++		return;
++	}
++	hakios_metal_cb_set_vertex_textures(c->cb, e->vsTextures, e->maxVsTexture, e->vsSamplers, e->maxVsSampler);
++	int rc = hakios_metal_cb_draw_indexed(c->cb, e->program, &e->pass,
++	                                      e->hasViewport ? &e->viewport : NULL,
++	                                      e->hasScissor ? &e->scissor : NULL,
++	                                      (unsigned)primitive, (unsigned)indexCount, (unsigned)indexType,
++	                                      ib, indexOffset, (unsigned)(instanceCount > 0 ? instanceCount : 1),
++	                                      0, 0,
++	                                      e->vsBuffers, e->vsOffsets, e->maxVsBuffer,
++	                                      e->fsBuffers, e->fsOffsets, e->maxFsBuffer,
++	                                      e->fsTextures, e->maxFsTexture,
++	                                      e->fsSamplers, e->maxFsSampler);
++	if (rc != 0) {
++		say([NSString stringWithFormat:@"drawIndexedPrimitives: failed (%s)", hakios_metal_error()]);
++	}
++	e->drawsCount++;
++	if (e->pass.load_action == 2 /* Clear */) {
++		e->pass.load_action = 1;
++	}
++}
++
++static void
++renderDrawIndexedSimple(id self, SEL _cmd, unsigned long primitive, unsigned long indexCount, unsigned long indexType,
++                        id indexBuffer, unsigned long indexOffset)
++{
++	renderDrawIndexed(self, _cmd, primitive, indexCount, indexType, indexBuffer, indexOffset, 1);
++}
++
++static void
++renderEnd(id self, __unused SEL _cmd)
++{
++	struct render_encoder *e = slotState(self);
++	struct commandbuffer *c = e != NULL && !e->ended ? slotState(e->commandBuffer) : NULL;
++
++	if (e != NULL && !e->ended) {
++		if (e->drawsCount == 0 && c != NULL && e->pass.load_action == 2 /* Clear */) {
++			if (hakios_metal_cb_clear(c->cb, &e->pass) != 0) {
++				say([NSString stringWithFormat:@"renderEnd: cb_clear failed: %s", hakios_metal_error()]);
++			}
++		}
++		e->ended = YES;
++	}
++}
++
++static id
++commandBufferRenderEncoder(id self, __unused SEL _cmd, id desc)
++{
++	id (*plain)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	struct commandbuffer *c = slotState(self);
++	struct render_encoder *e;
++	void **slot;
++	id encoder;
++
++	if (c == NULL || c->committed || gRenderEncoderClass == Nil || desc == nil ||
++	    (encoder = plain(plain((id)gRenderEncoderClass, sel_registerName("alloc")), sel_registerName("init"))) == nil) {
++		return nil;
++	}
++	e = calloc(1, sizeof(*e));
++	slot = stateOf(encoder);
++	if (e == NULL || slot == NULL) {
++		free(e);
++		[encoder release];
++		return nil;
++	}
++	e->commandBuffer = [self retain];
++
++	id colorAttachments = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("colorAttachments"));
++	if (colorAttachments != nil) {
++		id ca0 = ((id (*)(id, SEL, unsigned long))objc_msgSend)(colorAttachments, sel_registerName("objectAtIndexedSubscript:"), 0);
++		if (ca0 != nil) {
++			id tex = ((id (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("texture"));
++			if (tex != nil) {
++				e->pass.color0 = gpuTextureOf(tex);
++				e->pass.load_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("loadAction"));
++				e->pass.store_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("storeAction"));
++				e->pass.color0_level = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("level"));
++				e->pass.color0_slice = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("slice"));
++				MTLClearColor cc = ((MTLClearColor (*)(id, SEL))objc_msgSend)(ca0, sel_registerName("clearColor"));
++				e->pass.clear_color[0] = cc.red;
++				e->pass.clear_color[1] = cc.green;
++				e->pass.clear_color[2] = cc.blue;
++				e->pass.clear_color[3] = cc.alpha;
++			}
++		}
++		for (unsigned i = 1; i <= 7; i++) {
++			id ca = ((id (*)(id, SEL, unsigned long))objc_msgSend)(colorAttachments, sel_registerName("objectAtIndexedSubscript:"), i);
++			if (ca != nil) {
++				id mtex = ((id (*)(id, SEL))objc_msgSend)(ca, sel_registerName("texture"));
++				if (mtex != nil) {
++					e->pass.more[i - 1].texture = gpuTextureOf(mtex);
++					e->pass.more[i - 1].load_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca, sel_registerName("loadAction"));
++					e->pass.more[i - 1].store_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca, sel_registerName("storeAction"));
++					e->pass.more[i - 1].level = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca, sel_registerName("level"));
++					e->pass.more[i - 1].slice = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(ca, sel_registerName("slice"));
++					MTLClearColor mcc = ((MTLClearColor (*)(id, SEL))objc_msgSend)(ca, sel_registerName("clearColor"));
++					e->pass.more[i - 1].clear_color[0] = mcc.red;
++					e->pass.more[i - 1].clear_color[1] = mcc.green;
++					e->pass.more[i - 1].clear_color[2] = mcc.blue;
++					e->pass.more[i - 1].clear_color[3] = mcc.alpha;
++				}
++			}
++		}
++	}
++
++	id depthAttachment = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("depthAttachment"));
++	if (depthAttachment != nil) {
++		id dtex = ((id (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("texture"));
++		if (dtex != nil) {
++			e->pass.depth = gpuTextureOf(dtex);
++			e->pass.depth_load_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("loadAction"));
++			e->pass.depth_store_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("storeAction"));
++			e->pass.clear_depth = ((double (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("clearDepth"));
++			e->pass.depth_level = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("level"));
++			e->pass.depth_slice = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(depthAttachment, sel_registerName("slice"));
++		}
++	}
++
++	id stencilAttachment = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("stencilAttachment"));
++	if (stencilAttachment != nil) {
++		id stex = ((id (*)(id, SEL))objc_msgSend)(stencilAttachment, sel_registerName("texture"));
++		if (stex != nil) {
++			e->pass.stencil = gpuTextureOf(stex);
++			e->pass.stencil_load_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(stencilAttachment, sel_registerName("loadAction"));
++			e->pass.stencil_store_action = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(stencilAttachment, sel_registerName("storeAction"));
++			e->pass.clear_stencil = (unsigned)((unsigned long (*)(id, SEL))objc_msgSend)(stencilAttachment, sel_registerName("clearStencil"));
++		}
++	}
++
++	*slot = e;
++	return [encoder autorelease];
++}
++
++static void
++registerTextureAndSamplerClasses(Class device)
++{
++	static const char *const tex[] = { "MTLTexture", "MTLResource", NULL };
++	static const char *const samp[] = { "MTLSamplerState", NULL };
++	static const char *const renderPipe[] = { "MTLRenderPipelineState", NULL };
++
++	if ((gTextureClass = objectClass("HakiosMetalTexture", "_MTLTexture", tex, (IMP)textureDealloc)) != Nil) {
++		class_addMethod(gTextureClass, sel_registerName("width"), (IMP)textureWidth, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("height"), (IMP)textureHeight, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("depth"), (IMP)textureDepth, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("mipmapLevelCount"), (IMP)textureMipmapLevels, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("textureType"), (IMP)textureType, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("pixelFormat"), (IMP)texturePixelFormat, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("usage"), (IMP)textureUsage, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("sampleCount"), (IMP)textureSamples, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("arrayLength"), (IMP)textureArrayLength, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("allocatedSize"), (IMP)textureAllocatedSize, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("gpuAddress"), (IMP)textureGpuAddress, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("bufferBytesPerRow"), (IMP)textureBytesPerRow, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("buffer"), (IMP)textureBuffer, "@@:");
++		class_addMethod(gTextureClass, sel_registerName("bufferOffset"), (IMP)textureBufferOffset, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("iosurface"), (IMP)textureIOSurface, "@@:");
++		class_addMethod(gTextureClass, sel_registerName("iosurfacePlane"), (IMP)textureIOSurfacePlane, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("gpuResourceID"), (IMP)textureGpuResourceID, "Q@:");
++		class_addMethod(gTextureClass, sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), (IMP)textureReplaceRegion, "v@:{?=QQQQQQ}Qr^vQ");
++		class_addMethod(gTextureClass, sel_registerName("replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"), (IMP)textureReplaceRegion3D, "v@:{?=QQQQQQ}QQr^vQQ");
++		class_addMethod(gTextureClass, sel_registerName("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), (IMP)textureGetBytes, "v@:^vQ{?=QQQQQQ}Q");
++		class_addMethod(gTextureClass, sel_registerName("getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:"), (IMP)textureGetBytes3D, "v@:^vQQ{?=QQQQQQ}QQ");
++		class_addMethod(gTextureClass, sel_registerName("newTextureViewWithPixelFormat:textureType:levels:slices:"), (IMP)textureNewView, "@@:QQ{_NSRange=QQ}{_NSRange=QQ}");
++		class_addMethod(gTextureClass, sel_registerName("newTextureViewWithPixelFormat:"), (IMP)textureNewViewFormat, "@@:Q");
++		objc_registerClassPair(gTextureClass);
++		class_addMethod(device, sel_registerName("newTextureWithDescriptor:"), (IMP)deviceNewTexture, "@@:@");
++		class_addMethod(device, sel_registerName("newTextureWithDescriptor:iosurface:plane:"), (IMP)deviceNewTextureIOSurface, "@@:@@Q");
++	}
++
++	if ((gSamplerClass = objectClass("HakiosMetalSamplerState", "_MTLSamplerState", samp, (IMP)samplerDealloc)) != Nil) {
++		class_addMethod(gSamplerClass, sel_registerName("gpuResourceID"), (IMP)samplerGpuResourceID, "Q@:");
++		objc_registerClassPair(gSamplerClass);
++		class_addMethod(device, sel_registerName("newSamplerStateWithDescriptor:"), (IMP)deviceNewSamplerState, "@@:@");
++	}
++
++	if ((gRenderPipelineClass = objectClass("HakiosMetalRenderPipelineState", "_MTLRenderPipelineState", renderPipe, (IMP)renderPipelineDealloc)) != Nil) {
++		class_addMethod(gRenderPipelineClass, sel_registerName("maxTotalThreadsPerThreadgroup"), (IMP)renderPipelineMaxThreads, "Q@:");
++		objc_registerClassPair(gRenderPipelineClass);
++		class_addMethod(device, sel_registerName("newRenderPipelineStateWithDescriptor:error:"), (IMP)deviceNewRenderPipeline, "@@:@^@");
++		class_addMethod(device, sel_registerName("newRenderPipelineStateWithDescriptor:completionHandler:"), (IMP)deviceNewRenderPipelineAsync, "v@:@@?");
++	}
++}
++
+ static id
+ commandBufferComputeEncoder(id self, __unused SEL _cmd)
+ {
+@@ -1693,6 +2753,7 @@ registerCommandClasses(void)
+ 		class_addMethod(gCommandBufferClass, sel_registerName("blitCommandEncoder"), (IMP)commandBufferBlitEncoder, "@@:");
+ 		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoder"), (IMP)commandBufferComputeEncoder, "@@:");
+ 		class_addMethod(gCommandBufferClass, sel_registerName("computeCommandEncoderWithDispatchType:"), (IMP)commandBufferComputeEncoder, "@@:Q");
++		class_addMethod(gCommandBufferClass, sel_registerName("renderCommandEncoderWithDescriptor:"), (IMP)commandBufferRenderEncoder, "@@:@");
+ 		class_addMethod(gCommandBufferClass, sel_registerName("GPUStartTime"), (IMP)commandBufferNoTime, "d@:");
+ 		class_addMethod(gCommandBufferClass, sel_registerName("GPUEndTime"), (IMP)commandBufferNoTime, "d@:");
+ 		objc_registerClassPair(gCommandBufferClass);
+@@ -1709,11 +2770,39 @@ registerCommandClasses(void)
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("setComputePipelineState:"), (IMP)computeSetPipeline, "v@:@");
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffer:offset:atIndex:"), (IMP)computeSetBuffer, "v@:@QQ");
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("setBuffers:offsets:withRange:"), (IMP)computeSetBuffers, "v@:r^@r^Q{_NSRange=QQ}");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setTexture:atIndex:"), (IMP)computeSetTexture, "v@:@Q");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setTextures:withRange:"), (IMP)computeSetTextures, "v@:r^@{_NSRange=QQ}");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setSamplerState:atIndex:"), (IMP)computeSetSampler, "v@:@Q");
++		class_addMethod(gComputeEncoderClass, sel_registerName("setSamplerStates:withRange:"), (IMP)computeSetSamplers, "v@:r^@{_NSRange=QQ}");
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"), (IMP)computeDispatch, "v@:{?=QQQ}{?=QQQ}");
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("dispatchThreads:threadsPerThreadgroup:"), (IMP)computeDispatchThreads, "v@:{?=QQQ}{?=QQQ}");
+ 		class_addMethod(gComputeEncoderClass, sel_registerName("endEncoding"), (IMP)computeEnd, "v@:");
+ 		objc_registerClassPair(gComputeEncoderClass);
+ 	}
++	static const char *const renderEnc[] = { "MTLRenderCommandEncoder", "MTLCommandEncoder", NULL };
++	if ((gRenderEncoderClass = objectClass("HakiosMetalRenderEncoder", "_MTLCommandEncoder", renderEnc, (IMP)renderEncoderDealloc)) != Nil) {
++		class_addMethod(gRenderEncoderClass, sel_registerName("setRenderPipelineState:"), (IMP)renderSetPipeline, "v@:@");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setViewport:"), (IMP)renderSetViewport, "v@:{?=dddddd}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setScissorRect:"), (IMP)renderSetScissor, "v@:{?=QQQQ}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setVertexBuffer:offset:atIndex:"), (IMP)renderSetVertexBuffer, "v@:@QQ");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setVertexBuffers:offsets:withRange:"), (IMP)renderSetVertexBuffers, "v@:r^@r^Q{_NSRange=QQ}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFragmentBuffer:offset:atIndex:"), (IMP)renderSetFragmentBuffer, "v@:@QQ");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFragmentBuffers:offsets:withRange:"), (IMP)renderSetFragmentBuffers, "v@:r^@r^Q{_NSRange=QQ}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setVertexTexture:atIndex:"), (IMP)renderSetVertexTexture, "v@:@Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setVertexTextures:withRange:"), (IMP)renderSetVertexTextures, "v@:r^@{_NSRange=QQ}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFragmentTexture:atIndex:"), (IMP)renderSetFragmentTexture, "v@:@Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFragmentTextures:withRange:"), (IMP)renderSetFragmentTextures, "v@:r^@{_NSRange=QQ}");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setVertexSamplerState:atIndex:"), (IMP)renderSetVertexSampler, "v@:@Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFragmentSamplerState:atIndex:"), (IMP)renderSetFragmentSampler, "v@:@Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setCullMode:"), (IMP)renderSetCullMode, "v@:Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("setFrontFacingWinding:"), (IMP)renderSetWinding, "v@:Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("drawPrimitives:vertexStart:vertexCount:instanceCount:"), (IMP)renderDrawPrimitives, "v@:QQQQ");
++		class_addMethod(gRenderEncoderClass, sel_registerName("drawPrimitives:vertexStart:vertexCount:"), (IMP)renderDrawPrimitivesSimple, "v@:QQQ");
++		class_addMethod(gRenderEncoderClass, sel_registerName("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:"), (IMP)renderDrawIndexed, "v@:QQ@QQ");
++		class_addMethod(gRenderEncoderClass, sel_registerName("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"), (IMP)renderDrawIndexedSimple, "v@:QQ@Q");
++		class_addMethod(gRenderEncoderClass, sel_registerName("endEncoding"), (IMP)renderEnd, "v@:");
++		objc_registerClassPair(gRenderEncoderClass);
++	}
+ }
+ #endif
+ 
 -- 
 2.55.0
 

@@ -1,26 +1,24 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## 2026-11-01 ~19:30 HANDOFF (Antigravity): HAKIOS METAL OBJECTIVE-C COMPUTE & BLIT VERIFIED ON ADRENO 618
+## 2026-11-01 ~19:50 HANDOFF (Antigravity): FULL GRAPHICS & COMPUTE METAL PIPELINE VERIFIED ON ADRENO 618
 - **Milestone Reached**:
-  - Full end-to-end Objective-C Metal pipeline working natively on the Adreno 618 (`sunfish`) with **0 failures**.
-  - Verified with `/var/jb/usr/bin/hakios-test` running on physical device:
-    1. Instantiates `HakiosMetalDevice` (name: `"HakiOS Adreno 618"`).
-    2. Allocates 1 MB SweetGPU buffer in write-combined memory.
-    3. `[cb blitCommandEncoder]` fillBuffer 1 MB: completed in **2.7 ms**, status = 4 (`Completed`), readback verified 0 bytes wrong.
-    4. Parses real Apple metallib `/System/Library/CoreImage/PortraitFilters.cifilter/default.metallib` (36 compute functions).
-    5. `[device newComputePipelineStateWithFunction:fn error:&err]`: compiles Apple's `MetalFaceMask_InitMinMax` from AIR bitcode directly to Adreno 618 machine code via in-process Mesa compiler in **6.2 ms**.
-    6. `[cb computeCommandEncoder]`: binds pipeline, binds 1 MB buffer, dispatches 1 group of 64 threads.
-    7. GPU execution completed in **353.5 us**, status = 4 (`Completed`).
-    8. Hardware output buffer verified: `[2147483647, 2147483647, 2147483647, -2147483648, -2147483648, -2147483648]` (exact `INT_MAX` x3, `INT_MIN` x3 match on GPU).
-- **Implementation Details (`HakiosMetal.m`)**:
-  - Dynamic Objective-C subclassing of private stock Metal classes: `_MTLDevice`, `_MTLCommandQueue`, `_MTLCommandBuffer`, `_MTLComputePipelineState`, `_MTLCommandEncoder`.
-  - Registered `SweetMetalDevice` as subclass of `HakiosMetalDevice` for compatibility.
-  - Device naming cleanly set to `"HakiOS Adreno 618"` (avoids Qualcomm `(TM)` trademark confusion).
-  - Client filter support: `/var/jb/etc/hakiosmetal.clients` and standalone test binary bypass.
-- **Next Steps**:
-  1. Implement `HakiosMetalTexture` (wrapping `hakios_metal_texture_new_iosurface`, `replaceRegion:`, `getBytes:`) and `HakiosMetalSamplerState`.
-  2. Implement `HakiosMetalRenderPipelineState` (`hakios_metal_program_new_bitcode`) and `HakiosMetalRenderEncoder` (`hakios_metal_cb_draw2`, clear).
-  3. Deploy `HakiosMetalCore.dylib` to allow individual client apps to use HakiOS Metal while `backboardd` remains on stable GL/SweetMetal.
+  - Full graphics and compute pipeline working natively on the Adreno 618 (`sunfish`) with **0 failures**:
+    1. **Blit Engine**: 1 MB fill on GPU in **2.8 ms**, status = 4 (`Completed`), 0 bytes wrong.
+    2. **On-Device Compute Shader Compilation**: Apple system shader `MetalFaceMask_InitMinMax` compiled from AIR bitcode to Adreno 618 ir3 via Mesa in **27.5 ms**.
+    3. **Compute Hardware Execution**: Dispatched 64 GPU threads in **373.8 us**, status = 4, readback verified exact `INT_MAX` x3 and `INT_MIN` x3 match.
+    4. **Textures & Samplers**: 64x64 RGBA8Unorm texture allocated, written with `replaceRegion:`, read back with `getBytes:` (0 errors); linear sampler created.
+    5. **Render Pass Clear**: Render command encoder recorded clear pass, executed in **323.9 us**, status = 4, exact clear color `[51, 102, 153, 255]` verified on GPU.
+    6. **IOSurface Binding**: Real 64x64 BGRA `IOSurface` wrapped via `newTextureWithDescriptor:iosurface:plane:0` (SweetGPU surface `0x7e` ioctl), cleared on GPU in **288.2 us**, read back directly through CPU `IOSurfaceGetBaseAddress` verifying `[102, 153, 204, 255]`.
+    7. **Render Pipeline Compilation & Triangle Draw**: Vertex shader (`tri_pos_vs`) + fragment shader (`tri_color_fs`) compiled and linked into `HakiosMetalRenderPipelineState` on-device in **8.9 ms**; vertex buffer with 3 vertices bound; `drawPrimitives` triangle rasterized on hardware Adreno 618 in **271.3 us**, status = 4, interpolated center pixel (32, 32) verified `[63, 67, 126, 255]`.
+- **Implementation Added to `HakiosMetal.m`**:
+  - `HakiosMetalTexture`: `width`, `height`, `depth`, `mipmapLevelCount`, `textureType`, `pixelFormat`, `usage`, `sampleCount`, `allocatedSize`, `gpuAddress`, `bufferBytesPerRow`, `buffer`, `iosurface`, `replaceRegion:`, `getBytes:`, `newTextureViewWithPixelFormat:`.
+  - `HakiosMetalSamplerState`: `newSamplerStateWithDescriptor:` wrapping `hakios_metal_sampler_new`.
+  - `HakiosMetalRenderPipelineState`: `newRenderPipelineStateWithDescriptor:error:` compiling vertex and fragment bitcode via `hakios_metal_program_new_bitcode`.
+  - `HakiosMetalRenderEncoder`: `setRenderPipelineState:`, `setViewport:`, `setScissorRect:`, `setVertexBuffer:offset:atIndex:`, `setVertexTexture:`, `setFragmentTexture:`, `setVertexSamplerState:`, `setFragmentSamplerState:`, `drawPrimitives:`, `drawIndexedPrimitives:`, `endEncoding`.
+  - `HakiosMetalCommandBuffer`: `renderCommandEncoderWithDescriptor:`.
+- **Next Concrete Actions**:
+  1. Build dynamic driver bundle `HakiosMetalCore.dylib` to allow individual client apps listed in `/var/jb/etc/hakiosmetal.clients` or `/var/jb/etc/sweetmetal.clients` to use HakiOS Metal while `backboardd` remains on stable GL/SweetMetal.
+  2. Verify client apps (e.g. `Preferences`, `MobileSafari`, or test apps) launch and render hardware accelerated graphics smoothly using HakiOS Metal.
 
 
 ## 2026-11-01 ~05:30 HANDOFF (Antigravity): RESPRING SPINNER DISMISSED & CS_VALID RESOLVED (XNU 0189)
