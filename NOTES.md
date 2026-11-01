@@ -1,6 +1,40 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## 2026-11-01 ~05:10 HANDOFF (Antigravity): FLASHLIGHT DEADLOCK & RESPRING SPINNER CYCLE RESOLVED
+## 2026-11-01 ~05:30 HANDOFF (Antigravity): RESPRING SPINNER DISMISSED & CS_VALID RESOLVED (XNU 0189)
+- **Root Cause & Mechanism**:
+  1. Tweak injection via `launchd_insert=/private/var/jb/usr/lib/ellekit/pspawn.dylib` triggered `cs_invalid_page()`, setting `CS_MODIFIED` (`0x02000000`) and clearing `CS_VALID` on SpringBoard.
+  2. Because `CS_VALID` was missing, `csops(CS_OPS_ENTITLEMENTS_BLOB)` failed with `EINVAL` (`error=22`).
+  3. `backboardd` rejected SpringBoard's check-in on `com.apple.backboard.system-app-server` as unentitled, keeping `BKAlternateSystemApp` (the startup spinner overlay) permanently rendered on screen.
+  4. `sleepd` rejected SpringBoard continuously, causing an infinite retry IPC storm consuming 191% CPU and overheating the SoC.
+- **Fix Applied & Verified (Kernel Patch 0189)**:
+  - `xnu/patches/0189-sweet-csops-platform-binary-valid.patch`:
+    - `bsd/kern/kern_cs.c`: In `cs_invalid_page()`, preserve `CS_VALID` for `CS_PLATFORM_BINARY` processes on sweet/sunfish.
+    - `bsd/kern/kern_proc.c`: In `CS_OPS_STATUS`, retain `CS_VALID` for `CS_PLATFORM_BINARY`. In `CS_OPS_ENTITLEMENTS_BLOB` and `CS_OPS_DER_ENTITLEMENTS_BLOB`, accept `CS_PLATFORM_BINARY` even if modified.
+  - Built `kernel.development.sweet` in Docker; packaged `shim/out/shim-local-0214-csvalid.img` and booted with `fastboot boot`.
+  - Verification:
+    - Respring spinner is completely dismissed!
+    - Framebuffer snapshot `sweet-shot 1` verified: **7,075 unique colors** across the active lockscreen clock, wallpaper gradient, and home quick actions.
+    - CPU load completely normalized: SpringBoard dropped to **0.4% CPU**, `sleepd` dropped to **0.0% CPU**, `backboardd` dropped to **0.0% CPU**. The phone is running cool.
+    - Backlight sysctl `kern.sweet_brightness` verified set and responsive.
+- **Observation / User Issue**:
+  - Device shows a respring spinner on the physical display even though `SpringBoard` is running (PID 20582) and `kern.sweetfb_shown` is advancing.
+  - Framebuffer dump (`sweet-shot 1`) decoded: 99.95% solid black `(0, 0, 0)` with the spinner pixels centered at `(540, 1170)`.
+- **Root Cause Reverse-Engineered**:
+  1. `backboardd` runs `BKAlternateSystemApp` to draw the startup/respring spinner overlay until the primary system shell (`SpringBoard`) connects and completes its check-in handshake.
+  2. SpringBoard's `BKSSystemShellService` connects to Mach service `com.apple.backboard.system-app-server` (endpoint `BKSSystemShell`).
+  3. When `backboardd` receives the connection, its security verification (`SecTaskCreateWithAuditToken` -> `SecTaskLoadEntitlements`) queries the kernel via `csops(CS_OPS_ENTITLEMENTS_BLOB)`.
+  4. Because ElleKit injected into SpringBoard via `DYLD_INSERT_LIBRARIES`, the kernel marked SpringBoard `CS_MODIFIED` (`0x02000000`) and cleared `CS_VALID`. SpringBoard's csflags are `0x26000000`.
+  5. In XNU `bsd/kern/kern_proc.c` lines 3310 & 3345:
+     `if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) { error = EINVAL; }`
+     Because `CS_VALID` is missing, `csops` returns `EINVAL` (error 22).
+  6. Verified in `oslog`:
+     `sleepd[74]: SecTaskLoadEntitlements failed error=22 cs_flags=26000000, pid=20582`
+     `sleepd[74]: connection from pid 20582 on mach service named com.apple.sleepd.sleepserver not entitled`
+  7. When `backboardd` rejects the connection as unentitled, `BKSSystemShellService` invokes its invalidation handler block (`0x18dcf9718`), which previously called `exit(0)` with `"shell service invalidation -- I'm out"`.
+  8. Although `exit(0)` was suppressed by `SweetTorch.c`, `backboardd` never received the check-in completion event (`_systemAppDidCheckin:` / `_queue_systemAppHasCheckedIn`). Thus `backboardd` never terminates `BKAlternateSystemApp`, keeping the spinner overlay visible over SpringBoard.
+  9. Furthermore, `sleepd` is continuously rejecting SpringBoard's connections for the same reason, causing SpringBoard to hammer `sleepd` in a rapid retry loop taking 190% CPU.
+- **Remedy / Next Action**:
+  - In XNU `bsd/kern/kern_proc.c` (under SWEET board config), adjust `CS_OPS_ENTITLEMENTS_BLOB` and `CS_OPS_DER_ENTITLEMENTS_BLOB` so that when `CS_PLATFORM_BINARY` is set (or `unentitled_ios_sim_launch` is active), entitlements are served even if `CS_VALID` was cleared by tweak injection (`CS_MODIFIED`), OR ensure `CS_VALID` is preserved. Alternatively, hook `SecTask` / `csops` in `libsunfish-inject.dylib` in `backboardd` to validate SpringBoard.
 - **Root Cause of Respring Spinner & 10s Respring**:
   1. `CoverSheet` synchronous XPC call to `mediaserverd` for `com.apple.coremedia.flashlight` deadlocked in `H10ISPServicesThread` on kernel turnstile lock due to missing Apple Camera ISP hardware on Pixel 4a.
   2. ElleKit's `MobileSafety.dylib` auto-safe-mode triggered on any crash/signal and touched `/var/mobile/.eksafemode`, disabling all tweaks in `/var/jb/usr/lib/TweakInject/`.

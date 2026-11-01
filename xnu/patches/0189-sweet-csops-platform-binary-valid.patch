@@ -1,0 +1,85 @@
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index 43b1ea6..b387b6c 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -285,11 +285,24 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 		proc_csflags_update(p, flags);
+ 	} else {
+ 		if (flags & CS_VALID) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			/* On sweet/sunfish, do not strip CS_VALID from platform binaries when tweaks are injected */
++			if (!(flags & CS_PLATFORM_BINARY)) {
++				flags &= ~CS_VALID;
++				cs_procs_invalidated++;
++				verbose = 1;
++				proc_csflags_update(p, flags);
++				cs_process_invalidated(NULL);
++			} else {
++				proc_csflags_update(p, flags);
++			}
++#else
+ 			flags &= ~CS_VALID;
+ 			cs_procs_invalidated++;
+ 			verbose = 1;
+ 			proc_csflags_update(p, flags);
+ 			cs_process_invalidated(NULL);
++#endif
+ 		} else {
+ 			proc_csflags_update(p, flags);
+ 		}
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index 407a18b..498fa61 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -3216,6 +3216,11 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		if (csproc_get_platform_path(pt)) {
+ 			retflags |= CS_PLATFORM_PATH;
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (retflags & CS_PLATFORM_BINARY) {
++			retflags |= CS_VALID;
++		}
++#endif
+ 		//Don't return CS_REQUIRE_LV if we turned it on with CS_FORCED_LV but still report CS_FORCED_LV
+ 		if ((proc_getcsflags(pt) & CS_FORCED_LV) == CS_FORCED_LV) {
+ 			retflags &= (~CS_REQUIRE_LV);
+@@ -3307,11 +3312,19 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		struct cs_blob* blob;
+ 
+ 		proc_lock(pt);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED | CS_PLATFORM_BINARY)) == 0) {
++			proc_unlock(pt);
++			error = EINVAL;
++			goto out;
++		}
++#else
+ 		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) {
+ 			proc_unlock(pt);
+ 			error = EINVAL;
+ 			goto out;
+ 		}
++#endif
+ 		blob = csproc_get_blob(pt);
+ 		proc_unlock(pt);
+ 
+@@ -3342,11 +3355,19 @@ csops_internal(pid_t pid, int ops, user_addr_t uaddr, user_size_t usersize, user
+ 		struct cs_blob* blob;
+ 
+ 		proc_lock(pt);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED | CS_PLATFORM_BINARY)) == 0) {
++			proc_unlock(pt);
++			error = EINVAL;
++			goto out;
++		}
++#else
+ 		if ((proc_getcsflags(pt) & (CS_VALID | CS_DEBUGGED)) == 0) {
+ 			proc_unlock(pt);
+ 			error = EINVAL;
+ 			goto out;
+ 		}
++#endif
+ 		blob = csproc_get_blob(pt);
+ 		proc_unlock(pt);
+ 
