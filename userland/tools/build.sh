@@ -11,4 +11,8 @@ echo "Building sweet-bootctl..."
 $CC -o sweet-bootctl sweet-bootctl.c
 $LDID -S sweet-bootctl
 
+echo "Building sweet-growfs..."
+$CC -o sweet-growfs sweet-growfs.c
+$LDID -S sweet-growfs
+
 echo "Done."
