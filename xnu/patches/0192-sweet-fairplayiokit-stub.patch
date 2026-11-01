@@ -1,0 +1,121 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetFairPlay.cpp
+@@ -0,0 +1,94 @@
++/*
++ * Built-in com_apple_driver_FairPlayIOKit for SWEET: Apple's FairPlay kernel driver is there by name and refuses
++ * every request.
++ *
++ * fairplayd.H2 (launchd KeepAlive, MachServices com.apple.fairplayd, .versioned, com.apple.unfreed) opens the
++ * FairPlay driver's user client (entitlement com.apple.private.FairPlayIOKitUserClient.access ->
++ * com_apple_driver_FairPlayIOKitUserClient). That driver is Apple's closed part of the kernelcache, and without it
++ * fairplayd exits 0 every ~10 s without serving its queue, so every client waiting on it hangs: locationd's
++ * CLMescalSigner, AirTraffic's AirFair.syncBundle (Settings > iPhone Storage), probably the App Store.
++ *
++ * Here the service exists (the class name fairplayd matches is decoded at run time; this is the user client's name
++ * without "UserClient", Apple's naming) and opens, and every call answers kIOReturnUnsupported, so that fairplayd may
++ * stay up and answer its clients with an error instead of leaving them waiting. Each selector is logged the first
++ * time it is used: the log says whether fairplayd found this at all.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class com_apple_driver_FairPlayIOKit : public IOService {
++	OSDeclareDefaultStructors(com_apple_driver_FairPlayIOKit);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(com_apple_driver_FairPlayIOKit, IOService);
++
++bool
++com_apple_driver_FairPlayIOKit::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "com_apple_driver_FairPlayIOKitUserClient");
++	registerService();
++	IOLog("SWEET FAIRPLAY: com_apple_driver_FairPlayIOKit registered (opens, refuses every request)\n");
++	return true;
++}
++
++class com_apple_driver_FairPlayIOKitUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(com_apple_driver_FairPlayIOKitUserClient);
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(com_apple_driver_FairPlayIOKitUserClient, IOUserClient);
++
++bool
++com_apple_driver_FairPlayIOKitUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
++{
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET FAIRPLAY: %s opens type %u\n", name, (unsigned)type);
++	return IOUserClient::initWithTask(owningTask, securityID, type);
++}
++
++IOReturn
++com_apple_driver_FairPlayIOKitUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static uint64_t sweet_fairplay_logged;  /* selectors already logged (< 64) */
++
++IOReturn
++com_apple_driver_FairPlayIOKitUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	if (selector >= 64 || !(sweet_fairplay_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_fairplay_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET FAIRPLAY: %s sel %u in %u/%u out %u/%u -> unsupported\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnUnsupported;
++}
++#endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = com_apple_driver_FairPlayIOKit;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = com_apple_driver_FairPlayIOKit;"
++    "   },"
++    "   {"
+     "     'IOClass'         = AppleIPAppender;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = AppleIPAppender;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -14,6 +14,7 @@
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetIPAppender.cpp                             optional iokitcpp
++iokit/Kernel/arm/SweetFairPlay.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
