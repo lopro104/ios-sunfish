@@ -1,5 +1,28 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-01 ~19:30 HANDOFF (Antigravity): HAKIOS METAL OBJECTIVE-C COMPUTE & BLIT VERIFIED ON ADRENO 618
+- **Milestone Reached**:
+  - Full end-to-end Objective-C Metal pipeline working natively on the Adreno 618 (`sunfish`) with **0 failures**.
+  - Verified with `/var/jb/usr/bin/hakios-test` running on physical device:
+    1. Instantiates `HakiosMetalDevice` (name: `"HakiOS Adreno 618"`).
+    2. Allocates 1 MB SweetGPU buffer in write-combined memory.
+    3. `[cb blitCommandEncoder]` fillBuffer 1 MB: completed in **2.7 ms**, status = 4 (`Completed`), readback verified 0 bytes wrong.
+    4. Parses real Apple metallib `/System/Library/CoreImage/PortraitFilters.cifilter/default.metallib` (36 compute functions).
+    5. `[device newComputePipelineStateWithFunction:fn error:&err]`: compiles Apple's `MetalFaceMask_InitMinMax` from AIR bitcode directly to Adreno 618 machine code via in-process Mesa compiler in **6.2 ms**.
+    6. `[cb computeCommandEncoder]`: binds pipeline, binds 1 MB buffer, dispatches 1 group of 64 threads.
+    7. GPU execution completed in **353.5 us**, status = 4 (`Completed`).
+    8. Hardware output buffer verified: `[2147483647, 2147483647, 2147483647, -2147483648, -2147483648, -2147483648]` (exact `INT_MAX` x3, `INT_MIN` x3 match on GPU).
+- **Implementation Details (`HakiosMetal.m`)**:
+  - Dynamic Objective-C subclassing of private stock Metal classes: `_MTLDevice`, `_MTLCommandQueue`, `_MTLCommandBuffer`, `_MTLComputePipelineState`, `_MTLCommandEncoder`.
+  - Registered `SweetMetalDevice` as subclass of `HakiosMetalDevice` for compatibility.
+  - Device naming cleanly set to `"HakiOS Adreno 618"` (avoids Qualcomm `(TM)` trademark confusion).
+  - Client filter support: `/var/jb/etc/hakiosmetal.clients` and standalone test binary bypass.
+- **Next Steps**:
+  1. Implement `HakiosMetalTexture` (wrapping `hakios_metal_texture_new_iosurface`, `replaceRegion:`, `getBytes:`) and `HakiosMetalSamplerState`.
+  2. Implement `HakiosMetalRenderPipelineState` (`hakios_metal_program_new_bitcode`) and `HakiosMetalRenderEncoder` (`hakios_metal_cb_draw2`, clear).
+  3. Deploy `HakiosMetalCore.dylib` to allow individual client apps to use HakiOS Metal while `backboardd` remains on stable GL/SweetMetal.
+
+
 ## 2026-11-01 ~05:30 HANDOFF (Antigravity): RESPRING SPINNER DISMISSED & CS_VALID RESOLVED (XNU 0189)
 - **Root Cause & Mechanism**:
   1. Tweak injection via `launchd_insert=/private/var/jb/usr/lib/ellekit/pspawn.dylib` triggered `cs_invalid_page()`, setting `CS_MODIFIED` (`0x02000000`) and clearing `CS_VALID` on SpringBoard.
