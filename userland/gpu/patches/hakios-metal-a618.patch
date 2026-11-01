@@ -1,0 +1,311 @@
+From 1763b15f6d1511a2437c2e62dc3527e3ffab1963 Mon Sep 17 00:00:00 2001
+From: Lopro <lopro104@outlook.com>
+Date: Sun, 1 Nov 2026 06:07:49 +0200
+Subject: [PATCH 1/2] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
+ values from Mesa 25.0.7, no LPAC copies, GMEM CCU check per chip
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JgmyR9ZNd3ffzyiFdiy9Dw
+---
+ Makefile                         |  7 ++++-
+ include/hakios-metal/a6xx.hpp    | 45 ++++++++++++++++++++++++++++++++
+ include/hakios-metal/compute.hpp |  3 ++-
+ src/command.cpp                  |  6 ++---
+ src/fake_gpu.cpp                 | 11 +++++---
+ 5 files changed, 64 insertions(+), 8 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index a4893a2..f559203 100644
+--- a/Makefile
++++ b/Makefile
+@@ -19,7 +19,12 @@ SAN       ?=
+ ifneq ($(SAN),)
+ override CXXFLAGS += -fsanitize=$(SAN) -fno-omit-frame-pointer
+ endif
+-HOSTOUT   = out/host$(if $(SAN),-$(SAN))
++# CHIP=618: the Adreno 618 (the Pixel 4a, ios-sunfish) instead of the A635, into out/host-a618 and out/ios-a618
++CHIP      ?=
++ifeq ($(CHIP),618)
++override CXXFLAGS += -DHAKIOS_METAL_A618
++endif
++HOSTOUT   = out/host$(if $(CHIP),-a$(CHIP))$(if $(SAN),-$(SAN))
+ .DEFAULT_GOAL := test
+ 
+ # The host tools that make shader kernels into fixtures (tools/kernels.mk), and the link of Mesa's compiler libraries
+diff --git a/include/hakios-metal/a6xx.hpp b/include/hakios-metal/a6xx.hpp
+index cd754d9..8e66459 100644
+--- a/include/hakios-metal/a6xx.hpp
++++ b/include/hakios-metal/a6xx.hpp
+@@ -27,14 +27,28 @@ namespace hakios::metal::a6xx {
+ // From Mesa's src/freedreno/common/freedreno_devices.py: the entry for chip_id ...06030500 ("Adreno 7c+ Gen 3", every
+ // speedbin of the A635) is a6xx_base + a6xx_gen4 with num_ccu = 2.
+ 
++// HAKIOS_METAL_A618 builds for the Pixel 4a's Adreno 618 instead (chip id 0x06010800, Mesa 25.0.7's entry for GPUIds
++// 615/616/618/619: a6xx_base + a6xx_gen1 + blit_wfi_quirk, num_ccu = 1, tile_align 32x32); every value that differs is
++// under the same #if, with its source.
++#if defined(HAKIOS_METAL_A618)
++inline constexpr uint32_t kChipId = 0x06010800;             // not-in-headers: freedreno_devices.py GPUId(618); sunfish dt qcom,chipid
++inline constexpr bool kHasLpac = false;                      // not-in-headers: a6xx_gen1 has no has_lpac
++#else
+ inline constexpr uint32_t kChipId = 0x06030500;             // not-in-headers: freedreno_devices.py GPUId(chip_id=0x..06030500)
+ inline constexpr bool kHasLpac = true;                       // not-in-headers: freedreno_devices.py a6xx_gen4.has_lpac
++#endif
+ inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base.supports_double_threadsize
+ // CP_LOAD_STATE6_0_NUM_UNIT for a shader (ST6_SHADER) is capped at this many instruction groups: Mesa's comment says
+ // the blob allows 128 but 128 hangs this generation, so 127 it is (a longer shader is fetched past the preload).
++#if defined(HAKIOS_METAL_A618)
++inline constexpr uint32_t kInstrCacheSize = 64;              // not-in-headers: freedreno_devices.py a6xx_gen1.instr_cache_size
++inline constexpr uint32_t kFibersPerSp = 128 * 16;           // not-in-headers: freedreno_devices.py, the A618 entry (fibers_per_sp)
++inline constexpr uint32_t kNumSpCores = 1;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A618
++#else
+ inline constexpr uint32_t kInstrCacheSize = 127;             // not-in-headers: freedreno_devices.py a6xx_gen4.instr_cache_size
+ inline constexpr uint32_t kFibersPerSp = 128 * 2 * 16;       // not-in-headers: freedreno_devices.py, the A635 entry (fibers_per_sp)
+ inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A635
++#endif
+ inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py, the A635 entry (cs_shared_mem_size)
+ inline constexpr uint32_t kThreadsizeBase = 64;              // not-in-headers: freedreno_devices.py A6xxGPUInfo default threadsize_base
+ inline constexpr uint32_t kMaxWaves = 16;                    // not-in-headers: freedreno_devices.py A6xxGPUInfo default max_waves
+@@ -1383,6 +1397,32 @@ struct RegWrite {
+ 
+ // Mesa's per-chip "magic" values, as its generated freedreno_devices.h has them for this chip (__info14, the entry every
+ // A635 chip id maps to). Mesa does not know what most of them mean either; they are what the blob writes.
++#if defined(HAKIOS_METAL_A618)
++// The A618's, from Mesa 25.0.7's freedreno_devices.py (its magic_regs; tile_max is the a6xx default, 1024 x 1008)
++inline constexpr uint32_t kMagicPcPowerCntl = 0;                  // not-in-headers: A618 .magic.PC_POWER_CNTL
++inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x00108000;      // not-in-headers: A618 .magic.TPL1_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0x00000880;      // not-in-headers: A618 .magic.GRAS_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicSpChickenBits = 0x00000430;       // not-in-headers: A618 .magic.SP_CHICKEN_BITS
++inline constexpr uint32_t kMagicUcheClientPf = 0x00000004;        // not-in-headers: A618 .magic.UCHE_CLIENT_PF
++inline constexpr uint32_t kMagicPcModeCntl = 0x1f;                // not-in-headers: A618 .magic.PC_MODE_CNTL
++inline constexpr uint32_t kMagicSpDbgEcoCntl = 0;                 // not-in-headers: A618 .magic.SP_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicRbDbgEcoCntl = 0x04100000;        // not-in-headers: A618 .magic.RB_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicHlsqDbgEcoCntl = 0x00080000;      // not-in-headers: A618 .magic.HLSQ_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicRbUnknown8E01 = 1;                // not-in-headers: A618 .magic.RB_UNKNOWN_8E01
++inline constexpr uint32_t kMagicVpcDbgEcoCntl = 0;                // not-in-headers: A618 .magic.VPC_DBG_ECO_CNTL
++inline constexpr uint32_t kMagicUcheUnknown0E12 = 1;              // not-in-headers: A618 .magic.UCHE_UNKNOWN_0E12
++inline constexpr bool kHasGmemFastClear = true;                   // not-in-headers: a6xx_base (25.0.7's a6xx_gen1 leaves it on)
++inline constexpr bool kConcurrentResolve = false;                 // not-in-headers: a6xx_base
++inline constexpr bool kHasEarlyPreamble = false;                  // not-in-headers: a6xx_gen1
++inline constexpr uint32_t kNumCcu = 1;                            // not-in-headers: A618 num_ccu
++inline constexpr uint32_t kSysmemPerCcuDepthCacheSize = 0x10000;  // not-in-headers: a6xx_base sysmem_per_ccu_depth_cache_size
++inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-headers: a6xx_base sysmem_per_ccu_color_cache_size
++inline constexpr uint32_t kGmemBytes = 512 * 1024;                // not-in-headers: Linux a6xx_gpu adreno_618 SZ_512K; sweet_adreno GMEM_SIZE
++inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: a6xx_base gmem_ccu_color_cache_fraction QUARTER
++inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 32;      // not-in-headers: A618 tile_align_w/h
++inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: A6xxGPUInfo gmem_align_w/h
++inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: A6xxGPUInfo tile_max_w/h for a6xx
++#else
+ inline constexpr uint32_t kMagicPcPowerCntl = 1;                  // not-in-headers: freedreno_devices.h __info14 .magic.PC_POWER_CNTL
+ inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x05008000;      // not-in-headers: freedreno_devices.h __info14 .magic.TPL1_DBG_ECO_CNTL (83918848)
+ inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.h __info14 .magic.GRAS_DBG_ECO_CNTL
+@@ -1408,6 +1448,7 @@ inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-hea
+ inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
+ inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
+ inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
++#endif
+ // the border color table both TP base registers point at: Gallium's is FD6_MAX_BORDER_COLORS (256) entries of
+ // sizeof(struct fd6_bcolor_entry) (128 bytes: 32 fp32/fp16/int words); zeros are a valid table (black, transparent)
+ inline constexpr uint32_t kBorderColorBytes = 256 * 128;          // not-in-headers: fd6_texture.h FD6_MAX_BORDER_COLORS * FD6_BORDER_COLOR_SIZE
+@@ -4084,7 +4125,11 @@ constexpr uint32_t rbCcuCntlGmem() {
+     return (kHasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) | A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(kGmemCcuColorOffset >> 21) |
+            A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(kGmemCcuColorOffset & 0x1fffff);
+ }
++#if defined(HAKIOS_METAL_A618)
++static_assert(rbCcuCntlGmem() == 0x3e400000, "the GMEM CCU layout turnip computes for this chip (512K - 1 * 64K / 4)");
++#else
+ static_assert(rbCcuCntlGmem() == 0x3c400000, "the GMEM CCU layout turnip computes for this chip");
++#endif
+ 
+ // hardware binning (fd6_gmem.cc emit_binning_pass, update_vsc_pipe, fd6_emit_tile_prep): the binning pass runs every draw's
+ // vertex stage once over the whole window and the VSC writes, for each pipe of bins, which draws and primitives reach
+diff --git a/include/hakios-metal/compute.hpp b/include/hakios-metal/compute.hpp
+index 147a5d5..e8ca160 100644
+--- a/include/hakios-metal/compute.hpp
++++ b/include/hakios-metal/compute.hpp
+@@ -25,6 +25,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "hakios-metal/a6xx.hpp"
+ #include "hakios-metal/kernel.hpp"
+ #include "hakios-metal/pm4.hpp"
+ 
+@@ -106,7 +107,7 @@ static_assert(kTableIbosAt + kMaxIbos * 64 <= kTableTexConstAt && kTableTexConst
+ struct Options {
+     bool prelude = true;        // SP_MODE_CONTROL, SP_PERFCTR_ENABLE, SP_FLOAT_CNTL, as computerator opens with
+     bool invalidateCmd = true;  // HLSQ_INVALIDATE_CMD before the program
+-    bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
++    bool hlsqCopies = a6xx::kHasLpac;   // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
+     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
+     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
+     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE
+diff --git a/src/command.cpp b/src/command.cpp
+index 9c896d2..2e4be8d 100644
+--- a/src/command.cpp
++++ b/src/command.cpp
+@@ -451,9 +451,9 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
+ }
+ 
+ namespace {
+-// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
+-constexpr uint32_t kSpCores = 2;
+-constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
++// the chip's SP cores and fibers an SP (a6xx.hpp, from freedreno_devices.py)
++constexpr uint32_t kSpCores = a6xx::kNumSpCores;
++constexpr uint32_t kFibersPerSp = a6xx::kFibersPerSp;
+ }  // namespace
+ 
+ std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {
+diff --git a/src/fake_gpu.cpp b/src/fake_gpu.cpp
+index 06c8223..a098a0e 100644
+--- a/src/fake_gpu.cpp
++++ b/src/fake_gpu.cpp
+@@ -653,11 +653,16 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
+         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
+         return false;
+     }
+-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
++    if (!kHasLpac) {
++        // a chip without LPAC (the A618) has no second copies: turnip never writes them there
++        if (reg(REG_A6XX_SP_CS_CNTL_0) != 0 || reg(REG_A6XX_SP_CS_CNTL_1) != 0 || reg(REG_A6XX_HLSQ_CS_CTRL_REG1) != 0) {
++            fault("SP_CS_CNTL_0/1 or HLSQ_CS_CTRL_REG1 written on a chip without LPAC (has_lpac is gen4's)");
++            return false;
++        }
++    } else if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
+         return false;
+-    }
+-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
++    } else if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
+         return false;
+     }
+-- 
+2.55.0
+
+
+From cfae22fae8009082ef5808e0a1b5d3dbf5746a13 Mon Sep 17 00:00:00 2001
+From: Lopro <lopro104@outlook.com>
+Date: Sun, 1 Nov 2026 06:10:39 +0200
+Subject: [PATCH 2/2] SweetGPU as a second service name; out/ios-a618 for
+ CHIP=618; probe --blits-only; probe builds with clang 23
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JgmyR9ZNd3ffzyiFdiy9Dw
+---
+ Makefile                | 18 +++++++++++-------
+ src/iokit_transport.cpp |  4 ++++
+ tools/probe.cpp         | 12 ++++++++++--
+ 3 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index f559203..3f00fd3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,6 +25,7 @@ ifeq ($(CHIP),618)
+ override CXXFLAGS += -DHAKIOS_METAL_A618
+ endif
+ HOSTOUT   = out/host$(if $(CHIP),-a$(CHIP))$(if $(SAN),-$(SAN))
++IOSOUT    = out/ios$(if $(CHIP),-a$(CHIP))
+ .DEFAULT_GOAL := test
+ 
+ # The host tools that make shader kernels into fixtures (tools/kernels.mk), and the link of Mesa's compiler libraries
+@@ -89,28 +90,31 @@ check: test
+ 	plugin/tests/metal-plugin-test.sh
+ 	GPU=1 plugin/tests/metal-plugin-test.sh
+ 
+-ios: out/ios/hakios-metal-probe out/ios/libhakios-metal.a
++ios: $(IOSOUT)/hakios-metal-probe $(IOSOUT)/libhakios-metal.a
+ 
+ darwin: ios
+ 
+ # with MESA=1 the compiler goes to the phone too, against the iOS build of Mesa's libraries (IOS_MESA_BUILD, tools/compiler.mk)
+ IOS_CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -Werror
+ IOS_LIBS     =
++ifeq ($(CHIP),618)
++IOS_CXXFLAGS += -DHAKIOS_METAL_A618
++endif
+ ifneq ($(strip $(MESA)),)
+ IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
+ IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
+ endif
+ 
+-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+-	@mkdir -p out/ios/obj
+-	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
++$(IOSOUT)/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
++	@mkdir -p $(IOSOUT)/obj
++	cd $(IOSOUT)/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
+ 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
+-	rm -f $@ && $(IOS_AR) $@ out/ios/obj/*.o
++	rm -f $@ && $(IOS_AR) $@ $(IOSOUT)/obj/*.o
+ 
+ # (and the front end's archive, as the host tests: a probe linked before the front end changed tests the old one)
+-out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
++$(IOSOUT)/hakios-metal-probe: tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(wildcard tests/fixtures/*.hpp) \
+ 		$(if $(strip $(MESA)),$(IOS_MESA_BUILD)/src/compiler/air/libair.a)
+-	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp out/ios/libhakios-metal.a $(IOS_LIBS) \
++	$(IOS_CXX) $(IOS_CXXFLAGS) -Iinclude -o $@ tools/probe.cpp $(IOSOUT)/libhakios-metal.a $(IOS_LIBS) \
+ 		-framework IOKit -framework CoreFoundation -framework IOSurface
+ 
+ 
+diff --git a/src/iokit_transport.cpp b/src/iokit_transport.cpp
+index 48ef40e..8a5b86f 100644
+--- a/src/iokit_transport.cpp
++++ b/src/iokit_transport.cpp
+@@ -66,6 +66,10 @@ private:
+ 
+ std::unique_ptr<Transport> openKernelGpu(std::string* why) {
+     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("HakiosGPU"));
++    if (s == 0) {
++        // ios-sunfish's kernel: SweetGPU, a port of this same driver (the same requests and structures)
++        s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
++    }
+     if (s == 0) {
+         *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
+         return nullptr;
+diff --git a/tools/probe.cpp b/tools/probe.cpp
+index 153f6f4..b6dee12 100644
+--- a/tools/probe.cpp
++++ b/tools/probe.cpp
+@@ -373,12 +373,15 @@ static const char* dimName(uint8_t dim) {
+ }
+ 
+ int main(int argc, char** argv) {
+-    bool recover = false, bisect = false;
++    bool recover = false, bisect = false, blitsOnly = false;
+     compute::Options chosen;   // what the dispatches of stage 5 are encoded with
+     std::vector<std::pair<std::string, std::string>> metallibs;   // --metallib FILE FUNCTION: a kernel of the phone's own image
+     for (int i = 1; i < argc; i++) {
+         recover = recover || strcmp(argv[i], "--recover") == 0;
+         bisect = bisect || strcmp(argv[i], "--bisect") == 0;
++        // --blits-only: stages 1-4 (the command processor's copies and fills, no shader), for a GPU this driver has
++        // not run on yet (ios-sunfish's A618: the fixtures' machine code is the A635's)
++        blitsOnly = blitsOnly || strcmp(argv[i], "--blits-only") == 0;
+         // --notail: no end-of-dispatch events and waits of our own; the kernel's own CACHE_FLUSH_TS fence closes the
+         // submission (28 October: with them every dispatch hung, without them end_only completed in 48 us)
+         if (strcmp(argv[i], "--notail") == 0) chosen.tail = false;
+@@ -503,6 +506,11 @@ int main(int argc, char** argv) {
+         }
+     }
+ 
++    if (blitsOnly) {
++        std::printf("probe: --blits-only, stopping before stage 5\n");
++        std::printf("probe: %d failure%s\n", failures, failures == 1 ? "" : "s");
++        return failures;
++    }
+     // 5. compute, in order of hazard: the first shader instructions this driver has ever had the GPU run. The fake GPU
+     // checked that the dispatch holds together; only this says whether the GPU runs it, and what it writes.
+     {
+@@ -1464,7 +1472,7 @@ int main(int argc, char** argv) {
+                 const uint64_t words = t->buffer()->length() / 4;
+                 for (uint64_t i = 0; i < words; i++) w[i] = canary;
+                 const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
+-                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, Bindings{{}, {t.get()}});
++                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, [&] { Bindings b; b.textures = {t.get()}; return b; }());
+                 uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
+                 const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
+                 for (uint32_t z = 0; z < D; z++) {
+-- 
+2.55.0
+
