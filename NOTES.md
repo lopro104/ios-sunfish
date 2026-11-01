@@ -1,5 +1,17 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-01 ~03:45 HANDOFF (Antigravity): VERBOSE BOOT HANG & FLASHLIGHT UNBLOCK FIXED
+- **Root Cause of "Still Verbose" / Boot Hang**:
+  1. `CommCenter` had been crash-looping every 2s, spamming the early console; disabled with `tools/sweet-commcenter.py --disable`.
+  2. The lock screen (`CoverSheet`) initializes the flashlight/torch quick action during boot. It calls `SpringBoardUI` -> `AVFCapture` -> `CMCapture` which makes a synchronous Mach/XPC request to `mediaserverd` for `com.apple.coremedia.flashlight`.
+  3. Without `SweetTorch.dylib` installed in MobileSubstrate, `mediaserverd` has no camera/torch vendor and never answers, deadlocking SpringBoard's main thread on a turnstile. SpringBoard never completed its startup or rendered its first frame (`kern.sweetfb_shown: 0`), leaving the display showing the early kernel verbose console.
+- **Fix Applied & Verified**:
+  - Built and installed `SweetTorch.dylib` + `SweetTorch.plist` (XML format) into `/var/jb/Library/MobileSubstrate/DynamicLibraries/` on device (commit `7bca6e5`).
+  - `SweetTorch` hooks `BWFigCaptureDeviceVendor` in `mediaserverd` and swizzles `AVFlashlight` / `SBUIFlashlightController` in `SpringBoard` to control `kern.sweet_torch` directly without hanging.
+  - Placed `SweetMetalCore.dylib.v1` and created `sync_commit` (set to `2`) in `/System/Library/Extensions/SweetMetal.bundle/`.
+  - Restarted `mediaserverd` and `SpringBoard`: SpringBoard immediately exited the turnstile deadlock, entered the normal `GSEventRunModal` event loop, submitted frames to `backboardd`, and `AppleCLCD` presented frames (`kern.sweetfb_shown: 1`). SweetMetal telemetry confirms 44 commits completed cleanly on the Adreno 618 (mean commit-to-complete ~39.9 ms).
+  - Backlight sysctl `kern.sweet_brightness` is set and CoreBrightness is active.
+
 ## 2026-10-30 ~21:20 QUALCOMM BOOTCTL IMPLEMENTED (Antigravity): XNU 0188 & USERLAND BOOTCTL
 - **Goal**: Allow iOS to mark boots as successful and control A/B boot slots so Qualcomm's ABL (Android Bootloader) does not decrement tries or mark the slot unbootable (`0x80`).
 - **Kernel Implementation (`xnu/patches/0188-sweet-bootctl.patch`)**:
