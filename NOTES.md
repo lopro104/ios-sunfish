@@ -1,5 +1,23 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-01 ~05:10 HANDOFF (Antigravity): FLASHLIGHT DEADLOCK & RESPRING SPINNER CYCLE RESOLVED
+- **Root Cause of Respring Spinner & 10s Respring**:
+  1. `CoverSheet` synchronous XPC call to `mediaserverd` for `com.apple.coremedia.flashlight` deadlocked in `H10ISPServicesThread` on kernel turnstile lock due to missing Apple Camera ISP hardware on Pixel 4a.
+  2. ElleKit's `MobileSafety.dylib` auto-safe-mode triggered on any crash/signal and touched `/var/mobile/.eksafemode`, disabling all tweaks in `/var/jb/usr/lib/TweakInject/`.
+  3. Without `SweetTorch.dylib` loaded, stock SpringBoard attempted the synchronous hardware query on every boot, permanently hanging on the reload spinner.
+  4. Once booted, `BackBoardServices` invoked `exit(0)` on two watchdog callbacks: `"shell service invalidation -- I'm out"` (`0x3b718`) and `"backboardd must be going down, exiting"` (`0x3cc54`), causing SpringBoard to respring every 10 seconds.
+- **Fixes Applied & Verified**:
+  - `MobileSafety.dylib`: Replaced with a no-op stub (backup at `/var/jb/usr/lib/ellekit/MobileSafety.dylib.orig`) so ElleKit never enters safe mode or disables tweaks on non-Apple hardware.
+  - `SweetTorch.dylib` (`userland/torch/SweetTorch.c`):
+    - Uses ElleKit's `MSHookFunction` on `+[SBUIFlashlightController sharedInstance]`, `-[SBUIFlashlightController init]`, `-[AVFlashlight init]`, and `-[AVFlashlight _setupFlashlight]` to provide an in-memory mock singleton, completely eliminating calls to `mediaserverd`.
+    - Swizzles `BSSystemContainerForCurrentProcessPathProvider` (`defaultPath`, `libraryPath`, `cachesPath`) preventing `PaperBoardUI` container crashes.
+    - Hooks `TCCAccessRequest` & `TCCAccessPreflight` and added `NSMotionUsageDescription` to `SpringBoard.app/Info.plist` to prevent TCC privacy violation aborts.
+    - Hooks `BackBoardServices` watchdog exits at `fbase + 0x3b718` and `fbase + 0x3cc54`, suppressing the unexpected `exit(0)` respring.
+  - Verification:
+    - SpringBoard (PID 20582) is completely stable and running continuously (uptime > 3 min, CPU time > 4:30).
+    - Framebuffer snapshot `sweet-shot 1` verified: 438 unique colors (lockscreen clock, wallpaper, and quick actions actively rendered).
+    - Torch sysctl `kern.sweet_torch` verified working and controls hardware LED directly (`0` = off, `100` = on).
+
 ## 2026-11-01 ~03:45 HANDOFF (Antigravity): VERBOSE BOOT HANG & FLASHLIGHT UNBLOCK FIXED
 - **Root Cause of "Still Verbose" / Boot Hang**:
   1. `CommCenter` had been crash-looping every 2s, spamming the early console; disabled with `tools/sweet-commcenter.py --disable`.

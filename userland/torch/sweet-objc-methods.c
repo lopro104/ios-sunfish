@@ -24,6 +24,12 @@ list(Class cls, char kind)
 int
 main(int argc, char **argv)
 {
+	Class nsobj = objc_getClass("NSObject");
+	if (!objc_getClass("SearchUI") && nsobj) {
+		Class searchUI = objc_allocateClassPair(nsobj, "SearchUI", 0);
+		if (searchUI) objc_registerClassPair(searchUI);
+	}
+
 	if (argc != 3) {
 		fprintf(stderr, "usage: %s FRAMEWORK-PATH CLASS\n", argv[0]);
 		return 2;
