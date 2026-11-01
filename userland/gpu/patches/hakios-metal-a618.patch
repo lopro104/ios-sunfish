@@ -1,4 +1,4 @@
-From 1763b15f6d1511a2437c2e62dc3527e3ffab1963 Mon Sep 17 00:00:00 2001
+From e5759891fb24d90ec5bdbc82cc6f6ce0602c8095 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:07:49 +0200
 Subject: [PATCH 1/3] Adreno 618 (CHIP=618 / HAKIOS_METAL_A618): the chip's
@@ -184,7 +184,7 @@ index 06c8223..a098a0e 100644
 2.55.0
 
 
-From cfae22fae8009082ef5808e0a1b5d3dbf5746a13 Mon Sep 17 00:00:00 2001
+From a7d52463500eae0c562b02ba45bda6d5fd468011 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:10:39 +0200
 Subject: [PATCH 2/3] SweetGPU as a second service name; out/ios-a618 for
@@ -265,7 +265,7 @@ index 48ef40e..8a5b86f 100644
          *why = "no HakiosGPU service: the kernel has not started the GPU (gpu=1, the firmware in fw-gpu/, the phone)";
          return nullptr;
 diff --git a/tools/probe.cpp b/tools/probe.cpp
-index 153f6f4..b6dee12 100644
+index 461753b..7745643 100644
 --- a/tools/probe.cpp
 +++ b/tools/probe.cpp
 @@ -373,12 +373,15 @@ static const char* dimName(uint8_t dim) {
@@ -310,7 +310,7 @@ index 153f6f4..b6dee12 100644
 2.55.0
 
 
-From 318b038549a468f185775fd84b9fd83c8d345b88 Mon Sep 17 00:00:00 2001
+From 5e3c649431d21915f50f555a4720d0ac929c2061 Mon Sep 17 00:00:00 2001
 From: Lopro <lopro104@outlook.com>
 Date: Sun, 1 Nov 2026 06:33:23 +0200
 Subject: [PATCH 3/3] tests: the A618's values beside the A635's (test::kA618),
