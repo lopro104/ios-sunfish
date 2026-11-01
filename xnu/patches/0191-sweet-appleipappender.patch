@@ -1,0 +1,109 @@
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetIPAppender.cpp
+@@ -0,0 +1,82 @@
++/*
++ * Built-in AppleIPAppender for SWEET: a modem packet-data service that is there and refuses every request.
++ *
++ * CommCenter takes the phone for an iPhone with a modem (ADT baseband-chipset, MobileGestalt telephony) and drives
++ * the modem's packet-data path through ApplePDPHelper.framework, whose ApplePDPHelperInterface::getInstance() runs
++ * init(): IOServiceMatching("AppleIPAppender"), IOServiceOpen type 0, an IOGeneralInterest notification. With no such
++ * service init() fails, getInstance() leaves CommCenter a NULL instance, and its first call locks a mutex at address
++ * 0 (CommCenter sig 11 every 2 s; Settings' Privacy page then drops Location Services, which asks CommCenter first).
++ *
++ * Here the service exists and opens, so the instance is made, and every call into it answers kIOReturnUnsupported:
++ * ApplePDPHelper hands that back to CommCenter as a failed operation ("Performing '%s' failed"), as for a modem
++ * that is down. Each selector is logged the first time it is used.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++
++class AppleIPAppender : public IOService {
++	OSDeclareDefaultStructors(AppleIPAppender);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppender, IOService);
++
++bool
++AppleIPAppender::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleIPAppenderUserClient");
++	registerService();
++	IOLog("SWEET PDP: AppleIPAppender registered (opens, refuses every request: no modem)\n");
++	return true;
++}
++
++class AppleIPAppenderUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleIPAppenderUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleIPAppenderUserClient, IOUserClient);
++
++IOReturn
++AppleIPAppenderUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static uint64_t sweet_pdp_logged;       /* selectors already logged (< 64) */
++
++IOReturn
++AppleIPAppenderUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	if (selector >= 64 || !(sweet_pdp_logged & (1ULL << selector))) {
++		if (selector < 64) {
++			sweet_pdp_logged |= 1ULL << selector;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET PDP: %s sel %u in %u/%u out %u/%u -> unsupported\n", name, selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnUnsupported;
++}
++#endif /* SWEET */
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -58,6 +58,11 @@
+     "     'IOMatchCategory' = IOWatchdog;"
+     "   },"
+     "   {"
++    "     'IOClass'         = AppleIPAppender;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleIPAppender;"
++    "   },"
++    "   {"
+     "     'IOClass'         = IOCoreSurfaceRoot;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -13,6 +13,7 @@
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetIPAppender.cpp                             optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
