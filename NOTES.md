@@ -1,5 +1,27 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~01:35 BLACK PATCHES IN ANIMATIONS: image shim-local-0221-hold.img + current CA plug-in (user: "didnt see any black stuff"). Filmed with sweet-film (SWEET_FILM_STEP=8 SWEET_FILM_MB=400, 30 ms): the panel copied bands out of a surface the GPU was drawing. A probe showed 75 % of passes went into a surface marked in use: both buffers looked busy (0182 held a surface as long as it was on the panel) and this renderer ignores the mark anyway. xnu 0194: held only while queued or being copied. Plug-in: at commit waits up to 20 ms while IOSurfaceIsInUse (userland/gpu/sweet-ca-clients.h; measured 13 % of commits wait, ~5.6 ms, 2 timeouts in 1400), then kern.sweet_surface_gpu until completion. Remove the syslog counters when settled. Weather is off hakiosmetal.clients since the comparison and was not the cause; re-add it to test app Metal. Weather still showed "-- --" with DNS back: not traced.
+
+## 2026-11-04 ~01:35 STANDALONE WI-FI DNS RESOLUTION OPERATIONAL (afe66de)
+- **Problem**: The phone could ping raw IP addresses over Wi-Fi (`en0`), but all system DNS queries (`mDNSResponder`, apps) either timed out or required routing through `ue0` (USB tethering to PC's firewalld NAT). Root causes identified:
+  1. `CaptiveNetworkSupport` bundle in `configd` kept `en0` trapped in `Stage = Evaluate`, forcing `PrimaryRank = Last`.
+  2. Because `PrimaryRank` was `Last`, `configd` refused to promote `en0` to `PrimaryInterface` or publish `State:/Network/Global/DNS` for it.
+  3. When IPv6 DHCPv6/RA announced router DNS `fe80::1`, iOS stored it as an unscoped link-local address without `%en0`. XNU and `mDNSResponder` could not route unscoped link-local queries (`InterfaceID 0x0`), dropping every query.
+- **Fix Applied & Verified (`userland/net/sweet-wlan.c` & `tools/sweet-wlan-route.sh`, commit afe66de)**:
+  - `sweet-wlan` now explicitly sets `PrimaryRank = First` in `State:/Network/Service/4CD8DB21-0AC8-40A5-83C6-094D249CFE68`.
+  - Removes `State:/Network/Interface/en0/CaptiveNetwork` to clear the captive evaluation state.
+  - Directly publishes `State:/Network/Global/DNS` with `__IF_INDEX__ = 6 (en0)`, `__FLAGS__ = 6`, `__ORDER__ = 0`, `__CONFIGURATION_ID__ = "Default: 0"`, and `ServerAddresses = [ router_dns, "1.1.1.1", "8.8.8.8" ]`.
+  - Removed the scoped default route on `ue0` (`route delete -ifscope ue0 default 192.168.7.1`).
+- **Verification on Device**:
+  - `ping -c 3 google.com`: 4.9 ms average over `en0`, 0% packet loss.
+  - `ping -c 3 apple.com`: 31.7 ms average over `en0`, 0% packet loss.
+  - `ping -c 2 cloudflare.com`: 6.9 ms average over `en0`, 0% packet loss.
+  - `ping -c 2 wikipedia.org`: 43.9 ms average over `en0`, 0% packet loss.
+  - Wi-Fi link statistics: 4,645 transmitted / 11,030 received packets with 0 drops/errors.
+  - Home screen capture: verified fully drawn (lockscreen/homescreen with live clock, widgets, icons).
+  - High boot CPU load observed ("its kinda ahh"): directly caused by a 60-second `sweet-film` frame capture probe running concurrently with post-boot asset indexing (`mobileassetd`, `MTLCompilerService`). Normalized to idle load ~2-4 after probe exit.
+
+
 ## 2026-11-04 ~01:20 "WEATHER CAN'T FETCH" WAS DNS: Wi-Fi internet fine (ping 1.1.1.1 over en0), DNS dead. The phone's mDNSResponder asks over ue0 (USB) through the PC's NAT (see /var/root/sweet-wlan-route.sh), and masquerade on the PC's uplink firewalld zone was lost at the PC's reboot; sweet-live.sh did not restore it (only sweet-usbnet.sh did). Fixed on the PC (runtime) and in sweet-live.sh. So without the USB cable and the PC, the phone has no DNS at all: the real fix is DNS over Wi-Fi (Antigravity works on Wi-Fi, told on COMMS).
 - CA plug-in now marks surfaces drawn into (872408b, kern.sweet_surface_gpu): user sees black patches in Weather's night-to-day swipe "similar", so display timing was not the cause. Weather taken off hakiosmetal.clients for a comparison (listed: mtldisc hakios-metal-client mtltest PhotosPosterProvider). Result pending.
 
