@@ -31,6 +31,7 @@ while :; do
 				[ -x /var/jb/usr/bin/sweet-wlan ] && /var/jb/usr/bin/sweet-wlan >/dev/null 2>&1
 				route -n delete default >/dev/null 2>&1
 				route -n add default "$router" >/dev/null 2>&1
+				route -n delete -ifscope ue0 default >/dev/null 2>&1
 				echo "$(date +%T) default route -> $router via en0 (sweet-wlan published)"
 			fi
 
