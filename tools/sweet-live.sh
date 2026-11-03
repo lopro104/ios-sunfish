@@ -18,6 +18,10 @@ while kill -0 $LISTENER 2>/dev/null; do
 		nmcli dev set "$IF" managed no 2>/dev/null
 		sudo ip addr replace 192.168.7.1/24 dev "$IF" && sudo ip link set "$IF" up
 		sudo firewall-cmd -q --zone=trusted --change-interface="$IF" 2>/dev/null
+		# NAT for the phone's traffic out of the PC's uplink (its DNS goes over USB); a PC reboot loses this runtime setting
+		UPLINK=$(ip route show default | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+		ZONE=$(sudo firewall-cmd --get-zone-of-interface="$UPLINK" 2>/dev/null || sudo firewall-cmd --get-default-zone 2>/dev/null)
+		[ -n "$ZONE" ] && sudo firewall-cmd -q --zone="$ZONE" --add-masquerade 2>/dev/null
 		sudo iptables -C FORWARD -i "$IF" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i "$IF" -j ACCEPT
 		sudo iptables -C FORWARD -o "$IF" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
 		    sudo iptables -I FORWARD -o "$IF" -m state --state RELATED,ESTABLISHED -j ACCEPT
