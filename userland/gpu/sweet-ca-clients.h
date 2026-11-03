@@ -9,6 +9,7 @@
 #include <sys/sysctl.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <stdlib.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <Metal/Metal.h>
@@ -55,10 +56,35 @@ sweet_surface_tell(int value)
 	(void)sysctlbyname("kern.sweet_surface_gpu", NULL, NULL, &value, sizeof(value));
 }
 
+/*
+ * The window server's drawing thread on an A76 (core 7), as the GL layer did with boot-arg glbig: the kernel takes the
+ * eight cores as the same and leaves it on the six A55s, where a draw call took 150-290 us against 48 on core 6
+ * (metal_fps=draws). kern.sweet_bigcore binds the calling thread.
+ */
+static void
+sweet_big_core(void)
+{
+	static __thread int bound;
+
+	if (!bound) {
+		bound = 1;
+		const char *name = getprogname();
+		if (name != NULL && strcmp(name, "backboardd") == 0) {
+			int core = 7;
+			if (sysctlbyname("kern.sweet_bigcore", NULL, NULL, &core, sizeof(core)) != 0) {
+				syslog(LOG_ERR, "SweetMarks: kern.sweet_bigcore failed");
+			} else {
+				syslog(LOG_NOTICE, "SweetMarks: a drawing thread bound to core 7");
+			}
+		}
+	}
+}
+
 /* a render pass of this command buffer: its colour attachments' surfaces */
 static void
 sweet_marks_pass(void *cb, MTLRenderPassDescriptor *descriptor)
 {
+	sweet_big_core();
 	pthread_mutex_lock(&sweet_marks_lock);
 	int free_slot = -1, at = -1;
 	for (int i = 0; i < SWEET_MARK_CBS && at < 0; i++) {
