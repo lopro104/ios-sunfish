@@ -1,0 +1,39 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -224,7 +224,7 @@
+ 	uint32_t      fReadyFence;
+ 	SweetSurface *fHeld[SWEET_FB_HELD];     /* surfaces whose use count this driver raised */
+ 	uint32_t      fHeldCount;
+-	uint32_t      fShownIDs[SWEET_FB_LAYERS];  /* the layers' surfaces on the panel */
++	uint32_t      fShownIDs[SWEET_FB_LAYERS];  /* the layers' surfaces being copied to the panel (present()) */
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+@@ -1101,6 +1101,14 @@
+ void
+ AppleCLCD::taken(const uint8_t *src)
+ {
++	/*
++	 * From here until present() has copied them. Once copied a surface is free: the panel has its own memory. Held
++	 * for as long as it was on the panel, both of Core Animation's buffers looked in use nearly all the time (75 % of
++	 * the Metal passes), so the mark said nothing and a frame was drawn into the surface being copied.
++	 */
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		fShownIDs[layer] = (get32(src, 0x104) & (1u << layer)) ? get32(src, 0x54 + 4 * layer) : 0;
++	}
+ 	fHaveReady = false;
+ 	fFenceTicks = 0;
+ 	sweet_fb_stat[0]++;
+@@ -1473,10 +1481,10 @@
+ 		}
+ 		s->release();
+ 	}
+-	/* the surfaces copied are the panel's now; those it showed before are free (once nothing else waits on them) */
++	/* copied: the surfaces are free (once nothing else waits on them) */
+ 	IOLockLock(fLock);
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+-		fShownIDs[layer] = (mask & (1u << layer)) ? get32(rec, 0x54 + 4 * layer) : 0;
++		fShownIDs[layer] = 0;
+ 	}
+ 	updateHolds();
+ 	IOLockUnlock(fLock);

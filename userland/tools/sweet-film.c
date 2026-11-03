@@ -7,6 +7,8 @@
  * onto it) is sampled at every 4th pixel of every 4th row, unlocked (a read of what is there, as the
  * display copy reads it). FILE: "SWFILM" u32 frames, surfaces, then per frame and surface: u32 id,
  * width/4, height/4, u64 host time, then BGRX rows. tools/sweet-film.py makes PNG sheets of it.
+ * SWEET_FILM_STEP=N samples every Nth pixel and row instead of every 4th; SWEET_FILM_MB=N holds up to N MiB in memory
+ * and writes them at the end, for a rate the disk could not keep up with.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +43,10 @@ main(int argc, char *argv[])
 		perror(argv[1]);
 		return 1;
 	}
+	uint32_t step = getenv("SWEET_FILM_STEP") ? (uint32_t)atoi(getenv("SWEET_FILM_STEP")) : 4;
+	if (getenv("SWEET_FILM_MB")) {
+		setvbuf(f, malloc((size_t)atoi(getenv("SWEET_FILM_MB")) << 20), _IOFBF, (size_t)atoi(getenv("SWEET_FILM_MB")) << 20);
+	}
 	fwrite("SWFILM", 1, 6, f);
 	fwrite(&frames, 4, 1, f);
 	fwrite(&count, 4, 1, f);
@@ -48,7 +54,7 @@ main(int argc, char *argv[])
 	for (uint32_t n = 0; n < frames; n++) {
 		for (uint32_t k = 0; k < count; k++) {
 			IOSurfaceRef s = surfaces[k];
-			uint32_t w = (uint32_t)IOSurfaceGetWidth(s) / 4, h = (uint32_t)IOSurfaceGetHeight(s) / 4;
+			uint32_t w = (uint32_t)IOSurfaceGetWidth(s) / step, h = (uint32_t)IOSurfaceGetHeight(s) / step;
 			size_t row = IOSurfaceGetBytesPerRow(s);
 			const uint8_t *base = IOSurfaceGetBaseAddress(s);
 			uint64_t t = mach_absolute_time();
@@ -56,9 +62,9 @@ main(int argc, char *argv[])
 			fwrite(head, sizeof(head), 1, f);
 			fwrite(&t, 8, 1, f);
 			for (uint32_t y = 0; y < h; y++) {
-				const uint32_t *src = (const uint32_t *)(base + (size_t)y * 4 * row);
+				const uint32_t *src = (const uint32_t *)(base + (size_t)y * step * row);
 				for (uint32_t x = 0; x < w; x++) {
-					line[x] = src[x * 4];
+					line[x] = src[x * step];
 				}
 				fwrite(line, 4, w, f);
 			}
