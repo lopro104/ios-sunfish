@@ -16,6 +16,36 @@ mkdir -p "$OUT"
 sed -e 's|/redwood/share/ca-share/QuartzCore-default.metallib|/System/Library/Frameworks/QuartzCore.framework/default.metallib|g' \
     -e 's|if (!all \&\& (name == NULL \|\| strcmp(name, "backboardd") != 0)) {|if (!all \&\& !sweet_metal_listed(name)) {|' "$SRC" > "$OUT/HakiosMetalCA.m"
 grep -q sweet_metal_listed "$OUT/HakiosMetalCA.m" || { echo "the client check moved in $SRC" >&2; exit 1; }
+# the surfaces drawn into, told to the kernel (sweet-ca-clients.h)
+python3 -I - "$OUT/HakiosMetalCA.m" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+def once(a, b):
+	global s
+	if s.count(a) != 1:
+		sys.exit("not exactly once: " + a)
+	s = s.replace(a, b)
+once("""		hm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);
+
+		[encoder hakiosTakeResolves:descriptor];""", """		hm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);
+		sweet_marks_pass(self, descriptor);
+
+		[encoder hakiosTakeResolves:descriptor];""")
+once("""	_committed = YES;
+	_committedAt = hm_now();
+""", """	_committed = YES;
+	_committedAt = hm_now();
+	sweet_marks_commit(self);
+""")
+once("""	HakiosMetalCommandBuffer *self = (HakiosMetalCommandBuffer *)context;
+
+	hm_timeline(""", """	HakiosMetalCommandBuffer *self = (HakiosMetalCommandBuffer *)context;
+
+	sweet_marks_done(self);
+	hm_timeline(""")
+open(p, "w").write(s)
+PY
 make -C "$HM" -j8 ios MESA=1 CHIP=618 SDK="$SDK" \
 	IOS_CXX="clang++ -target arm64-apple-ios16.0 -isysroot $SDK --ld-path=$LD -Wno-unused-command-line-argument" \
 	IOS_AR="llvm-ar --format=darwin rcs" 2>&1 | grep -E "error:|\*\*\*" || true
