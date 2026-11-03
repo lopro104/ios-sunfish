@@ -13,7 +13,9 @@ M="$ROOT/research/hakios-metal-src/workspace/xnu-deps/build/mesa/build-softpipe-
 SRC="$ROOT/research/hakios-xnu-tools/userland/src/HakiosMetalCA.m"
 OUT="$ROOT/userland/gpu/out-ca"
 mkdir -p "$OUT"
-sed 's|/redwood/share/ca-share/QuartzCore-default.metallib|/System/Library/Frameworks/QuartzCore.framework/default.metallib|g' "$SRC" > "$OUT/HakiosMetalCA.m"
+sed -e 's|/redwood/share/ca-share/QuartzCore-default.metallib|/System/Library/Frameworks/QuartzCore.framework/default.metallib|g' \
+    -e 's|if (!all \&\& (name == NULL \|\| strcmp(name, "backboardd") != 0)) {|if (!all \&\& !sweet_metal_listed(name)) {|' "$SRC" > "$OUT/HakiosMetalCA.m"
+grep -q sweet_metal_listed "$OUT/HakiosMetalCA.m" || { echo "the client check moved in $SRC" >&2; exit 1; }
 make -C "$HM" -j8 ios MESA=1 CHIP=618 SDK="$SDK" \
 	IOS_CXX="clang++ -target arm64-apple-ios16.0 -isysroot $SDK --ld-path=$LD -Wno-unused-command-line-argument" \
 	IOS_AR="llvm-ar --format=darwin rcs" 2>&1 | grep -E "error:|\*\*\*" || true
@@ -25,7 +27,7 @@ for a in src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/free
 	ARCHIVES="$ARCHIVES $M/$a"
 done
 clang -target arm64-apple-ios16.0 -isysroot "$SDK" --ld-path="$LD" -Wno-unused-command-line-argument -O2 -g0 -bundle \
-	-fno-objc-arc -w -DHakiosMetalDevice=SweetMetalDevice -DHAKIOS_METAL_A618 -I"$HM/include" \
+	-fno-objc-arc -w -include "$ROOT/userland/gpu/sweet-ca-clients.h" -DHakiosMetalDevice=SweetMetalDevice -DHAKIOS_METAL_A618 -I"$HM/include" \
 	"$OUT/HakiosMetalCA.m" "$HM/out/ios-a618/libhakios-metal.a" $ARCHIVES -lz -lm -lc++ -lobjc \
 	-framework Foundation -framework IOKit -framework IOSurface -framework Metal -framework CoreFoundation \
 	-o "$OUT/SweetMetal"
