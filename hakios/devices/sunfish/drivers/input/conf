@@ -1,0 +1,5 @@
+# devices/sunfish/drivers/input/conf: what only the Pixel 4a has.
+
+driver FTM5
+	file    bsd/dev/hakios.ftm5.c
+	help    the touch screen: an ST FTM5 at I2C 0x49 on serial engine 7 (touchscreen=1; touch_delay=N, default 45 s)

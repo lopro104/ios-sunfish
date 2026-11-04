@@ -1,0 +1,5 @@
+# devices/sunfish/drivers/gpu/conf: what only the Pixel 4a has.
+
+driver CMDPANEL
+	file    bsd/dev/hakios.cmdpanel.c
+	help    the command-mode panel: keeps the frame going to it, by the pingpong's autorefresh (panel_autorefresh=1)
