@@ -1,5 +1,15 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~02:48 DUAL BIG-CORE SPLIT & ANIMATION RATE UNCAP (469ad27)
+- User resumed iOS work on the phone (running shim-local-0221-hold.img, idle load < 1.0).
+- **Big-Core Allocation**: Claude previously bound `backboardd`'s drawing thread to big core 7 (`004fe11`, `kern.sweet_bigcore=7`), raising home swipe FPS from 27 to 32. However, `SpringBoard` (handling touch events, run loop, and layout at 53% CPU) was left competing with background tasks on slow in-order Cortex-A55 cores (0-5).
+  - Updated `userland/animrate/SweetAnimRate.m` constructor to bind `SpringBoard`'s main thread to the other big core, Cortex-A76 core 6 (`kern.sweet_bigcore=6`). Now the two primary UI threads each own a dedicated out-of-order 2.2 GHz A76 core without contention.
+- **Display Link Uncap Fix**:
+  - In `SweetAnimRate.m`, `set_fps` and `set_range` were previously suppressing calls to the original setters when `full_rate` was detected, rather than telling `CADisplayLink` to run unconstrained.
+  - Fixed to mirror HakiOS's `inject_sb.c`: passes `0` to `original_set_fps` and `CAFrameRateRangeMake(0, 0, 0)` to `original_set_range` for full-rate display links, unconstraining the animation frame rate up to the panel's 60 Hz.
+- Rebuilt with `userland/animrate/build.sh`, deployed to `/var/jb/Library/MobileSubstrate/DynamicLibraries/SweetAnimRate.dylib`, and reloaded via `sbreload`. SpringBoard restarted cleanly (PID 2920), running at 0.0% idle CPU and cool.
+
+
 ## 2026-11-04 ~02:10 iOS ROOT CAN BE REBUILT WITHOUT A FULL BACKUP (no backup of userdata was taken, user's decision: the phone goes to Android testing, which overwrites iOS). NOT YET TESTED: the first boot of a rebuilt root may need work (the first-boot data migration once ran 2 h without finishing).
 - Rebuild: tools/mkiosroot.sh OS.dmg SYSTEMOS.dmg APPOS.dmg OUT.img SIZE (IPSW in ~/Downloads, SIZE = 111707M: userdata minus the log ring); mount -t hfsplus -o loop,force; tools/sweet-root-tweaks.py ROOT --gpu MESA_OUT; sudo tools/sweet-root-overlay.py ROOT; copy research/fw-local to /fw (not /fw/rmtfs: per-device, from the phone's own partitions); unmount; write to userdata; boot shim-local-0221-hold.img.
 - research/root-overlay/overlay-clean.tar (188 MB, git-ignored, 7285 entries): allow-listed from the phone: /var/jb without home, tmp, logs, cache; changed system files (launchd.plist, wifid, SpringBoard Info.plist, MediaToolbox, SweetMetal.bundle with the CA plug-in only, gl libs, backboardd wrapper); disabled.plist (vmd, wifip2pd...); sweet-wlan-route.sh. Left out on purpose: Wi-Fi networks, keychains, /var/mobile, containers, SSH keys, logs, /fw, test binaries. Scan for the user's SSID, serial, address: only /home/lopro build paths in SweetWiFi's binary (rebuild with a neutral path before sharing). Apple's and Procursus's files are in it: do not publish the tar itself.
