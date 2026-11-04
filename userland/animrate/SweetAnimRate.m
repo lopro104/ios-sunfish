@@ -18,6 +18,8 @@
 #include <objc/runtime.h>
 #include <string.h>
 
+#include <sys/sysctl.h>
+
 static id (*original_link_with)(id, SEL, id, SEL);
 static void (*original_set_fps)(id, SEL, NSInteger);
 static void (*original_set_range)(id, SEL, CAFrameRateRange);
@@ -37,17 +39,16 @@ link_with(id self, SEL cmd, id target, SEL action)
 static void
 set_fps(id self, SEL cmd, NSInteger fps)
 {
-	if (objc_getAssociatedObject(self, &full_rate) == nil) {
-		original_set_fps(self, cmd, fps);
-	}
+	original_set_fps(self, cmd, objc_getAssociatedObject(self, &full_rate) != nil ? 0 : fps);
 }
 
 static void
 set_range(id self, SEL cmd, CAFrameRateRange range)
 {
-	if (objc_getAssociatedObject(self, &full_rate) == nil) {
-		original_set_range(self, cmd, range);
+	if (objc_getAssociatedObject(self, &full_rate) != nil) {
+		range = CAFrameRateRangeMake(0, 0, 0);
 	}
+	original_set_range(self, cmd, range);
 }
 
 static void
@@ -65,6 +66,12 @@ add_animation(id self, SEL cmd, CAAnimation *animation, NSString *key)
 __attribute__((constructor)) static void
 sweet_anim_rate(void)
 {
+	const char *name = getprogname();
+	if (name != NULL && strcmp(name, "SpringBoard") == 0) {
+		int core = 6;
+		(void)sysctlbyname("kern.sweet_bigcore", NULL, NULL, &core, sizeof(core));
+	}
+
 	Class link = objc_getClass("CADisplayLink"), layer = objc_getClass("CALayer");
 	Method m;
 
