@@ -1,5 +1,12 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~05:05 FRAME RATE: PAUSED (claude-display, user asked to hold off while working with Antigravity)
+- Observed (home-screen swipes by the user, ~02:30, before Antigravity's 469ad27): 28-37 shown/s, GPU busy 73-89%, a buffer made to committed ~8 ms, commit to completion 26-35 ms, full-screen passes of ~100 draws 20-24 ms. So the GPU side is the limit, not the CPU or display pacing.
+- Vendor sdmmagpie-gpu.dtsi: speed bin 146 (ours) tops out at 700 MHz, bus level 11 (1804 MHz); we run 565 MHz (adreno_speed default). The vendor also uses LLC slices (gpu 12, gpuhtw 11) and UBWC mode 2; whether ours are used was not finished. No fix tried yet.
+- Guess, not measured: memory or caching rather than core clock, since an old GL test (0126) saw no clear gain going to 565 MHz. Next test: boot with adreno_speed=4 (430 MHz); if pass times grow by ~1.31x the core clock is the limit, if not, memory.
+- tools/sweet-uibench.sh + userland/pagetest (SweetPageTest, flips home pages on com.sweet.pagetest.start) give a load with nobody at the phone; needs /var/root/sweet-notify (on the phone, a one-line notify_post). The one run so far is NOT a valid baseline: it ran right after sbreload while PosterBoard/WallpaperKit were busy (mean 15 shown/s). Wait for them to settle before measuring.
+- Phone: no reboot, same image with metal_fps. SpringBoard was restarted once ~05:03. Tweak files removed from the phone; still loaded in the running SpringBoard until its next restart, inert.
+
 ## 2026-11-04 ~04:36 HAKIOS BASE MIGRATION STARTED & U-BOOT FOR SUNFISH COMPILED
 - **Migration Decision**: Moving `sunfish` and `sweet` onto HakiOS's clean source-tree architecture (`research/hakios-xnu-tools/`), eliminating the 194-patch diff series in favor of Kconfig-style driver manifests, SoC layers, and defconfigs.
 - **U-Boot for Pixel 4a Built**:
