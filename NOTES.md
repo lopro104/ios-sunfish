@@ -1,5 +1,21 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~04:36 HAKIOS BASE MIGRATION STARTED & U-BOOT FOR SUNFISH COMPILED
+- **Migration Decision**: Moving `sunfish` and `sweet` onto HakiOS's clean source-tree architecture (`research/hakios-xnu-tools/`), eliminating the 194-patch diff series in favor of Kconfig-style driver manifests, SoC layers, and defconfigs.
+- **U-Boot for Pixel 4a Built**:
+  - Found `sm7150-mainline/u-boot` on branch `tauchgang` with hardcoded text-offset fix `0x00080000` (commit `f8c04469`).
+  - Fixed OpenSSL 4.0 `ENGINE_*` stubs in `research/uboot/u-boot/lib/rsa/rsa-sign.c`.
+  - Built U-Boot for `sm7150-google-sunfish`: produced `u-boot.bin` (1.3 MB).
+  - Assembled `u-boot-sunfish.img` (64 MiB) with LZ4 compression, header v2, and AVB hash footer for fastboot boot.
+- **Device & SoC Layer Initialized in HakiOS**:
+  - Un-sparsed the full HakiOS tree (`research/hakios-xnu-tools`).
+  - Synchronized reference Qualcomm device `devices/redwood` (POCO X5 Pro).
+  - Initialized `devices/sunfish/` and `socs/sm7150/` with `tools/hakios-device.py new sunfish --soc sm7150`.
+  - Auto-extracted 11 of 16 Qualcomm MMIO/SoC parameters from `dtb/sunfish/dtb` via `tools/soc-args.py`.
+  - Generated `.config` via `make sunfish_defconfig` (kernel version `2.1.13-hakios-darwin22.5-sm7150-g96ffbc53`).
+  - Toolchain verified: `/home/lopro/theos/sdks/iPhoneOS16.5.sdk` and `theos/toolchain/linux/iphone/bin` are installed and ready.
+
+
 ## 2026-11-04 ~03:55 SENSORS & AUTO-ROTATION OPERATIONAL, POLISHING COMPLETED
 - **Auto-Rotation & Orientation Control (`userland/sensors/`)**:
   - Built and deployed `userland/sensors/SweetSensors.m` (ElleKit tweak) and `userland/sensors/sweet-sensor-ctl.m` (CLI + daemon).
