@@ -1,5 +1,17 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~05:40 HAKIOS: SUNFISH KERNEL REBUILT, SIGNED BOOT IMAGE READY
+- **Rebuilt Kernel**: Recompiled kernel with POCO `cpufreq` and `thermal` removed.
+  - Active built-in drivers (10 total): `socinfo`, `buttons`, `pmic`, `ufs`, `cmdpanel`, `ftm5` (+ core/virtio stubs).
+- **Payload & Boot Image Assembly**:
+  - `xnuloader/mkpayload.py` assembled `build/payload-sunfish.bin` (14.88 MB) with cmdline:
+    `debug=0x14e -v serial=3 touchscreen=1 buttons=0 panel_autorefresh=1`
+  - `tools/mkubootimg.py` assembled Header v2 Android boot image (16.2 MB) with 4096-byte pages, DTB (`devices/sunfish/prebuilt/device-tree.dtb`), U-Boot (`0x00080000` text offset), and HKUB ramdisk (`loader.efi` + payload).
+  - Padded to 64 MiB and added AVB hash footer using `/usr/local/bin/avbtool` for Pixel 4a bootloader:
+    **`research/hakios-xnu-tools/build/u-boot-sunfish-hakios-signed.img`** (and mirrored in `hakios/build/`).
+- **Privacy & Safety**: All remote git pushes remain halted as requested. Device currently untouched on working hold kernel.
+
+
 ## 2026-11-04 ~05:35 HAKIOS: KERNEL LINKS WITH FTM5 + CMDPANEL; POCO-ADDRESS DRIVERS OFF (claude-display)
 - Built in research/hakios-xnu-tools (hakios/ has no toolchain or xnu-src yet): make-kernel reports built, drivers list includes cmdpanel and ftm5. Not run.
 - sunfish.config had cpufreq=1 and thermal=1 from sm7150.config through `hakios-config.py args` (Makefile ARGS). Addresses are the POCO X5 Pro's: EPSS 0x18591000 vs OSM 0x18323000, TSENS 0xc263000 vs 0xc222000/0xc223000. Now off for sunfish in both trees. Consequence: no thermal protection and CPUs at whatever the firmware left until ported. Do not run heavy loads on this path.
