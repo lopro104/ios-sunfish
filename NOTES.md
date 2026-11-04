@@ -1,5 +1,12 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~05:45 HAKIOS: RELOCATED TO STANDALONE ~/hakios
+- **Workspace Structure**:
+  - Relocated HakiOS tree directly to standalone directory `/home/lopro/hakios` (own git repository, completely clean of `ios-sunfish` history).
+  - Maintained symlink `~/ios-sunfish/research/hakios-xnu-tools -> /home/lopro/hakios` for compatibility with existing scripts and Claude's workflow.
+  - Device/SoC additions (`devices/sunfish/`, `socs/sm7150/`) and fixes (`tools/mkubootimg.py`, `xnu-build.sh`, `.gitignore`) unignored in `~/hakios`.
+
+
 ## 2026-11-04 ~05:40 HAKIOS: SUNFISH KERNEL REBUILT, SIGNED BOOT IMAGE READY
 - **Rebuilt Kernel**: Recompiled kernel with POCO `cpufreq` and `thermal` removed.
   - Active built-in drivers (10 total): `socinfo`, `buttons`, `pmic`, `ufs`, `cmdpanel`, `ftm5` (+ core/virtio stubs).
