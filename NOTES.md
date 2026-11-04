@@ -21,6 +21,13 @@
 - **Comms & Collaboration**:
   - Checked `COMMS.md` via `tools/comms-check.sh` and posted status to `claude-display`, inviting Claude to help port modular drivers (`sweet_touch.c`, `sweet_fb.c`, etc.) to HakiOS `drivers/`.
 
+## 2026-11-04 ~05:15 HAKIOS MIGRATION: FTM5 TOUCH PORTED, COMPILED ONLY (claude-display, at Antigravity's request)
+- research/hakios-xnu-tools/devices/sunfish/drivers/input/{hakios.ftm5.c,conf}: bsd/dev/sweet_touch.c's FTM5 path (Goodix/FocalTech removed), posting to /dev/hakios-touch (0..65535), SPMI through hakios_spmi_lock, its only PMIC write the PM6150 GPIO4 load switch as before. touchscreen=1 starts it, touch_delay=N (default 45 s).
+- Enabled in devices/sunfish/configs/sunfish.config (CONFIG_HAKIOS_FTM5=y, CONFIG_TOUCHSCREEN=y); device.conf has a touch status line.
+- Checked: one-file clang -fsyntax-only -Wall -Wextra, no warnings (hand-picked flags, not the kernel's build); hakios-device.py check and boot-args.py --check pass. NOT linked into a kernel, NOT run. `make sunfish_defconfig && make kernel` left to whoever owns the shared build.
+- Traps: (1) devices/ and socs/ are git-ignored in the HakiOS tree, and that tree is git-ignored here, so this driver and all of devices/sunfish exist only on this disk. (2) touchscreen=1 also starts hakios.buttons.c unless buttons=0, and that driver has POCO X5 Pro values. (3) Needs ABL's GENI I2C firmware; on a boot through U-Boot the engine, clocks and switch may differ: one log line and it stops.
+- Not done: sweet_spmi.c's battery temperature, panel/display (SweetFramebuffer.cpp, 1686 lines).
+
 ## 2026-11-04 ~05:05 FRAME RATE: PAUSED (claude-display, user asked to hold off while working with Antigravity)
 - Observed (home-screen swipes by the user, ~02:30, before Antigravity's 469ad27): 28-37 shown/s, GPU busy 73-89%, a buffer made to committed ~8 ms, commit to completion 26-35 ms, full-screen passes of ~100 draws 20-24 ms. So the GPU side is the limit, not the CPU or display pacing.
 - Vendor sdmmagpie-gpu.dtsi: speed bin 146 (ours) tops out at 700 MHz, bus level 11 (1804 MHz); we run 565 MHz (adreno_speed default). The vendor also uses LLC slices (gpu 12, gpuhtw 11) and UBWC mode 2; whether ours are used was not finished. No fix tried yet.
