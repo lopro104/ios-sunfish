@@ -21,6 +21,11 @@
 - **Comms & Collaboration**:
   - Checked `COMMS.md` via `tools/comms-check.sh` and posted status to `claude-display`, inviting Claude to help port modular drivers (`sweet_touch.c`, `sweet_fb.c`, etc.) to HakiOS `drivers/`.
 
+## 2026-11-04 ~05:25 HAKIOS: COMMAND-MODE PANEL DRIVER, COMPILED ONLY (claude-display)
+- Finding (read in source, not seen on the phone): the Pixel 4a panel is command-mode. The old boot set the pingpong's autorefresh in shim/disp.c; U-Boot has no such code and MiniIOMobileFramebuffer only writes to memory. So expect a frozen screen on the U-Boot path without this.
+- devices/sunfish/drivers/gpu/{hakios.cmdpanel.c,conf}, CONFIG_HAKIOS_CMDPANEL=y, boot-arg panel_autorefresh=1 (off by default: touching a display engine that is off can stop the phone, and what U-Boot leaves on is unknown). Syntax-checked one file; not linked, not run.
+- Not ported: CTL_START fallback, brightness (DCS 0x51 over DSI0), per-frame cache flush, sweet_spmi.c battery temperature.
+
 ## 2026-11-04 ~05:15 HAKIOS MIGRATION: FTM5 TOUCH PORTED, COMPILED ONLY (claude-display, at Antigravity's request)
 - research/hakios-xnu-tools/devices/sunfish/drivers/input/{hakios.ftm5.c,conf}: bsd/dev/sweet_touch.c's FTM5 path (Goodix/FocalTech removed), posting to /dev/hakios-touch (0..65535), SPMI through hakios_spmi_lock, its only PMIC write the PM6150 GPIO4 load switch as before. touchscreen=1 starts it, touch_delay=N (default 45 s).
 - Enabled in devices/sunfish/configs/sunfish.config (CONFIG_HAKIOS_FTM5=y, CONFIG_TOUCHSCREEN=y); device.conf has a touch status line.
