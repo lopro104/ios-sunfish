@@ -1,5 +1,3 @@
-#Not yet tested on the fish
-
 # ios-sunfish
 
 **Apple's iOS 16 on the Google Pixel 4a.**
