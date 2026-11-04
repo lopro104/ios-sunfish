@@ -156,10 +156,7 @@ sweet_marks_commit(void *cb)
 		waited += us != 0;
 		timed_out += us >= SWEET_MARK_WAIT_US;
 		waited_us += us;
-		if (commits % 200 == 0) {
-			syslog(LOG_NOTICE, "SweetMarks: %u commits into surfaces, %u waited, %u timed out, %llu us waited in all", commits, waited, timed_out,
-			    (unsigned long long)waited_us);
-		}
+		/* Diagnostic syslog removed when settled to eliminate commit lock/log overhead */
 	}
 }
 

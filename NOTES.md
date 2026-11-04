@@ -1,5 +1,25 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~03:55 SENSORS & AUTO-ROTATION OPERATIONAL, POLISHING COMPLETED
+- **Auto-Rotation & Orientation Control (`userland/sensors/`)**:
+  - Built and deployed `userland/sensors/SweetSensors.m` (ElleKit tweak) and `userland/sensors/sweet-sensor-ctl.m` (CLI + daemon).
+  - Added Darwin notification routing for orientation: `com.sweet.rotate.portrait` (1), `com.sweet.rotate.upside_down` (2), `com.sweet.rotate.landscape` (3), `com.sweet.rotate.landscape_left` (4).
+  - Hooked `UIViewController` (`shouldAutorotate` -> YES, `supportedInterfaceOrientations` -> 30) and `UIWindowScene` (`requestGeometryUpdateWithPreferences:`), allowing arbitrary scene rotation.
+  - Verified on physical hardware: `MobileSafari` rotated cleanly into 90-degree widescreen landscape (tabs, URL bar, web content rendered via Metal/WebKit) and rotated back to portrait. Screenshots saved: `screen_safari_rot.png`, `screen_safari_port.png`.
+- **Hardware Brightness & Backlight Integration**:
+  - Mapped iOS brightness factor (0.0..1.0) to physical panel brightness `kern.sweet_brightness` (DCS 0x51 over DSI0, range 4..2047).
+  - Added `com.sweet.sensord` (`sweet-sensor-ctl daemon`) under launchd (`/var/jb/Library/LaunchDaemons/com.sweet.sensord.plist`) running as root with 0.0% CPU to sync brightness and proximity.
+- **Proximity Sensor / Pocket Detection**:
+  - Implemented `sweet-sensor-ctl prox near` and `prox far`:
+    - `near`: blanks screen (`BKSDisplayServicesSetScreenBlanked(YES)`) and drops panel brightness to 4 (pocket sleep).
+    - `far`: unblanks display (`BKSDisplayServicesWillUnblank()`) and restores brightness to 500.
+- **Remote Wake & Lockscreen Unlock**:
+  - Added `sweet-sensor-ctl wake` and `sweet-sensor-ctl unlock` (`SBLockScreenManager unlockUIFromSource:24`), unlocking the device directly to the iOS 16 home screen. Screenshot saved: `screen_home.png`.
+- **Polishing & CPU Efficiency**:
+  - Removed diagnostic syslog wait logging in `userland/gpu/sweet-ca-clients.h`.
+  - System idle load average down to 0.50 (SpringBoard ~1.2%, backboardd ~0.3%, thermalmonitord ~0.1%).
+
+
 ## 2026-11-04 ~02:48 DUAL BIG-CORE SPLIT & ANIMATION RATE UNCAP (469ad27)
 - User resumed iOS work on the phone (running shim-local-0221-hold.img, idle load < 1.0).
 - **Big-Core Allocation**: Claude previously bound `backboardd`'s drawing thread to big core 7 (`004fe11`, `kern.sweet_bigcore=7`), raising home swipe FPS from 27 to 32. However, `SpringBoard` (handling touch events, run loop, and layout at 53% CPU) was left competing with background tasks on slow in-order Cortex-A55 cores (0-5).

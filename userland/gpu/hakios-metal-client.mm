@@ -297,6 +297,38 @@ int main(int argc, char **argv) {
                 }
             }
             printf("ok  QuartzCore render pipelines compiled: %u of %u\n", compiled, tried);
+
+            // Test 6b: QuartzCore Uber-Shader with Function Constant Specialization
+            printf("--- QuartzCore Uber-Shader Specialization ---\n");
+            MTLFunctionConstantValues *fcv = [[MTLFunctionConstantValues alloc] init];
+            bool bTrue = true;
+            bool bFalse = false;
+            [fcv setConstantValue:&bTrue type:MTLDataTypeBool atIndex:0];
+            [fcv setConstantValue:&bFalse type:MTLDataTypeBool atIndex:1];
+
+            id<MTLFunction> vs = [qcLib newFunctionWithName:@"fixed_vert_lph_gen"];
+            id<MTLFunction> fs = [qcLib newFunctionWithName:@"fixed_frag_lph_cpf" constantValues:fcv error:&err];
+            if (!fs) {
+                printf("FAIL: newFunctionWithName:fixed_frag_lph_cpf constantValues: %s\n",
+                       err ? err.localizedDescription.UTF8String : "unknown");
+                failures++;
+            } else {
+                printf("ok  specialized fixed_frag_lph_cpf function created\n");
+                MTLRenderPipelineDescriptor *rdesc = [[MTLRenderPipelineDescriptor alloc] init];
+                rdesc.vertexFunction = vs;
+                rdesc.fragmentFunction = fs;
+                rdesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                t0 = now_us();
+                id<MTLRenderPipelineState> rps = [device newRenderPipelineStateWithDescriptor:rdesc error:&err];
+                dt = now_us() - t0;
+                if (rps) {
+                    printf("ok  specialized pipeline [fixed_vert_lph_gen + fixed_frag_lph_cpf] compiled in %llu us\n", dt);
+                } else {
+                    printf("FAIL: specialized pipeline compile failed: %s\n",
+                           err ? err.localizedDescription.UTF8String : "unknown");
+                    failures++;
+                }
+            }
         }
 
         // Test 7: GPU Family & Feature Checks
