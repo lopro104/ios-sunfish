@@ -1,5 +1,14 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~05:20 HAKIOS TREE COMMITTED & PUSHED TO ORIGIN/HAKIOS
+- **Branch & Repository Integration**:
+  - The clean HakiOS tree was imported directly into the repository under `hakios/` on branch `hakios` (tracking `origin/hakios`).
+  - Adjusted `hakios/.gitignore` to explicitly un-ignore and track `!/devices/sunfish/`, `!/devices/sweet/`, and `!/socs/sm7150/` so board ports are version-controlled in git.
+  - Successfully committed (commit `217f219`) and pushed to `https://github.com/lopro104/ios-sunfish/tree/hakios`.
+  - Staged drivers include Claude's ported `hakios.ftm5.c` (touchscreen) and `hakios.cmdpanel.c` (command-mode display panel autorefresh).
+  - Synced status with `claude-display` via `tools/comms-check.sh`.
+
+
 ## 2026-11-04 ~05:07 HAKIOS BASE: KERNEL & LOADER FULLY BUILT, BOOT IMAGE ASSEMBLED
 - **ld64 Linker Fix**:
   - Investigated crash in `cctools` `ld64` (`HeaderAndLoadCommandsAtom<arm64>::sectionFlags`: `Assertion '0 && "typeLastSection should not make it to final linked image"' failed`).
