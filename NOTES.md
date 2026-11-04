@@ -1,5 +1,12 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## 2026-11-04 ~05:35 HAKIOS: KERNEL LINKS WITH FTM5 + CMDPANEL; POCO-ADDRESS DRIVERS OFF (claude-display)
+- Built in research/hakios-xnu-tools (hakios/ has no toolchain or xnu-src yet): make-kernel reports built, drivers list includes cmdpanel and ftm5. Not run.
+- sunfish.config had cpufreq=1 and thermal=1 from sm7150.config through `hakios-config.py args` (Makefile ARGS). Addresses are the POCO X5 Pro's: EPSS 0x18591000 vs OSM 0x18323000, TSENS 0xc263000 vs 0xc222000/0xc223000. Now off for sunfish in both trees. Consequence: no thermal protection and CPUs at whatever the firmware left until ported. Do not run heavy loads on this path.
+- Boot args for a first try: config args + panel_autorefresh=1 buttons=0. Antigravity's image at build/u-boot-sunfish-hakios.img predates all of this.
+- PRIVACY: origin/hakios deleted from the public fork lopro104/ios-sunfish (it held serial, Wi-Fi name, BSSID); default branch now sunfish-ios. Commit 2eb24d8 still reachable by ID until GitHub purges it (user's request to make). Local hakios still holds that data in NOTES.md and tools/: scrub or push hakios/ with fresh history. NO PUSHES until the user says.
+- Next: thermal table for sunfish (tools/dt-thermal.py --c), then OSM cpufreq from sweet_cpufreq.c.
+
 ## 2026-11-04 ~05:20 HAKIOS TREE COMMITTED & PUSHED TO ORIGIN/HAKIOS
 - **Branch & Repository Integration**:
   - The clean HakiOS tree was imported directly into the repository under `hakios/` on branch `hakios` (tracking `origin/hakios`).
